@@ -163,14 +163,22 @@ class ConvSwiGLU(nn.Module):
         inter = intermediate_size if intermediate_size is not None else _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
         self.inter = inter
         self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.dwconv = nn.Conv1d(
-            in_channels=inter,
-            out_channels=inter,
-            kernel_size=conv_kernel,
-            padding=conv_kernel // 2,
-            groups=inter,
-            bias=True,
-        ).to(dtype=torch.bfloat16)
+        # self.dwconv = nn.Conv1d(
+        #     in_channels=inter,
+        #     out_channels=inter,
+        #     kernel_size=conv_kernel,
+        #     padding=conv_kernel // 2,
+        #     groups=inter,
+        #     bias=True,
+        # ).to(dtype=torch.bfloat16)
+        self.dwattn = Attention(
+            hidden_size=inter,
+            head_dim=inter // 8,
+            num_heads=8,
+            num_key_value_heads=8,
+            causal=False,
+        )
+        self.conv_kernel = conv_kernel
 
         self.act = nn.SiLU()
         self.down_proj = CastedLinear(inter, hidden_size, bias=False)
@@ -178,10 +186,11 @@ class ConvSwiGLU(nn.Module):
     def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         x_ffn = F.silu(gate) * up
-        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
-        x_conv = x_conv[..., :up.size(1)]
+        # x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
+        x_conv = self.dwattn(cos_sin = None, hidden_states=x_ffn, window_size=self.conv_kernel - 1)
+        # x_conv = x_conv[..., :up.size(1)]
         x_conv = self.act(x_conv)
-        x_conv = x_conv.transpose(1, 2).contiguous()
+        # x_conv = x_conv.transpose(1, 2).contiguous()
         x_out = self.down_proj(x_conv)
 
         return x_out
