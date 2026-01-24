@@ -56,7 +56,7 @@ class URMBlock(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
@@ -152,12 +152,12 @@ class URM_Inner(nn.Module):
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings
+                        hidden_states = hidden_states + input_embeddings + (torch.randn_like(hidden_states) * 2 - 1)
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
         for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings
+            hidden_states = hidden_states + input_embeddings + (torch.randn_like(hidden_states) * 2 - 1)
             for layer in self.layers:
                 hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
