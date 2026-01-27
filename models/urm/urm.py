@@ -152,12 +152,12 @@ class URM_Inner(nn.Module):
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings + (torch.randn_like(hidden_states) * 2 - 1)
+                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
         for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings + (torch.randn_like(hidden_states) * 2 - 1)
+            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
             for layer in self.layers:
                 hidden_states = layer(hidden_states=hidden_states, **seq_info)
 

@@ -155,7 +155,7 @@ class ConvSwiGLU(nn.Module):
         self,
         hidden_size: int,
         expansion: float,
-        conv_kernel: int = 8,
+        conv_kernel: int = 2,
         intermediate_size: Optional[int] = None,
     ):
         super().__init__()
