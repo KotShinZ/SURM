@@ -294,8 +294,9 @@ class TD3Critic(nn.Module):
 
 class ReplayBuffer:
     """
-    CPU-based replay buffer storing transitions in bfloat16.
-    Uses batch-level copy for fast insertion.
+    GPU-based replay buffer storing transitions in bfloat16.
+    All data stays on GPU — no CPU transfers needed.
+    next_state is NOT stored; reconstructed as state + input_emb + action.
     """
 
     def __init__(
@@ -304,105 +305,72 @@ class ReplayBuffer:
         seq_len: int,
         hidden_size: int,
         label_seq_len: int,
+        device: str = "cuda",
     ):
         self.capacity = capacity
+        self.device = device
         self.ptr = 0
         self.size = 0
 
         shape = (capacity, seq_len, hidden_size)
-        self.states = torch.zeros(shape, dtype=torch.bfloat16, pin_memory=True)
-        self.actions = torch.zeros(shape, dtype=torch.bfloat16, pin_memory=True)
-        self.next_states = torch.zeros(shape, dtype=torch.bfloat16, pin_memory=True)
-        self.input_embeddings = torch.zeros(shape, dtype=torch.bfloat16, pin_memory=True)
-        self.rewards = torch.zeros(capacity, dtype=torch.float32, pin_memory=True)
-        self.dones = torch.zeros(capacity, dtype=torch.bool, pin_memory=True)
+        self.states = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        self.actions = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        # next_states omitted: reconstruct as states + input_embeddings + actions
+        self.input_embeddings = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(capacity, dtype=torch.bool, device=device)
         self.labels = torch.zeros(
-            (capacity, label_seq_len), dtype=torch.int32, pin_memory=True
+            (capacity, label_seq_len), dtype=torch.int32, device=device
         )
-
-    def add(
-        self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-        reward: torch.Tensor,
-        next_state: torch.Tensor,
-        done: torch.Tensor,
-        input_emb: torch.Tensor,
-        labels: torch.Tensor,
-    ):
-        """Add a batch of transitions. All inputs are [B, ...] on GPU."""
-        B = state.shape[0]
-        # Fix #2: batch-level copy instead of per-sample Python loop
-        # Compute indices (handle wraparound)
-        indices = torch.arange(B) + self.ptr
-        indices = indices % self.capacity
-
-        self.states[indices] = state.cpu().to(torch.bfloat16)
-        self.actions[indices] = action.cpu().to(torch.bfloat16)
-        self.next_states[indices] = next_state.cpu().to(torch.bfloat16)
-        self.input_embeddings[indices] = input_emb.cpu().to(torch.bfloat16)
-        self.rewards[indices] = reward.cpu().float()
-        if isinstance(done, torch.Tensor):
-            self.dones[indices] = done.cpu()
-        else:
-            self.dones[indices] = done
-        self.labels[indices] = labels.cpu().to(torch.int32)
-
-        self.ptr = (self.ptr + B) % self.capacity
-        self.size = min(self.size + B, self.capacity)
 
     def add_batch(
         self,
-        states: torch.Tensor,      # [T, B, L, C]
-        actions: torch.Tensor,      # [T, B, L, C]
-        rewards: torch.Tensor,      # [T, B]
-        next_states: torch.Tensor,  # [T, B, L, C]
-        dones: torch.Tensor,        # [T, B]
-        input_embs: torch.Tensor,   # [T, B, L, C]
-        labels: torch.Tensor,       # [T, B, label_seq_len]
+        states: torch.Tensor,      # [T, B, L, C] or [1, N, L, C]
+        actions: torch.Tensor,
+        rewards: torch.Tensor,      # [T, B] or [1, N]
+        dones: torch.Tensor,
+        input_embs: torch.Tensor,
+        labels: torch.Tensor,
     ):
-        """Add T*B transitions at once. All inputs are on GPU, transferred in bulk."""
+        """Add transitions. All inputs already on GPU — zero-copy."""
         T, B = states.shape[0], states.shape[1]
         N = T * B
 
-        # Flatten T and B dims: [T, B, ...] -> [T*B, ...]
-        flat_states = states.reshape(N, *states.shape[2:]).cpu().to(torch.bfloat16)
-        flat_actions = actions.reshape(N, *actions.shape[2:]).cpu().to(torch.bfloat16)
-        flat_next = next_states.reshape(N, *next_states.shape[2:]).cpu().to(torch.bfloat16)
-        flat_embs = input_embs.reshape(N, *input_embs.shape[2:]).cpu().to(torch.bfloat16)
-        flat_rewards = rewards.reshape(N).cpu().float()
-        flat_dones = dones.reshape(N).cpu()
-        flat_labels = labels.reshape(N, labels.shape[-1]).cpu().to(torch.int32)
+        # Flatten [T, B, ...] -> [N, ...]
+        flat_s = states.reshape(N, *states.shape[2:]).to(torch.bfloat16)
+        flat_a = actions.reshape(N, *actions.shape[2:]).to(torch.bfloat16)
+        flat_e = input_embs.reshape(N, *input_embs.shape[2:]).to(torch.bfloat16)
+        flat_r = rewards.reshape(N).float()
+        flat_d = dones.reshape(N)
+        flat_l = labels.reshape(N, labels.shape[-1]).to(torch.int32)
 
-        # Handle wraparound in circular buffer using modular indexing
-        indices = (torch.arange(N) + self.ptr) % self.capacity
+        indices = (torch.arange(N, device=self.device) + self.ptr) % self.capacity
 
-        self.states[indices] = flat_states
-        self.actions[indices] = flat_actions
-        self.next_states[indices] = flat_next
-        self.input_embeddings[indices] = flat_embs
-        self.rewards[indices] = flat_rewards
-        self.dones[indices] = flat_dones
-        self.labels[indices] = flat_labels
+        self.states[indices] = flat_s
+        self.actions[indices] = flat_a
+        self.input_embeddings[indices] = flat_e
+        self.rewards[indices] = flat_r
+        self.dones[indices] = flat_d
+        self.labels[indices] = flat_l
 
         self.ptr = (self.ptr + N) % self.capacity
         self.size = min(self.size + N, self.capacity)
 
     def sample(
-        self, batch_size: int, device: str = "cuda"
+        self, batch_size: int
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor,
     ]:
-        indices = torch.randint(0, self.size, (batch_size,))
+        """Sample batch. Returns (s, a, r, d, input_emb, labels). All on GPU."""
+        indices = torch.randint(0, self.size, (batch_size,), device=self.device)
         return (
-            self.states[indices].to(device, non_blocking=True),
-            self.actions[indices].to(device, non_blocking=True),
-            self.rewards[indices].to(device, non_blocking=True),
-            self.next_states[indices].to(device, non_blocking=True),
-            self.dones[indices].to(device, non_blocking=True),
-            self.input_embeddings[indices].to(device, non_blocking=True),
-            self.labels[indices].to(device, non_blocking=True),
+            self.states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.dones[indices],
+            self.input_embeddings[indices],
+            self.labels[indices],
         )
 
 
@@ -639,7 +607,8 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints/rl_td3")
 
     # TD3 hyperparameters
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gamma", type=float, default=0.5,
+                        help="Discount factor. Low values recommended for long-horizon (96-step) tasks")
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--policy_noise", type=float, default=0.1)
     parser.add_argument("--noise_clip", type=float, default=0.3)
@@ -651,11 +620,15 @@ def main():
     parser.add_argument("--critic_warmup_steps", type=int, default=1000,
                         help="Number of critic-only training steps before enabling actor updates")
 
-    # Behavioral Cloning regularization (TD3+BC)
-    parser.add_argument("--bc_lambda", type=float, default=1.0,
-                        help="BC regularization weight: L_actor = -Q(s,a) + λ*||a - a_pretrained||²")
-    parser.add_argument("--bc_decay", type=float, default=0.9999,
-                        help="Per-step decay for bc_lambda (gradually reduce BC constraint)")
+    # TD3+BC: BC is primary term (weight=1), Q is weighted bonus
+    # actor_loss = -lam * Q(s,a).mean() + BC_loss
+    # where lam = bc_alpha / (bc_alpha + mean(|Q|))
+    parser.add_argument("--bc_alpha", type=float, default=2.5,
+                        help="TD3+BC alpha: controls Q-term weight. lam = alpha/(alpha+|Q|)")
+
+    # Subsample transitions per collection step to preserve buffer diversity
+    parser.add_argument("--buffer_collect_size", type=int, default=4096,
+                        help="Max transitions to store per collection step (subsample from T*B)")
 
     # Training
     parser.add_argument("--lr_actor", type=float, default=1e-5)
@@ -767,10 +740,11 @@ def main():
     # -----------------------------------------------------------------------
     # 5. Replay buffer & reward normalizer
     # -----------------------------------------------------------------------
-    print(f"Creating replay buffer (capacity={args.buffer_size})...")
+    print(f"Creating replay buffer (capacity={args.buffer_size}, device={device})...")
     replay_buffer = ReplayBuffer(
         capacity=args.buffer_size, seq_len=full_seq_len,
         hidden_size=hidden_size, label_seq_len=seq_len,
+        device=device,
     )
     # Fix #3: reward normalization
     reward_normalizer = RewardNormalizer(clip=5.0)
@@ -815,11 +789,12 @@ def main():
     print(f"  total_steps={args.total_steps}")
     print(f"  num_unroll_steps={args.num_unroll_steps}")
     print(f"  buffer_size={args.buffer_size}, td3_batch_size={args.td3_batch_size}")
+    print(f"  buffer_collect_size={args.buffer_collect_size}")
     print(f"  warmup_steps={args.warmup_steps} (buffer fill)")
     print(f"  critic_warmup_steps={args.critic_warmup_steps} (critic-only phase)")
     print(f"  gamma={args.gamma}, tau={args.tau}, q_clip={args.q_clip}")
     print(f"  policy_delay={args.policy_delay}")
-    print(f"  bc_lambda={args.bc_lambda}, bc_decay={args.bc_decay}")
+    print(f"  bc_alpha={args.bc_alpha} (TD3+BC: lam=alpha/(alpha+|Q|))")
     print(f"  exploration_noise={args.exploration_noise}")
     print(f"  policy_noise={args.policy_noise}")
     print("=" * 60)
@@ -833,9 +808,6 @@ def main():
     # Use compiled actor_step for training (uncompiled for target networks)
     train_actor_step = compiled_actor_step
 
-    # CUDA stream for async buffer transfer (Fix #6)
-    transfer_stream = torch.cuda.Stream() if device == "cuda" else None
-
     critic_losses = []
     actor_losses = []
     rewards_collected = []
@@ -843,7 +815,7 @@ def main():
     T = args.num_unroll_steps
     last_actor_loss = None
     last_bc_loss = None
-    current_bc_lambda = args.bc_lambda
+    last_lam = 0.0
     critic_update_count = 0  # Track critic updates for warmup phase
 
     progress = tqdm(range(1, args.total_steps + 1), desc="RL Training")
@@ -870,15 +842,14 @@ def main():
 
         hidden = inner.init_hidden.expand(B, full_seq_len, -1).clone()
 
-        # Pre-allocate GPU buffers for all transitions (Fix #1)
+        # Pre-allocate GPU buffers for all transitions
         all_states = torch.empty(T, B, full_seq_len, hidden_size,
                                  device=device, dtype=torch.bfloat16)
         all_actions = torch.empty_like(all_states)
-        all_next_states = torch.empty_like(all_states)
         all_rewards = torch.empty(T, B, device=device, dtype=torch.float32)
         all_dones = torch.zeros(T, B, device=device, dtype=torch.bool)
 
-        # Pure GPU unroll loop — no CPU transfers or .item() calls (Fix #4)
+        # Pure GPU unroll loop
         with torch.no_grad():
             for t in range(T):
                 state_t = hidden
@@ -896,59 +867,69 @@ def main():
                     lm_head, noisy_next_state, batch_gpu["labels"], puzzle_emb_len
                 )
 
-                # Store in GPU buffers (no CPU transfer)
+                # Store in GPU buffers (no transfers)
                 all_states[t] = state_t.to(torch.bfloat16)
                 all_actions[t] = noisy_action.to(torch.bfloat16)
-                all_next_states[t] = noisy_next_state.to(torch.bfloat16)
                 all_rewards[t] = reward
                 if t == T - 1:
                     all_dones[t] = True
 
                 hidden = noisy_next_state
 
-        # Single reward stats update after loop (Fix #2: vectorized)
+        # Reward stats update (vectorized, on GPU)
         reward_normalizer.update(all_rewards)
-        # Single .item() call for logging (Fix #4)
         mean_reward_this_step = all_rewards.mean().item()
         rewards_collected.append(mean_reward_this_step)
 
-        # Expand input_emb and labels to [T, B, ...] for batch buffer add
+        # Expand input_emb and labels to [T, B, ...]
         all_input_embs = input_emb.unsqueeze(0).expand(T, -1, -1, -1).to(torch.bfloat16)
         all_labels = batch_gpu["labels"].unsqueeze(0).expand(T, -1, -1)
 
-        # Async GPU->CPU transfer on separate stream (Fix #6)
-        if transfer_stream is not None:
-            torch.cuda.current_stream().synchronize()
-            with torch.cuda.stream(transfer_stream):
-                replay_buffer.add_batch(
-                    all_states, all_actions, all_rewards,
-                    all_next_states, all_dones, all_input_embs, all_labels,
-                )
+        # Subsample transitions to preserve buffer diversity
+        N_total = T * B
+        N_keep = min(N_total, args.buffer_collect_size)
+        if N_keep < N_total:
+            perm = torch.randperm(N_total, device=device)[:N_keep]
+            t_idx = perm // B
+            b_idx = perm % B
+            sub_states = all_states[t_idx, b_idx].unsqueeze(0)
+            sub_actions = all_actions[t_idx, b_idx].unsqueeze(0)
+            sub_rewards = all_rewards[t_idx, b_idx].unsqueeze(0)
+            sub_dones = all_dones[t_idx, b_idx].unsqueeze(0)
+            sub_embs = all_input_embs[t_idx, b_idx].unsqueeze(0)
+            sub_labels = all_labels[t_idx, b_idx].unsqueeze(0)
         else:
-            replay_buffer.add_batch(
-                all_states, all_actions, all_rewards,
-                all_next_states, all_dones, all_input_embs, all_labels,
-            )
+            sub_states = all_states
+            sub_actions = all_actions
+            sub_rewards = all_rewards
+            sub_dones = all_dones
+            sub_embs = all_input_embs
+            sub_labels = all_labels
+
+        # Direct GPU write — no CPU transfer needed
+        replay_buffer.add_batch(
+            sub_states, sub_actions, sub_rewards,
+            sub_dones, sub_embs, sub_labels,
+        )
 
         # === TD3+BC UPDATES ===
         if replay_buffer.size < args.warmup_steps:
             progress.set_postfix(buffer=replay_buffer.size)
             continue
 
-        # Wait for buffer transfer to complete before sampling
-        if transfer_stream is not None:
-            transfer_stream.synchronize()
+        # Sample from GPU buffer — no CPU→GPU transfer
+        (s, a, r, d, stored_input_emb, stored_labels
+         ) = replay_buffer.sample(args.td3_batch_size)
 
-        # Sample from buffer
-        (s, a, r, s_next, d, stored_input_emb, stored_labels
-         ) = replay_buffer.sample(args.td3_batch_size, device=device)
+        # Reconstruct next_state on GPU: s' = s + u + a
+        s_next = s + stored_input_emb + a
 
         # Normalize rewards for Q-learning
         r_norm = reward_normalizer.normalize(r)
 
         # --- Critic update (always runs) ---
         with torch.no_grad():
-            # Target action (uncompiled — target nets change slowly)
+            # Target action
             _, target_action = actor_step(layers_target, cos_sin, s_next, stored_input_emb)
             # Target policy smoothing
             noise = (
@@ -979,26 +960,29 @@ def main():
         soft_update(critic_1_target, critic_1, args.tau)
         soft_update(critic_2_target, critic_2, args.tau)
 
-        # --- Delayed actor update with critic warmup gate + BC regularization ---
+        # --- Delayed actor update with critic warmup gate + TD3+BC ---
         actor_update_allowed = critic_update_count > args.critic_warmup_steps
         if actor_update_allowed and step % args.policy_delay == 0:
             _, actor_action = train_actor_step(layers, cos_sin, s, stored_input_emb)
 
-            # Q-value maximization loss
-            q_loss = -critic_1(s, actor_action).mean()
+            # Q-value term
+            q_val = critic_1(s, actor_action).mean()
 
-            # BC regularization: penalize deviation from pretrained policy
+            # BC term: penalize deviation from pretrained policy
             with torch.no_grad():
                 _, pretrained_action = actor_step(
                     pretrained_layers, cos_sin, s, stored_input_emb
                 )
             bc_loss = F.mse_loss(actor_action, pretrained_action)
 
-            # Combined actor loss: TD3+BC
-            # Normalize Q-loss by its absolute value to balance with BC loss
-            # (following TD3+BC paper: α/(α/|Q|) * Q + λ * BC)
-            q_abs_mean = current_q1.detach().abs().mean().clamp(min=1.0)
-            actor_loss = q_loss / q_abs_mean + current_bc_lambda * bc_loss
+            # TD3+BC (Fujimoto & Gu, 2021):
+            #   actor_loss = -lam * Q(s, pi(s)).mean() + BC_loss
+            #   lam = alpha / (alpha + mean(|Q|))
+            # BC is the PRIMARY term (weight=1), Q is a small weighted bonus.
+            # This prevents the actor from chasing inaccurate Q estimates.
+            q_abs_mean = current_q1.detach().abs().mean().clamp(min=1e-6)
+            lam = args.bc_alpha / (args.bc_alpha + q_abs_mean)
+            actor_loss = -lam * q_val + bc_loss
 
             actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -1006,9 +990,7 @@ def main():
             actor_optimizer.step()
             last_actor_loss = actor_loss.item()
             last_bc_loss = bc_loss.item()
-
-            # Decay BC lambda (gradually allow more RL-driven updates)
-            current_bc_lambda *= args.bc_decay
+            last_lam = lam.item() if isinstance(lam, torch.Tensor) else lam
 
             # Soft update actor target
             soft_update(actor_target_layers, actor.inner.layers, args.tau)
@@ -1024,8 +1006,8 @@ def main():
                 phase=phase,
                 c_loss=f"{critic_loss.item():.4f}",
                 a_loss=f"{a_loss_val:.4f}",
-                bc=f"{bc_loss_val:.4f}",
-                bc_λ=f"{current_bc_lambda:.4f}",
+                bc=f"{bc_loss_val:.6f}",
+                lam=f"{last_lam:.4f}",
                 reward=f"{avg_r:.4f}",
                 buf=replay_buffer.size,
             )
