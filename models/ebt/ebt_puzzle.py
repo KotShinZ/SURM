@@ -61,6 +61,13 @@ class EBTPuzzleConfig(BaseModel):
     denoising_initial_condition: str = "zeros"  # "zeros" or "random_noise"
     clamp_grad_max: float = 0.0  # 0 = disabled
 
+    # URM-style inner cycles: repeat layers L_cycles times per MCMC step with input re-injection
+    L_cycles: int = 6
+
+    # Probability of halting (resetting carry) per forward call during training.
+    # ~10% keeps diverse carry states; 1.0 = always reset (original behaviour).
+    halt_prob: float = 0.1
+
     # Inference step count (pretrain.py reads this via ``_get_loop_config``)
     loops: int = 16
 
@@ -74,10 +81,16 @@ class EBTPuzzleConfig(BaseModel):
 
 @dataclass
 class EBTCarry:
-    """Minimal carry: EBT does all MCMC steps in a single forward call."""
+    """Carry state persisted between forward calls.
+
+    ``predicted_logits`` stores the last MCMC output so that non-halted
+    examples continue refining from where they left off rather than
+    restarting from zeros every call.
+    """
     steps: torch.Tensor
     halted: torch.Tensor
     current_data: Dict[str, torch.Tensor]
+    predicted_logits: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +263,41 @@ class EBTPuzzle(nn.Module):
 
     # -- interface expected by pretrain.py (via loss head) --
 
+    def _make_init_logits(self, B: int, S: int, device: torch.device) -> torch.Tensor:
+        """Return freshly initialised predicted logits for halted (reset) examples."""
+        V = self.config.vocab_size
+        if self.config.denoising_initial_condition == "zeros":
+            return torch.zeros(B, S, V, device=device, dtype=torch.float32)
+        elif self.config.denoising_initial_condition == "random_noise":
+            return torch.randn(B, S, V, device=device, dtype=torch.float32) * 0.01
+        else:
+            raise ValueError(
+                f"Unknown denoising_initial_condition: {self.config.denoising_initial_condition}"
+            )
+
+    def reset_carry(self, carry: EBTCarry, B: int, S: int, device: torch.device) -> EBTCarry:
+        """Reset predicted_logits only for halted examples (mirrors URM's reset_carry)."""
+        init_logits = self._make_init_logits(B, S, device)
+        new_predicted_logits = torch.where(
+            carry.halted.view(-1, 1, 1),
+            init_logits,
+            carry.predicted_logits,
+        )
+        return EBTCarry(
+            steps=torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps),
+            halted=carry.halted,
+            current_data=carry.current_data,
+            predicted_logits=new_predicted_logits,
+        )
+
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> EBTCarry:
-        B = batch["inputs"].shape[0]
+        B, S = batch["inputs"].shape[:2]
         device = batch["inputs"].device
         return EBTCarry(
             steps=torch.zeros(B, dtype=torch.int32, device=device),
             halted=torch.ones(B, dtype=torch.bool, device=device),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            predicted_logits=self._make_init_logits(B, S, device),
         )
 
     def forward(
@@ -265,7 +306,7 @@ class EBTPuzzle(nn.Module):
         batch: Dict[str, torch.Tensor],
         compute_target_q: bool = False,
     ) -> Tuple[EBTCarry, Dict[str, torch.Tensor]]:
-        # --- handle carry (new data for halted examples) ---
+        # --- update current_data for halted examples (load new puzzle) ---
         new_current_data = {
             k: torch.where(
                 carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)),
@@ -277,7 +318,10 @@ class EBTPuzzle(nn.Module):
 
         inputs = new_current_data["inputs"]
         B, S = inputs.shape
-        V = self.config.vocab_size
+
+        # --- reset carry: only halted examples get fresh predicted_logits ---
+        # (mirrors URM: new_carry = self.inner.reset_carry(carry.halted, carry))
+        carry = self.reset_carry(carry, B, S, inputs.device)
 
         # pretrain.py wraps evaluation in torch.inference_mode() which blocks
         # autograd.  We need gradients for the MCMC loop, so temporarily exit
@@ -291,15 +335,8 @@ class EBTPuzzle(nn.Module):
             cos_sin = self.rotary_emb()
             alpha = torch.clamp(self.alpha, min=0.0001)
 
-            # --- initialise predicted logits ---
-            if self.config.denoising_initial_condition == "zeros":
-                predicted_logits = torch.zeros(B, S, V, device=inputs.device, dtype=torch.float32)
-            elif self.config.denoising_initial_condition == "random_noise":
-                predicted_logits = torch.randn(B, S, V, device=inputs.device, dtype=torch.float32) * 0.01
-            else:
-                raise ValueError(
-                    f"Unknown denoising_initial_condition: {self.config.denoising_initial_condition}"
-                )
+            # Start MCMC from the (selectively reset) carry logits.
+            predicted_logits = carry.predicted_logits.detach()
 
             num_steps = self.config.mcmc_num_steps if self.training else self.config.loops
 
@@ -324,12 +361,14 @@ class EBTPuzzle(nn.Module):
                     else:
                         pred_embeddings_full = pred_embeddings
 
-                    # combine input + predicted embeddings
-                    hidden = input_embeddings + pred_embeddings_full.to(input_embeddings.dtype)
-
-                    # transformer forward
-                    for layer in self.layers:
-                        hidden = layer(cos_sin=cos_sin, hidden_states=hidden)
+                    # L_cycles: URM-style repeated layer passes with input re-injection.
+                    # hidden starts from pred_embeddings; each cycle adds input_embeddings
+                    # before passing through all transformer layers (same as URM's L_cycles).
+                    hidden = pred_embeddings_full.to(input_embeddings.dtype)
+                    for _ in range(self.config.L_cycles):
+                        hidden = hidden + input_embeddings
+                        for layer in self.layers:
+                            hidden = layer(cos_sin=cos_sin, hidden_states=hidden)
 
                     # scalar energy (from non-puzzle positions)
                     energy = self.energy_head(hidden[:, self.puzzle_emb_len:])  # (B, S, 1)
@@ -353,13 +392,28 @@ class EBTPuzzle(nn.Module):
                     # MCMC update
                     predicted_logits = predicted_logits - alpha * grad
 
+        # --- determine halted for next call ---
+        # carry.steps was already reset-to-0 for halted examples in reset_carry;
+        # increment by 1 to count the step we just completed.
+        # During training: halt randomly with halt_prob so that diverse carry states
+        # accumulate (analogous to URM's exploration).  Always force halt once
+        # new_steps reaches loops so that the pretrain.py carry loop terminates.
+        # At inference always halt so that every example delivers a final answer.
+        with torch.no_grad():
+            new_steps = carry.steps + 1
+            if self.training:
+                halted = (torch.rand(B, device=inputs.device) < self.config.halt_prob) | (new_steps >= self.config.loops)
+            else:
+                halted = torch.ones(B, dtype=torch.bool, device=inputs.device)
+
         # --- outputs ---
         outputs: Dict[str, torch.Tensor] = {"logits": predicted_logits}
 
         new_carry = EBTCarry(
-            steps=torch.ones(B, dtype=torch.int32, device=inputs.device),
-            halted=torch.ones(B, dtype=torch.bool, device=inputs.device),
+            steps=new_steps,
+            halted=halted,
             current_data=new_current_data,
+            predicted_logits=predicted_logits.detach(),
         )
         return new_carry, outputs
 
