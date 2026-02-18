@@ -1,0 +1,31 @@
+name: urm.urm_energy@URM
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+loops: 16
+num_layers: 8
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+H_cycles: 2
+L_cycles: 6
+
+mcmc_step_size: 100.0
+mcmc_step_size_learnable: true
+
+loop_deltas: [0, 8]
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+
+profile: true
+
+eval_interval: 1000
+checkpoint_every_eval: True
+checkpoint_path: .cache/checkpoint
+
+ema: True
+ema_rate: 0.999
