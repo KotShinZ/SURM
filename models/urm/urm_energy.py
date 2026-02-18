@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, ConvSwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, apply_rotary_pos_emb
 from models.sparse_embedding import CastedSparseEmbedding
 
 
@@ -37,17 +37,49 @@ class URMConfig(BaseModel):
     L_cycles: int
     H_cycles: int
     forward_dtype: str = "bfloat16"
+    mcmc_step_size: float = 100.0
+    mcmc_step_size_learnable: bool = True
+
+
+class EBTAttention(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads):
+        super().__init__()
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.qkv_proj = CastedLinear(hidden_size, (num_heads + 2 * num_key_value_heads) * head_dim, bias=False)
+        self.o_proj = CastedLinear(self.output_size, hidden_size, bias=False)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, window_size=-1) -> torch.Tensor:
+        B, S, _ = hidden_states.shape
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(B, S, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        q = qkv[:, :, :self.num_heads]
+        k = qkv[:, :, self.num_heads:self.num_heads + self.num_key_value_heads]
+        v = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(scores.float(), dim=-1).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, S, self.output_size)
+        return self.o_proj(attn_output)
 
 
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
-        self.self_attn = Attention(
+        self.self_attn = EBTAttention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            causal=False,
         )
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
@@ -79,6 +111,11 @@ class URM_Inner(nn.Module):
         )
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.energy_head = CastedLinear(self.config.hidden_size, 1, bias=False)
+        self.alpha = nn.Parameter(
+            torch.tensor(float(self.config.mcmc_step_size)),
+            requires_grad=self.config.mcmc_step_size_learnable,
+        )
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
 
         if self.config.puzzle_emb_ndim > 0:
@@ -97,11 +134,6 @@ class URM_Inner(nn.Module):
         )
 
         self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
-
-        self.init_hidden = nn.Buffer(
-            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
-            persistent=True,
-        )
 
         with torch.no_grad():
             self.q_head.weight.zero_()
@@ -123,7 +155,7 @@ class URM_Inner(nn.Module):
 
     def empty_carry(self, batch_size: int) -> URMCarry:
         return URMCarry(
-            current_hidden=torch.empty(
+            current_hidden=torch.zeros(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
@@ -134,7 +166,7 @@ class URM_Inner(nn.Module):
     def reset_carry(self, reset_flag: torch.Tensor, carry: URMCarry) -> URMCarry:
         new_hidden = torch.where(
             reset_flag.view(-1, 1, 1),
-            self.init_hidden,
+            torch.zeros_like(carry.current_hidden),
             carry.current_hidden
         )
         return replace(carry, current_hidden=new_hidden)
@@ -148,22 +180,34 @@ class URM_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         hidden_states = carry.current_hidden
+        alpha = torch.clamp(self.alpha, min=1e-4)
+
         if self.config.H_cycles > 1:
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                        with torch.enable_grad():
+                            hs = hidden_states.detach().requires_grad_(True)
+                            h = hs + input_embeddings.detach()
+                            for layer in self.layers:
+                                h = layer(hidden_states=h, **seq_info)
+                            energy = self.energy_head(h).to(torch.float32).sum()
+                            grad = torch.autograd.grad(energy, hs)[0]
+                        hidden_states = (hs - alpha.detach() * grad.detach()).detach()
 
-        for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
+        for l in range(self.config.L_cycles):
+            hs = hidden_states.detach().requires_grad_(True)
+            h = hs + input_embeddings
             for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                h = layer(hidden_states=h, **seq_info)
+            energy = self.energy_head(h).to(torch.float32).sum()
+            create_graph = (l == self.config.L_cycles - 1) and self.training
+            grad = torch.autograd.grad(energy, hs, create_graph=create_graph)[0]
+            hidden_states = hs - alpha * grad
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
+        q_logits = self.q_head(h[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
