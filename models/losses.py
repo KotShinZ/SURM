@@ -178,32 +178,33 @@ class ACTLossHead(nn.Module):
 
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
+            use_act = getattr(getattr(self.model, "config", None), "use_act", True)
             metrics = {
                 "count": valid_metrics.sum(),
 
                 "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
-                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+            if use_act:
+                metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
 
         # Losses
         # FIXME: Assuming the batch is always full
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        metrics["lm_loss"] = lm_loss.detach()
 
-        metrics.update({
-            "lm_loss": lm_loss.detach(),
-            "q_halt_loss": q_halt_loss.detach(),
-        })
-
-        # Q continue (bootstrapping target loss)
+        q_halt_loss = 0
         q_continue_loss = 0
-        if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
+        if use_act:
+            q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+            metrics["q_halt_loss"] = q_halt_loss.detach()
 
-            metrics["q_continue_loss"] = q_continue_loss.detach()
+            # Q continue (bootstrapping target loss)
+            if "target_q_continue" in outputs:
+                q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
+                metrics["q_continue_loss"] = q_continue_loss.detach()
 
         aux_loss = outputs.get("moe_aux_loss")
         if aux_loss is not None:

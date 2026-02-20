@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, ConvSwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, apply_rotary_pos_emb
 from models.sparse_embedding import CastedSparseEmbedding
+from models.losses import IGNORE_LABEL_ID, stablemax_cross_entropy, softmax_cross_entropy
 
 
 @dataclass
@@ -39,6 +40,7 @@ class URMConfig(BaseModel):
     forward_dtype: str = "bfloat16"
     mcmc_step_size: float = 100.0
     mcmc_step_size_learnable: bool = True
+    use_act: bool = True
 
 
 class EBTAttention(nn.Module):
@@ -261,7 +263,7 @@ class URM(nn.Module):
             new_steps = new_steps + 1
             halted = (new_steps >= self.config.loops)
 
-            if self.training and (self.config.loops > 1):
+            if self.config.use_act and self.training and (self.config.loops > 1):
                 halted = halted | (q_halt_logits > 0)
 
                 # Exploration

@@ -15,6 +15,7 @@ L_cycles: 6
 
 mcmc_step_size: 100.0
 mcmc_step_size_learnable: true
+use_act: false
 
 loop_deltas: [0, 8]
 
