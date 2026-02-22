@@ -61,6 +61,84 @@ class URMBlock(nn.Module):
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
+    
+class DDLUpdate(nn.Module):
+    """
+    スカラー値レジーム (d_v = 1) 向けのDeep Delta Learning更新モジュール
+    """
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        
+        # ゲートブランチ beta(X): 出力範囲は (0, 2)
+        self.beta_proj = CastedLinear(hidden_size, 1, bias=True)
+
+        # 値ブランチ v(X)
+        self.v_proj = CastedLinear(hidden_size, 1, bias=True)
+
+        # betaの初期値が1.0付近（直交射影）になるようにロジットのバイアスを0.0で初期化
+        nn.init.constant_(self.beta_proj.bias, 0.0)
+
+    def forward(self, x: torch.Tensor, x_ctx: torch.Tensor, f_out: torch.Tensor) -> torch.Tensor:
+        """
+        x: 現在の残差状態 (x_l)
+        x_ctx: 正規化されたコンテキスト (RMSNorm(x_l))
+        f_out: サブレイヤーの出力 (\tilde{k}_l)
+        """
+        # 1. ゲート \beta_l \in (0, 2)
+        beta = 2.0 * torch.sigmoid(self.beta_proj(x_ctx))
+        
+        # 2. 値 v_l 
+        v = self.v_proj(x)
+        
+        # 3. 精度に配慮した k_l の L2正規化
+        d = self.hidden_size
+        variance = f_out.pow(2).mean(dim=-1, keepdim=True)
+        k_hat = f_out * torch.rsqrt(variance + (self.eps ** 2) / d)
+        k = k_hat / math.sqrt(d)
+        
+        # 4. ランク1 Delta更新: x_{l+1} = x_l + \beta_l * (v_l - k_l^T x_l) * k_l
+        k_dot_x = (k * x).sum(dim=-1, keepdim=True)
+        x_next = x + beta * (v - k_dot_x) * k
+        
+        return x_next
+
+
+class DDLURMBlock(nn.Module):
+    def __init__(self, config: URMConfig) -> None:
+        super().__init__()
+        self.norm_eps = config.rms_norm_eps
+        
+        # サブレイヤー
+        self.self_attn = Attention(
+            hidden_size=config.hidden_size,
+            head_dim=config.hidden_size // config.num_heads,
+            num_heads=config.num_heads,
+            num_key_value_heads=config.num_heads,
+            causal=False,
+        )
+        self.mlp = ConvSwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+        )
+        
+        # 各サブレイヤー用のDDLモジュール
+        self.attn_ddl = DDLUpdate(config.hidden_size, self.norm_eps)
+        self.mlp_ddl = DDLUpdate(config.hidden_size, self.norm_eps)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # --- Attention サブレイヤー ---
+        x_ctx_attn = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=x_ctx_attn, window_size=-1)
+        hidden_states = self.attn_ddl(hidden_states, x_ctx_attn, attn_output)
+        
+        # --- ConvSwiGLU サブレイヤー ---
+        x_ctx_mlp = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+        mlp_output = self.mlp(x_ctx_mlp)
+        hidden_states = self.mlp_ddl(hidden_states, x_ctx_mlp, mlp_output)
+        
+        return hidden_states
 
 
 class URM_Inner(nn.Module):
@@ -96,7 +174,7 @@ class URM_Inner(nn.Module):
             base=self.config.rope_theta,
         )
 
-        self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
+        self.layers = nn.ModuleList([DDLURMBlock(self.config) for _ in range(self.config.num_layers)])
 
         self.init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
