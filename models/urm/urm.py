@@ -48,10 +48,12 @@ class URMBlock(nn.Module):
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
             causal=False,
+            attn_dropout=config.attn_dropout,
         )
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
+            mlp_dropout=config.mlp_dropout,
         )
         self.norm_eps = config.rms_norm_eps
 
