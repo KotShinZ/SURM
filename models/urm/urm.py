@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
-
+from logger import global_logger
 
 @dataclass
 class URMCarry:
@@ -186,6 +186,10 @@ class URM(nn.Module):
             halted=torch.ones((batch_size,), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
+        
+    def norm_func(self, x1, x2):
+        #return torch.norm(x1 - x2, dim=(1,2))
+        return torch.norm(x1 - x2, dim=(1,2)) / (1e-7 + torch.norm(x1 + x2, dim=(1,2)) / 2)
 
     def forward(
         self,
@@ -205,7 +209,14 @@ class URM(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_carry, new_current_data)
+        new_carry2, logits, (q_halt_logits, q_continue_logits) = self.inner(new_carry, new_current_data)
+        
+        hidden_diff_norm = self.norm_func(new_carry2.current_hidden.detach(), new_carry.current_hidden.detach())
+        sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
+        steps_count = torch.bincount(new_carry2.steps.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
+        mean_norm_with_steps = sum_norm_with_steps / steps_count.clamp_min(1)
+        if global_logger.is_log:
+            global_logger.store("mean_norm_with_steps", mean_norm_with_steps)
 
         outputs = {
             "logits": logits,
@@ -224,10 +235,13 @@ class URM(nn.Module):
                 halt_exploration_prob = 0.1
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
+                
+                # if getattr(getattr(self.config, "config", None), "use_act", True) == False:
+                halted = halted | (hidden_diff_norm < 0.001)
 
         return (
             URMCarry(
-                current_hidden=new_carry.current_hidden,
+                current_hidden=new_carry2.current_hidden,
                 steps=new_steps,
                 halted=halted,
                 current_data=new_current_data,
