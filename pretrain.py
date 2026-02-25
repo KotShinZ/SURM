@@ -135,6 +135,8 @@ class PretrainConfig(pydantic.BaseModel):
 
     use_muon: bool = False
 
+    data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
+
 
 
 @dataclass
@@ -150,9 +152,11 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
+    data_fraction = config.data_fraction if not kwargs.get("test_set_mode", False) else 1.0
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
-            seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size, **kwargs
+            seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
+            data_fraction=data_fraction, **kwargs
         ),
         split=split,
     )
@@ -270,6 +274,7 @@ def init_train_state(
     total_steps = int(
         config.epochs
         * train_metadata.total_groups
+        * config.data_fraction
         * train_metadata.mean_puzzle_examples
         / effective_gbs
     )

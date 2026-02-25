@@ -37,3 +37,6 @@ puzzle_emb_weight_decay: 0.1
 puzzle_emb_lr: 1e-2
 
 use_muon: False
+
+# Fraction of training groups to use per epoch (1.0 = all, 0.5 = half)
+data_fraction: 1.0

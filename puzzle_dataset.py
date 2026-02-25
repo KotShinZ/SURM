@@ -49,6 +49,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     rank: int
     num_replicas: int
 
+    data_fraction: float = 1.0  # Fraction of training groups to use per epoch (1.0 = all)
+
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -159,7 +161,9 @@ class PuzzleDataset(IterableDataset):
             # Randomly shuffle groups
             rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
 
-            group_order = np.concatenate([rng.permutation(dataset["group_indices"].size - 1) for _i in range(self.config.epochs_per_iter)])
+            num_groups = dataset["group_indices"].size - 1
+            groups_per_epoch = max(1, round(num_groups * self.config.data_fraction))
+            group_order = np.concatenate([rng.permutation(num_groups)[:groups_per_epoch] for _i in range(self.config.epochs_per_iter)])
             start_index = 0
             
             while start_index < group_order.size:
