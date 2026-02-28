@@ -11,7 +11,7 @@ from models.losses import IGNORE_LABEL_ID
 from data.common import PuzzleDatasetMetadata
 
 
-def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int):
+def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int, data_fraction: float = 1.0):
     # Pack examples into a full batch
     batch = []
     batch_puzzle_indices = []
@@ -20,7 +20,11 @@ def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indi
     while (start_index < group_order.size) and (current_size < global_batch_size):
         # Pick a group and a puzzle from that group
         group_id = group_order[start_index]
-        puzzle_id = rng.integers(group_indices[group_id], group_indices[group_id + 1])
+        group_start = group_indices[group_id]
+        group_end = group_indices[group_id + 1]
+        # Limit puzzles per group based on data_fraction
+        group_end_limited = group_start + max(1, round((group_end - group_start) * data_fraction))
+        puzzle_id = rng.integers(group_start, group_end_limited)
         start_index += 1
 
         # Get range of the puzzle
@@ -162,10 +166,9 @@ class PuzzleDataset(IterableDataset):
             rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
 
             num_groups = dataset["group_indices"].size - 1
-            groups_per_epoch = max(1, round(num_groups * self.config.data_fraction))
-            group_order = np.concatenate([rng.permutation(num_groups)[:groups_per_epoch] for _i in range(self.config.epochs_per_iter)])
+            group_order = np.concatenate([rng.permutation(num_groups) for _i in range(self.config.epochs_per_iter)])
             start_index = 0
-            
+
             while start_index < group_order.size:
                 start_index, batch_indices, batch_puzzle_indices = _sample_batch(
                     rng,
@@ -174,6 +177,7 @@ class PuzzleDataset(IterableDataset):
                     group_indices=dataset["group_indices"],
                     start_index=start_index,
                     global_batch_size=self.config.global_batch_size,
+                    data_fraction=self.config.data_fraction,
                 )
 
                 # Select current rank and collate

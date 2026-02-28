@@ -932,12 +932,12 @@ def launch(hydra_config: DictConfig):
     for _iter_id in range(total_iters):
         if RANK == 0:
             count = 0
-            for set_name, batch, global_batch_size in train_loader:
-                count += 1
+            # for set_name, batch, global_batch_size in train_loader:
+            #     count += 1
             print(f"_iter_id: {_iter_id}")
             print(f"train_epochs_per_iter: {train_epochs_per_iter}")
             print(f"total_iters: {total_iters}")
-            print(f"train_loader len: {count}")
+            #print(f"train_loader len: {count}")
             print(f"Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
