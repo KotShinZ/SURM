@@ -927,6 +927,7 @@ def launch(hydra_config: DictConfig):
     print(f"Total parameters: {total_params}")
     for name, param in train_state.model.named_parameters():
         print(f"Parameter: {name}, Shape: {param.shape}, Size: {param.numel()}")
+    print(eval_loader, eval_metadata, evaluators)
 
     # Training Loop
     for _iter_id in range(total_iters):
