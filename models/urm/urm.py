@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, ConvSwiGLU, ConvSwiGLU2D, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 
@@ -37,6 +37,8 @@ class URMConfig(BaseModel):
     L_cycles: int
     H_cycles: int
     forward_dtype: str = "bfloat16"
+    grid_h: int = 30
+    grid_w: int = 30
 
 
 class URMBlock(nn.Module):
@@ -49,9 +51,13 @@ class URMBlock(nn.Module):
             num_key_value_heads=config.num_heads,
             causal=False,
         )
-        self.mlp = ConvSwiGLU(
+        puzzle_emb_len = -(config.puzzle_emb_ndim // -config.hidden_size) if config.puzzle_emb_ndim > 0 else 0
+        self.mlp = ConvSwiGLU2D(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
+            grid_h=config.grid_h,
+            grid_w=config.grid_w,
+            prefix_len=puzzle_emb_len,
         )
         self.norm_eps = config.rms_norm_eps
 
@@ -146,6 +152,8 @@ class URM_Inner(nn.Module):
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(cos_sin=self.rotary_emb())
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        # print("puzzle_identifiers", batch["puzzle_identifiers"].shape, batch["puzzle_identifiers"].dtype)
+        # print("input_embeddings", input_embeddings.shape, input_embeddings.dtype)
 
         hidden_states = carry.current_hidden
         if self.config.H_cycles > 1:

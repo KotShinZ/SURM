@@ -196,6 +196,76 @@ class ConvSwiGLU(nn.Module):
         return x_out
 
 
+class ConvSwiGLU2D(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        grid_h: int,
+        grid_w: int,
+        conv_kernel: int = 2,
+        prefix_len: int = 0,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+
+        inter = intermediate_size if intermediate_size is not None else _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+        self.inter = inter
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.prefix_len = prefix_len
+
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.pad_size = conv_kernel // 2
+        self.dwconv = nn.Conv2d(
+            in_channels=inter,
+            out_channels=inter,
+            kernel_size=conv_kernel,
+            padding=0,
+            groups=inter,
+            bias=True,
+        ).to(dtype=torch.bfloat16)
+        self.conv_kernel = conv_kernel
+
+        self.act = nn.SiLU()
+        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        x_ffn = F.silu(gate) * up  # [batch, total_seq_len, inter]
+
+        batch = x_ffn.shape[0]
+
+        # Split prefix tokens and grid tokens
+        if self.prefix_len > 0:
+            prefix_ffn = x_ffn[:, :self.prefix_len]   # [batch, prefix_len, inter]
+            grid_ffn = x_ffn[:, self.prefix_len:]      # [batch, H*W, inter]
+        else:
+            prefix_ffn = None
+            grid_ffn = x_ffn
+
+        # Reshape grid tokens to 2D: [batch, inter, H, W]
+        grid_2d = grid_ffn.reshape(batch, self.grid_h, self.grid_w, self.inter)
+        grid_2d = grid_2d.permute(0, 3, 1, 2).to(self.dwconv.weight.dtype)
+
+        # Pad with -1 (represents "empty" in ARC grid encoding)
+        grid_2d = F.pad(grid_2d, (self.pad_size,) * 4, mode='constant', value=-1)
+
+        x_conv = self.dwconv(grid_2d)
+        # Clip to grid size (needed for even kernel sizes)
+        x_conv = x_conv[:, :, :self.grid_h, :self.grid_w]
+        x_conv = self.act(x_conv)
+        # Reshape back to [batch, H*W, inter]
+        x_conv = x_conv.permute(0, 2, 3, 1).reshape(batch, self.grid_h * self.grid_w, self.inter).contiguous()
+
+        if prefix_ffn is not None:
+            # Apply activation to prefix tokens (no conv)
+            prefix_out = self.act(prefix_ffn)
+            x_conv = torch.cat([prefix_out, x_conv], dim=1)
+
+        return self.down_proj(x_conv)
+
+
 class FullyLinearGLU(nn.Module):
     def __init__(self, hidden_size: int, expansion: float):
         super().__init__()
