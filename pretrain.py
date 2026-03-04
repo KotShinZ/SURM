@@ -25,6 +25,7 @@ from models.muon import Muon
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from logger import global_logger
 
 
 class EMAHelper(object):
@@ -132,6 +133,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     ema: bool = False
     ema_rate: float = 0.999
+    use_act: bool = False
 
     use_muon: bool = False
 
@@ -591,7 +593,7 @@ def train_batch(
     # Reduce metrics
     if len(metrics):
         assert not any(v.requires_grad for v in metrics.values())
-
+        
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
         metric_values = torch.stack([metrics[k] for k in metric_keys])
@@ -615,6 +617,12 @@ def train_batch(
             reduced_metrics = {f"train/{k}": _normalize_metric(k, v) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+            
+            if global_logger.is_log and train_state.step % 100 == 0:
+                logger_dict = global_logger.get_log_dict(train_state.step)
+                logger_dict = {f"train/{k}": v for k, v in logger_dict.items()}
+                reduced_metrics.update(logger_dict)
+            
             return reduced_metrics
 
 
