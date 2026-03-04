@@ -237,8 +237,14 @@ class URM(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
-                if getattr(getattr(self.config, "config", None), "use_act", True) == False:
-                    halted = halted | (hidden_diff_norm < 0.001)
+                if self.config.use_act == False:
+                    norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.02)
+                    norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.005)
+                    if norm_diff_max != norm_diff_min:
+                        norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
+                    else:
+                        norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
+                    halted = halted | (hidden_diff_norm < norm_diff_threshold)
 
         return (
             URMCarry(
