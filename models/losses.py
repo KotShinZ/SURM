@@ -179,7 +179,6 @@ class ACTLossHead(nn.Module):
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
             use_act = getattr(getattr(self.model, "config", None), "use_act", True)
-            use_act = False
             metrics = {
                 "count": valid_metrics.sum(),
 

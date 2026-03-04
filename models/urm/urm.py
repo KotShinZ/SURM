@@ -37,6 +37,7 @@ class URMConfig(BaseModel):
     L_cycles: int
     H_cycles: int
     forward_dtype: str = "bfloat16"
+    use_act: bool = True
 
 
 class URMBlock(nn.Module):
@@ -236,8 +237,8 @@ class URM(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
-                # if getattr(getattr(self.config, "config", None), "use_act", True) == False:
-                halted = halted | (hidden_diff_norm < 0.001)
+                if getattr(getattr(self.config, "config", None), "use_act", True) == False:
+                    halted = halted | (hidden_diff_norm < 0.001)
 
         return (
             URMCarry(

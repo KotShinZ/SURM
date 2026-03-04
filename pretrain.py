@@ -133,7 +133,6 @@ class PretrainConfig(pydantic.BaseModel):
 
     ema: bool = False
     ema_rate: float = 0.999
-    use_act: bool = False
 
     use_muon: bool = False
 
@@ -861,6 +860,9 @@ def launch(hydra_config: DictConfig):
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    if RANK == 0:
+        print("Config:")
+        print(config.model_dump_json(indent=2))
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
