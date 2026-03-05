@@ -98,7 +98,7 @@ class URM_Inner(nn.Module):
 
         self.rotary_emb = RotaryEmbedding(
             dim=self.config.hidden_size // self.config.num_heads,
-            max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+            max_position_embeddings=(self.config.seq_len + self.puzzle_emb_len) * self.config.L_cycles,
             base=self.config.rope_theta,
         )
 

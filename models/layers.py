@@ -127,10 +127,13 @@ class Attention(nn.Module):
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
 
-        # RoPE
+        # RoPE with offset for KV cache
+        rope_offset = kv_cache[0].shape[1] if kv_cache is not None else 0
         if cos_sin is not None:
             cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            cos_curr = cos[rope_offset: rope_offset + seq_len]
+            sin_curr = sin[rope_offset: rope_offset + seq_len]
+            query, key = apply_rotary_pos_emb(query, key, cos_curr, sin_curr)
 
         # Concatenate cached K, V from previous L_cycle iterations
         if kv_cache is not None:
