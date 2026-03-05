@@ -28,6 +28,6 @@ checkpoint_path: .cache/checkpoint
 ema: True
 ema_rate: 0.999
 
-use_act: False
+use_act: True
 norm_diff_max: 0.01
 norm_diff_min: 0.005

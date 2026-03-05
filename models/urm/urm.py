@@ -56,12 +56,17 @@ class URMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
+    def forward(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        attn_output, new_kv_cache = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1, kv_cache=kv_cache)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
-        return hidden_states
+        return hidden_states, new_kv_cache
 
 
 class URM_Inner(nn.Module):
@@ -152,15 +157,23 @@ class URM_Inner(nn.Module):
         if self.config.H_cycles > 1:
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
+                    layer_kv_caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * len(self.layers)
                     for _ in range(self.config.L_cycles):
                         hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                        new_layer_kv_caches = []
+                        for i, layer in enumerate(self.layers):
+                            hidden_states, new_kv = layer(hidden_states=hidden_states, kv_cache=layer_kv_caches[i], **seq_info)
+                            new_layer_kv_caches.append(new_kv)
+                        layer_kv_caches = new_layer_kv_caches
 
+        layer_kv_caches = [None] * len(self.layers)
         for _ in range(self.config.L_cycles):
             hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-            for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            new_layer_kv_caches = []
+            for i, layer in enumerate(self.layers):
+                hidden_states, new_kv = layer(hidden_states=hidden_states, kv_cache=layer_kv_caches[i], **seq_info)
+                new_layer_kv_caches.append(new_kv)
+            layer_kv_caches = new_layer_kv_caches
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]

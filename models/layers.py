@@ -109,7 +109,13 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, window_size=-1) -> torch.Tensor:
+    def forward(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        window_size: int = -1,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
 
         # hidden_states: [bs, seq_len, num_heads, head_dim]
@@ -126,14 +132,25 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size))
+        # Concatenate cached K, V from previous L_cycle iterations
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            key_full = torch.cat([cached_k, key], dim=1)
+            value_full = torch.cat([cached_v, value], dim=1)
+        else:
+            key_full = key
+            value_full = value
+
+        new_kv_cache = (key_full, value_full)
+
+        # flash attn (supports seqlen_q != seqlen_k in non-causal mode)
+        attn_output = flash_attn_func(q=query, k=key_full, v=value_full, causal=self.causal, window_size=(window_size, window_size))
         if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
             attn_output = attn_output[0]
 
-        # attn_output: [batch_size, num_heads, seq_len, head_dim]
+        # attn_output: [batch_size, seq_len, num_heads, head_dim]
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output), new_kv_cache
 
 
 class SwiGLU(nn.Module):
