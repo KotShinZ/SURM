@@ -105,6 +105,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
+        self.attn_dropout = attn_dropout
 
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
@@ -127,7 +128,8 @@ class Attention(nn.Module):
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size))
+        dropout_p = self.attn_dropout if self.training else 0.0
+        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size), dropout_p=dropout_p)
         if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
             attn_output = attn_output[0]
 
@@ -157,6 +159,7 @@ class ConvSwiGLU(nn.Module):
         expansion: float,
         conv_kernel: int = 2,
         intermediate_size: Optional[int] = None,
+        mlp_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -182,6 +185,7 @@ class ConvSwiGLU(nn.Module):
 
         self.act = nn.SiLU()
         self.down_proj = CastedLinear(inter, hidden_size, bias=False)
+        self.mlp_dropout = nn.Dropout(mlp_dropout)
 
     def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
@@ -191,7 +195,7 @@ class ConvSwiGLU(nn.Module):
         x_conv = x_conv[..., :up.size(1)]
         x_conv = self.act(x_conv)
         x_conv = x_conv.transpose(1, 2).contiguous()
-        x_out = self.down_proj(x_conv)
+        x_out = self.down_proj(self.mlp_dropout(x_conv))
 
         return x_out
 

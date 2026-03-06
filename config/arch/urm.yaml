@@ -31,3 +31,5 @@ ema_rate: 0.999
 use_act: False
 norm_diff_max: 0.01
 norm_diff_min: 0.005
+attn_dropout: 0.2
+mlp_dropout: 0.2
