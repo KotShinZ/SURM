@@ -218,6 +218,7 @@ class URM(nn.Module):
         sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
         steps_count = torch.bincount(new_carry2.steps.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
         mean_norm_with_steps = sum_norm_with_steps / steps_count.clamp_min(1)
+        # print(mean_norm_with_steps)
         if global_logger.is_log:
             global_logger.store("mean_norm_with_steps", mean_norm_with_steps)
 
@@ -239,14 +240,17 @@ class URM(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
-                if self.config.use_act == False:
-                    norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.02)
-                    norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.005)
+                if self.config.use_act == False:  
+                    #print("Hidden diff norm:", hidden_diff_norm)
+                    norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.1)
+                    norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.01)
                     if norm_diff_max != norm_diff_min:
                         norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
                     else:
                         norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
-                    halted = halted | (hidden_diff_norm < norm_diff_threshold)
+                    # print("Hidden diff norm:", hidden_diff_norm)
+                    # print("Norm diff threshold:", norm_diff_threshold+ self.config.attn_dropout)
+                    halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
 
         return (
             URMCarry(
