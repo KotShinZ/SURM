@@ -244,6 +244,9 @@ class URM(nn.Module):
                     #print("Hidden diff norm:", hidden_diff_norm)
                     norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.1)
                     norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.01)
+                    if self.config.attn_dropout == 0.0:
+                        norm_diff_max = 0.01
+                        norm_diff_min = 0.005
                     if norm_diff_max != norm_diff_min:
                         norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
                     else:
