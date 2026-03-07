@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, RotaryEmbedding2D, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from logger import global_logger
 
@@ -29,6 +29,8 @@ class URMConfig(BaseModel):
     expansion: float
     num_heads: int
     pos_encodings: str
+    grid_height: int = 0  # Grid height for 2D RoPE (0 = use 1D RoPE)
+    grid_width: int = 0   # Grid width  for 2D RoPE (0 = use 1D RoPE)
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
     rms_norm_eps: float = 1e-5
@@ -93,11 +95,20 @@ class URM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        self.rotary_emb = RotaryEmbedding(
-            dim=self.config.hidden_size // self.config.num_heads,
-            max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
-            base=self.config.rope_theta,
-        )
+        if self.config.grid_height > 0 and self.config.grid_width > 0:
+            self.rotary_emb = RotaryEmbedding2D(
+                dim=self.config.hidden_size // self.config.num_heads,
+                grid_height=self.config.grid_height,
+                grid_width=self.config.grid_width,
+                puzzle_emb_len=self.puzzle_emb_len,
+                base=self.config.rope_theta,
+            )
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.config.hidden_size // self.config.num_heads,
+                max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                base=self.config.rope_theta,
+            )
 
         self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
 

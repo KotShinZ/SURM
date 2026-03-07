@@ -17,6 +17,10 @@ loop_deltas: [0, 8]
 
 puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: rope
+# 2D RoPE: set both to the grid dimensions to enable (e.g. 9/9 for Sudoku, 30/30 for ARC-AGI).
+# 0 (default) falls back to standard 1D RoPE.
+grid_height: 0
+grid_width: 0
 
 # Enable timing profile output during training for debugging
 profile: true

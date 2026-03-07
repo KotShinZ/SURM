@@ -16,7 +16,7 @@ except ImportError:
 from models.common import trunc_normal_init_
 
 
-CosSin = Tuple[torch.Tensor, torch.Tensor]
+CosSin = Tuple[torch.Tensor, ...]
 
 
 def _find_multiple(a, b):
@@ -40,6 +40,37 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
     q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
     k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
 
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+
+def apply_rotary_pos_emb_2d(
+    q: torch.Tensor, k: torch.Tensor,
+    cos_row: torch.Tensor, sin_row: torch.Tensor,
+    cos_col: torch.Tensor, sin_col: torch.Tensor,
+):
+    # q, k: [bs, seq_len, num_heads, head_dim]
+    # cos_row, sin_row, cos_col, sin_col: [seq_len, head_dim // 2]
+    # The first half of head_dim carries row RoPE, the second half carries col RoPE.
+    orig_dtype = q.dtype
+    q = q.to(cos_row.dtype)
+    k = k.to(cos_row.dtype)
+
+    half = q.shape[-1] // 2
+    q_row, q_col = q[..., :half], q[..., half:]
+    k_row, k_col = k[..., :half], k[..., half:]
+
+    cos_r = cos_row.unsqueeze(-2)  # [seq_len, 1, half_dim]
+    sin_r = sin_row.unsqueeze(-2)
+    cos_c = cos_col.unsqueeze(-2)
+    sin_c = sin_col.unsqueeze(-2)
+
+    q_row = q_row * cos_r + rotate_half(q_row) * sin_r
+    k_row = k_row * cos_r + rotate_half(k_row) * sin_r
+    q_col = q_col * cos_c + rotate_half(q_col) * sin_c
+    k_col = k_col * cos_c + rotate_half(k_col) * sin_c
+
+    q_embed = torch.cat([q_row, q_col], dim=-1)
+    k_embed = torch.cat([k_row, k_col], dim=-1)
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 
@@ -95,6 +126,51 @@ class RotaryEmbedding(nn.Module):
     def forward(self):
         return self.cos_cached, self.sin_cached
 
+
+class RotaryEmbedding2D(nn.Module):
+    """2D Rotary Position Embeddings for grid-structured inputs (e.g. Sudoku, ARC-AGI).
+
+    The first half of head_dim encodes the row position and the second half
+    encodes the column position.  Puzzle-embedding tokens that precede the
+    grid in the sequence are assigned position (row=0, col=0) so they
+    receive no rotation (cos=1, sin=0).
+    """
+
+    def __init__(self, dim: int, grid_height: int, grid_width: int,
+                 puzzle_emb_len: int, base: float, device=None):
+        super().__init__()
+
+        half_dim = dim // 2  # each spatial axis gets half the head dimensions
+
+        # Frequency bands — same formula as standard RoPE but applied to half_dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.float32, device=device) / half_dim))
+
+        total_len = puzzle_emb_len + grid_height * grid_width
+
+        # Row / column indices for every token position.
+        # Puzzle-embedding prefix tokens get (row=0, col=0).
+        row_ids = torch.zeros(total_len, dtype=torch.float32, device=device)
+        col_ids = torch.zeros(total_len, dtype=torch.float32, device=device)
+
+        grid_pos = torch.arange(grid_height * grid_width, dtype=torch.float32, device=device)
+        row_ids[puzzle_emb_len:] = grid_pos // grid_width
+        col_ids[puzzle_emb_len:] = grid_pos % grid_width
+
+        # [total_len, half_dim//2] → [total_len, half_dim]  (same duplication as 1D RoPE)
+        row_freqs = torch.outer(row_ids, inv_freq)
+        col_freqs = torch.outer(col_ids, inv_freq)
+
+        row_emb = torch.cat([row_freqs, row_freqs], dim=-1)
+        col_emb = torch.cat([col_freqs, col_freqs], dim=-1)
+
+        self.cos_row = nn.Buffer(row_emb.cos(), persistent=False)
+        self.sin_row = nn.Buffer(row_emb.sin(), persistent=False)
+        self.cos_col = nn.Buffer(col_emb.cos(), persistent=False)
+        self.sin_col = nn.Buffer(col_emb.sin(), persistent=False)
+
+    def forward(self):
+        return self.cos_row, self.sin_row, self.cos_col, self.sin_col
+
 class Attention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0):
         super().__init__()
@@ -122,10 +198,15 @@ class Attention(nn.Module):
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
 
-        # RoPE
+        # RoPE (1D or 2D)
         if cos_sin is not None:
-            cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            if len(cos_sin) == 4:
+                # 2D RoPE: (cos_row, sin_row, cos_col, sin_col)
+                query, key = apply_rotary_pos_emb_2d(query, key, *cos_sin)
+            else:
+                # 1D RoPE: (cos, sin)
+                cos, sin = cos_sin
+                query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # flash attn
         dropout_p = self.attn_dropout if self.training else 0.0
