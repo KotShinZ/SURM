@@ -617,7 +617,7 @@ def train_batch(
 
             reduced_metrics["train/lr"] = lr_this_step
             
-            if global_logger.is_log and train_state.step % 1000 == 0:
+            if global_logger.is_log and train_state.step % 2000 == 0:
                 logger_dict = global_logger.get_log_dict(train_state.step)
                 logger_dict = {f"train/{k}": v for k, v in logger_dict.items()}
                 reduced_metrics.update(logger_dict)

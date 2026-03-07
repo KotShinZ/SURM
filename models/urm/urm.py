@@ -159,10 +159,27 @@ class URM_Inner(nn.Module):
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
+        # Gradient norm logging for unrolled layers
+        _log_grads = global_logger.is_log and self.training
+        if _log_grads:
+            _grad_norms = {}
+            _total_unrolled = self.config.L_cycles * len(self.layers)
+            def _make_grad_hook(idx, container, total):
+                def hook(grad):
+                    container[idx] = grad.detach().norm().item()
+                    if len(container) == total:
+                        norm_tensor = torch.tensor([container[i] for i in range(total)])
+                        global_logger.store("grad_norm_per_layer", norm_tensor)
+                return hook
+
+        _unrolled_idx = 0
         for _ in range(self.config.L_cycles):
             hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
             for layer in self.layers:
                 hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                if _log_grads:
+                    hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                    _unrolled_idx += 1
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
@@ -240,7 +257,7 @@ class URM(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
-                if self.config.use_act == False:  
+                if self.config.use_act == False and self.training == True:  
                     #print("Hidden diff norm:", hidden_diff_norm)
                     norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.1)
                     norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.01)
