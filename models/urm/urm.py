@@ -40,6 +40,7 @@ class URMConfig(BaseModel):
     H_cycles: int
     forward_dtype: str = "bfloat16"
     use_act: bool = True
+    noise_size: float = 0.0
 
 
 class URMBlock(nn.Module):
@@ -167,6 +168,8 @@ class URM_Inner(nn.Module):
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
                         hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
+                        if self.config.noise_size > 0:
+                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
@@ -188,6 +191,8 @@ class URM_Inner(nn.Module):
             hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
             for layer in self.layers:
                 hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                if self.config.noise_size > 0:
+                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
                 if _log_grads:
                     hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
                     _unrolled_idx += 1
