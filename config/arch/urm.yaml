@@ -32,8 +32,8 @@ checkpoint_path: .cache/checkpoint
 ema: True
 ema_rate: 0.999
 
-attn_dropout: 0.4
-mlp_dropout: 0.4
+attn_dropout: 0.0
+mlp_dropout: 0.0
 
 use_act: False
 norm_diff_max: 0.2
