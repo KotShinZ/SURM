@@ -33,6 +33,7 @@ class URMConfig(BaseModel):
     grid_width: int = 0   # Grid width  for 2D RoPE (0 = use 1D RoPE)
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
+    topk_sparsity: float = 0.0
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     loops: int
@@ -53,6 +54,7 @@ class URMBlock(nn.Module):
             num_key_value_heads=config.num_heads,
             causal=False,
             attn_dropout=config.attn_dropout,
+            topk_sparsity=config.topk_sparsity,
         )
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
