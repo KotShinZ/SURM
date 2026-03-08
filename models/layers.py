@@ -172,7 +172,7 @@ class RotaryEmbedding2D(nn.Module):
         return self.cos_row, self.sin_row, self.cos_col, self.sin_col
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, topk_sparsity=0.0):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -182,9 +182,66 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
         self.attn_dropout = attn_dropout
+        self.topk_sparsity = topk_sparsity  # fraction of scores to drop (e.g. 0.8 = keep top 20%)
 
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def _topk_attention(self, query, key, value, dropout_p):
+        """Manual attention with percentile-based top-k sparsity masking.
+
+        Keeps only the top (1 - topk_sparsity) fraction of attention scores per
+        query position and replaces the rest with -inf before softmax.
+        """
+        # query: [bs, seq_len, num_heads, head_dim]
+        # Transpose to [bs, num_heads, seq_len, head_dim]
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+
+        # GQA: expand key/value heads to match query heads
+        if self.num_key_value_heads != self.num_heads:
+            repeat_factor = self.num_heads // self.num_key_value_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+
+        scale = 1.0 / math.sqrt(self.head_dim)
+        # [bs, num_heads, seq_len_q, seq_len_k]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Causal mask
+        if self.causal:
+            seq_len_q, seq_len_k = attn_scores.shape[-2], attn_scores.shape[-1]
+            causal_mask = torch.triu(
+                torch.ones(seq_len_q, seq_len_k, device=attn_scores.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+
+        # Top-k sparsity: compute per-query threshold via quantile
+        # Number of keys to keep per query
+        seq_len_k = attn_scores.shape[-1]
+        k_keep = max(1, int(seq_len_k * (1.0 - self.topk_sparsity)))
+
+        # kthvalue needs the k-th smallest, so we want the (seq_len_k - k_keep + 1)-th smallest
+        # Equivalent: find the top k_keep values and mask the rest
+        # Use topk for efficiency
+        topk_vals, _ = attn_scores.topk(k_keep, dim=-1)  # [bs, num_heads, seq_len_q, k_keep]
+        # Threshold is the minimum of the top-k values (i.e., the k-th largest)
+        threshold = topk_vals[..., -1:]  # [bs, num_heads, seq_len_q, 1]
+        # Mask scores below threshold
+        sparse_mask = attn_scores < threshold
+        attn_scores = attn_scores.masked_fill(sparse_mask, float('-inf'))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+        # [bs, num_heads, seq_len_q, head_dim]
+        attn_output = torch.matmul(attn_weights, v)
+        # Back to [bs, seq_len, num_heads, head_dim]
+        return attn_output.transpose(1, 2).contiguous()
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, window_size=-1) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -208,11 +265,16 @@ class Attention(nn.Module):
                 cos, sin = cos_sin
                 query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
         dropout_p = self.attn_dropout if self.training else 0.0
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size), dropout_p=dropout_p)
-        if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-            attn_output = attn_output[0]
+
+        if self.topk_sparsity > 0.0:
+            # Top-k sparse attention (manual computation)
+            attn_output = self._topk_attention(query, key, value, dropout_p)
+        else:
+            # flash attn
+            attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size), dropout_p=dropout_p)
+            if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
+                attn_output = attn_output[0]
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore

@@ -32,8 +32,9 @@ checkpoint_path: .cache/checkpoint
 ema: True
 ema_rate: 0.999
 
-attn_dropout: 0.4
-mlp_dropout: 0.4
+attn_dropout: 0.0
+mlp_dropout: 0.0
+topk_sparsity: 0.0  # fraction of attention scores to drop (e.g. 0.8 = keep top 20%)
 
 use_act: False
 norm_diff_max: 0.2
