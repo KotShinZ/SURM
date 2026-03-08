@@ -40,3 +40,19 @@ use_muon: False
 
 # Fraction of training groups to use per epoch (1.0 = all, 0.5 = half)
 data_fraction: 1.0
+
+# Online augmentation: applied randomly per sample at training time.
+# Detected automatically from seq_len: 900 → ARC-AGI, 81 → Sudoku.
+# Set enabled: true to activate.
+online_aug:
+  enabled: false
+  # ARC-AGI: dihedral symmetry (8 rotations/reflections)
+  arc_dihedral: true
+  # ARC-AGI: random permutation of the 10 color tokens
+  arc_color_perm: true
+  # Sudoku: random permutation of digits 1-9
+  sudoku_digit_perm: true
+  # Sudoku: random row/column/band permutation (preserves Sudoku validity)
+  sudoku_row_col_perm: true
+  # Sudoku: random transpose (swap rows ↔ columns)
+  sudoku_transpose: true

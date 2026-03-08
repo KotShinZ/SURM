@@ -23,6 +23,7 @@ from omegaconf import DictConfig, OmegaConf
 from adam_atan2_pytorch import AdamAtan2
 from models.muon import Muon
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from data.online_aug import OnlineAugConfig
 from utils import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from logger import global_logger
@@ -138,6 +139,9 @@ class PretrainConfig(pydantic.BaseModel):
 
     data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
 
+    # Online augmentation (applied per batch during training only)
+    online_aug: Optional[OnlineAugConfig] = None
+
 
 
 @dataclass
@@ -153,11 +157,14 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    data_fraction = config.data_fraction if not kwargs.get("test_set_mode", False) else 1.0
+    is_test = kwargs.get("test_set_mode", False)
+    data_fraction = config.data_fraction if not is_test else 1.0
+    # Apply online augmentation only during training
+    online_aug = config.online_aug if not is_test else None
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            data_fraction=data_fraction, **kwargs
+            data_fraction=data_fraction, online_aug=online_aug, **kwargs
         ),
         split=split,
     )

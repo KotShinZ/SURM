@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional
 
 import numpy as np
 import pydantic
@@ -9,6 +10,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from models.losses import IGNORE_LABEL_ID
 from data.common import PuzzleDatasetMetadata
+from data.online_aug import OnlineAugConfig, apply_online_aug
 
 
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int, data_fraction: float = 1.0):
@@ -54,6 +56,9 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     num_replicas: int
 
     data_fraction: float = 1.0  # Fraction of training groups to use per epoch (1.0 = all)
+
+    # Online augmentation applied at training time (None = disabled)
+    online_aug: Optional[OnlineAugConfig] = None
 
 
 class PuzzleDataset(IterableDataset):
@@ -194,6 +199,9 @@ class PuzzleDataset(IterableDataset):
                     "labels": dataset["labels"][batch_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
                 })
+
+                if self.config.online_aug is not None and self.config.online_aug.enabled:
+                    batch = apply_online_aug(batch, self.metadata.seq_len, self.config.online_aug)
 
                 yield set_name, batch, global_effective_batch_size
                 
