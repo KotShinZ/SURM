@@ -611,7 +611,7 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.5,
                         help="Discount factor. Low values recommended for long-horizon (96-step) tasks")
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--policy_noise", type=float, default=0.1)
+    parser.add_argument("--policy_noise", type=float, default=0.001)
     parser.add_argument("--noise_clip", type=float, default=0.3)
     parser.add_argument("--policy_delay", type=int, default=50,
                         help="Actor update frequency (1 actor update per N critic updates)")
@@ -620,6 +620,9 @@ def main():
     # Critic warmup: train critic only for this many steps before actor updates
     parser.add_argument("--critic_warmup_steps", type=int, default=500,
                         help="Number of critic-only training steps before enabling actor updates")
+    parser.add_argument("--critic_loss_threshold", type=float, default=None,
+                        help="Actor updates are blocked until the EMA of critic_loss drops below this value. "
+                             "None disables the threshold check.")
 
     # TD3+BC: BC is primary term (weight=1), Q is weighted bonus
     # actor_loss = -lam * Q(s,a).mean() + BC_loss
@@ -637,11 +640,11 @@ def main():
     # Fix #4: larger buffer, smaller batch by default
     parser.add_argument("--buffer_size", type=int, default=50000)
     parser.add_argument("--td3_batch_size", type=int, default=256)
-    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--warmup_steps", type=int, default=200)
     parser.add_argument("--num_unroll_steps", type=int, default=96,
                         help="Recurrent unroll steps per episode (1 step = 1 layer-stack pass)")
     parser.add_argument("--total_steps", type=int, default=50000)
-    parser.add_argument("--eval_interval", type=int, default=100)
+    parser.add_argument("--eval_interval", type=int, default=200)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=10)
 
@@ -836,6 +839,8 @@ def main():
     last_bc_loss = None
     last_lam = 0.0
     critic_update_count = 0  # Track critic updates for warmup phase
+    critic_loss_ema = None   # EMA of critic_loss for threshold check
+    critic_loss_ema_alpha = 0.05  # EMA smoothing factor
 
     progress = tqdm(range(1, args.total_steps + 1), desc="RL Training")
     for step in progress:
@@ -975,12 +980,24 @@ def main():
         critic_optimizer.step()
         critic_update_count += 1
 
+        # Update critic loss EMA
+        c_loss_val = critic_loss.item()
+        if critic_loss_ema is None:
+            critic_loss_ema = c_loss_val
+        else:
+            critic_loss_ema = (1.0 - critic_loss_ema_alpha) * critic_loss_ema + critic_loss_ema_alpha * c_loss_val
+
         # Soft update critic targets (every step, independent of actor)
         soft_update(critic_1_target, critic_1, args.tau)
         soft_update(critic_2_target, critic_2, args.tau)
 
         # --- Delayed actor update with critic warmup gate + TD3+BC ---
-        actor_update_allowed = critic_update_count > args.critic_warmup_steps
+        critic_threshold_met = (
+            args.critic_loss_threshold is None
+            or critic_loss_ema <= args.critic_loss_threshold
+        )
+        actor_update_allowed = critic_update_count > args.critic_warmup_steps and critic_threshold_met
+        actor_updated = False
         if actor_update_allowed and step % args.policy_delay == 0:
             _, actor_action = train_actor_step(layers, cos_sin, s, stored_input_emb)
 
@@ -1010,6 +1027,7 @@ def main():
             last_actor_loss = actor_loss.item()
             last_bc_loss = bc_loss.item()
             last_lam = lam.item() if isinstance(lam, torch.Tensor) else lam
+            actor_updated = True
 
             # Soft update actor target
             soft_update(actor_target_layers, actor.inner.layers, args.tau)
@@ -1020,10 +1038,14 @@ def main():
                      / max(len(rewards_collected[-args.log_interval:]), 1))
             a_loss_val = last_actor_loss if last_actor_loss is not None else 0.0
             bc_loss_val = last_bc_loss if last_bc_loss is not None else 0.0
-            phase = "critic-only" if not actor_update_allowed else "actor+critic"
+            if not actor_update_allowed:
+                phase = "critic-only" if critic_update_count <= args.critic_warmup_steps else "waiting-threshold"
+            else:
+                phase = "actor+critic"
             progress.set_postfix(
                 phase=phase,
                 c_loss=f"{critic_loss.item():.4f}",
+                c_ema=f"{critic_loss_ema:.4f}",
                 a_loss=f"{a_loss_val:.4f}",
                 bc=f"{bc_loss_val:.6f}",
                 lam=f"{last_lam:.4f}",
@@ -1033,12 +1055,14 @@ def main():
             if use_wandb:
                 wandb.log({
                     "train/critic_loss": critic_loss.item(),
+                    "train/critic_loss_ema": critic_loss_ema,
                     "train/actor_loss": a_loss_val,
                     "train/bc_loss": bc_loss_val,
                     "train/lambda": last_lam,
                     "train/mean_reward": avg_r,
                     "train/buffer_size": replay_buffer.size,
                     "train/critic_update_count": critic_update_count,
+                    "train/actor_updated": int(actor_updated),
                 }, step=step)
 
         # === EVALUATION ===
