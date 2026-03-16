@@ -618,7 +618,7 @@ def main():
     parser.add_argument("--exploration_noise", type=float, default=0.1)
 
     # Critic warmup: train critic only for this many steps before actor updates
-    parser.add_argument("--critic_warmup_steps", type=int, default=500,
+    parser.add_argument("--critic_warmup_steps", type=int, default=200,
                         help="Number of critic-only training steps before enabling actor updates")
     parser.add_argument("--critic_loss_threshold", type=float, default=None,
                         help="Actor updates are blocked until the EMA of critic_loss drops below this value. "
