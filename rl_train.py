@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from tqdm import tqdm
+import wandb
 
 from models.layers import (
     Attention,
@@ -617,7 +618,7 @@ def main():
     parser.add_argument("--exploration_noise", type=float, default=0.1)
 
     # Critic warmup: train critic only for this many steps before actor updates
-    parser.add_argument("--critic_warmup_steps", type=int, default=1000,
+    parser.add_argument("--critic_warmup_steps", type=int, default=500,
                         help="Number of critic-only training steps before enabling actor updates")
 
     # TD3+BC: BC is primary term (weight=1), Q is weighted bonus
@@ -644,6 +645,11 @@ def main():
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=10)
 
+    # WandB
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
+
     # Critic architecture
     parser.add_argument("--critic_layers", type=int, default=2)
 
@@ -656,6 +662,19 @@ def main():
 
     # Enable TF32 for faster matmuls on Ampere+ GPUs
     torch.set_float32_matmul_precision("high")
+
+    # -----------------------------------------------------------------------
+    # 0. WandB initialization
+    # -----------------------------------------------------------------------
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(
+            project="URM-RL-TD3",
+            entity=args.wandb_entity,
+            name=args.run_name,
+            config=vars(args),
+        )
+        print(f"WandB run: {wandb.run.url}")
 
     # -----------------------------------------------------------------------
     # 1. Load pretrained actor
@@ -1011,6 +1030,16 @@ def main():
                 reward=f"{avg_r:.4f}",
                 buf=replay_buffer.size,
             )
+            if use_wandb:
+                wandb.log({
+                    "train/critic_loss": critic_loss.item(),
+                    "train/actor_loss": a_loss_val,
+                    "train/bc_loss": bc_loss_val,
+                    "train/lambda": last_lam,
+                    "train/mean_reward": avg_r,
+                    "train/buffer_size": replay_buffer.size,
+                    "train/critic_update_count": critic_update_count,
+                }, step=step)
 
         # === EVALUATION ===
         if step % args.eval_interval == 0:
@@ -1022,6 +1051,8 @@ def main():
                 f"  exact_accuracy={eval_metrics['eval/exact_accuracy']:.4f}, "
                 f"  mean_reward={eval_metrics['eval/mean_reward']:.4f}"
             )
+            if use_wandb:
+                wandb.log(eval_metrics, step=step)
 
         # === CHECKPOINTING ===
         if step % args.save_interval == 0:
@@ -1046,6 +1077,10 @@ def main():
     )
     for k, v in eval_metrics.items():
         print(f"  {k}: {v:.4f}")
+    if use_wandb:
+        wandb.log({f"final/{k.split('/')[-1]}": v for k, v in eval_metrics.items()},
+                  step=args.total_steps)
+        wandb.finish()
     print("Done.")
 
 
