@@ -129,6 +129,7 @@ class URMBlock(nn.Module):
             hidden_states=attn_input,
             window_size=-1,
         )  # [B, T, D]
+        attn_output = rms_norm(attn_output, variance_epsilon=self.norm_eps)
 
         # Add attention output as a new source
         new_sources = list(sources)
@@ -142,6 +143,7 @@ class URMBlock(nn.Module):
 
         # 4) MLP sublayer output
         mlp_output = self.mlp(mlp_input)  # [B, T, D]
+        mlp_output = rms_norm(mlp_output, variance_epsilon=self.norm_eps)
 
         # Add MLP output as a new source
         new_sources.append(mlp_output)
