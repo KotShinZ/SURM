@@ -43,7 +43,6 @@ class URMConfig(BaseModel):
     use_act: bool = True
     noise_size: float = 0.0
 
-
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
@@ -63,13 +62,92 @@ class URMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
-        hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
-        return hidden_states
+    def _full_attnres_mix(
+        self,
+        sources: List[torch.Tensor],   # len=S, each [B, T, D]
+        query: torch.Tensor,           # [D]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Full AttnRes mixing.
 
+        sources[i]: [B, T, D]
+        V         : [S, B, T, D]
+        logits    : [S, B, T]
+        alpha     : [S, B, T]
+        mixed     : [B, T, D]
+        """
+        if len(sources) == 0:
+            raise ValueError("sources must contain at least one tensor.")
+
+        V = torch.stack(sources, dim=0)  # [S, B, T, D]
+        K = rms_norm(V, variance_epsilon=self.norm_eps)  # [S, B, T, D]
+
+        q = query.to(dtype=K.dtype, device=K.device)     # [D]
+        logits = torch.einsum("d,sbtd->sbt", q, K)       # [S, B, T]
+        alpha = torch.softmax(logits, dim=0)             # [S, B, T]
+
+        mixed = torch.einsum("sbt,sbtd->btd", alpha, V)  # [B, T, D]
+        return mixed, alpha
+
+    def forward(
+        self,
+        cos_sin: CosSin,
+        sources: List[torch.Tensor],   # source accumulation is local to one L_cycle
+        attn_query: torch.Tensor,      # [D] for this (cycle, layer)
+        mlp_query: torch.Tensor,       # [D] for this (cycle, layer)
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Full AttnRes block.
+
+        Inputs:
+            sources:
+                Local source list for the current L_cycle only.
+                Each element has shape [B, T, D].
+
+            attn_query:
+                [D], cycle-layer-specific query for the attention sublayer.
+
+            mlp_query:
+                [D], cycle-layer-specific query for the MLP sublayer.
+
+        Returns:
+            hidden_states:
+                [B, T, D] = output of the MLP sublayer
+
+            sources:
+                original sources + [attn_output, mlp_output]
+        """
+        # 1) Build self-attention input from all previous sources in this cycle
+        attn_input, _ = self._full_attnres_mix(
+            sources=sources,
+            query=attn_query,
+        )  # [B, T, D]
+
+        # 2) Attention sublayer output
+        attn_output = self.self_attn(
+            cos_sin=cos_sin,
+            hidden_states=attn_input,
+            window_size=-1,
+        )  # [B, T, D]
+
+        # Add attention output as a new source
+        new_sources = list(sources)
+        new_sources.append(attn_output)
+
+        # 3) Build MLP input from updated source list
+        mlp_input, _ = self._full_attnres_mix(
+            sources=new_sources,
+            query=mlp_query,
+        )  # [B, T, D]
+
+        # 4) MLP sublayer output
+        mlp_output = self.mlp(mlp_input)  # [B, T, D]
+
+        # Add MLP output as a new source
+        new_sources.append(mlp_output)
+
+        hidden_states = mlp_output
+        return hidden_states, new_sources
 
 class URM_Inner(nn.Module):
     def __init__(self, config: URMConfig) -> None:
@@ -115,6 +193,16 @@ class URM_Inner(nn.Module):
 
         self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
 
+        # Full AttnRes queries with per-cycle and per-layer specificity
+        # attn_queries: [L_cycles, num_layers, D]
+        # mlp_queries : [L_cycles, num_layers, D]
+        self.attn_queries = nn.Parameter(
+            torch.zeros(self.config.L_cycles, self.config.num_layers, self.config.hidden_size)
+        )
+        self.mlp_queries = nn.Parameter(
+            torch.zeros(self.config.L_cycles, self.config.num_layers, self.config.hidden_size)
+        )
+
         self.init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
@@ -123,6 +211,8 @@ class URM_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
+            self.attn_queries.zero_()
+            self.mlp_queries.zero_()
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -156,6 +246,66 @@ class URM_Inner(nn.Module):
         )
         return replace(carry, current_hidden=new_hidden)
 
+    def _add_noise(self, x: torch.Tensor) -> torch.Tensor:
+        if self.config.noise_size > 0:
+            return x + (torch.randn_like(x) * self.config.noise_size * 2 - self.config.noise_size)
+        return x
+
+    def _run_one_l_cycle(
+        self,
+        hidden_states: torch.Tensor,    # [B, T, D]
+        input_embeddings: torch.Tensor, # [B, T, D]
+        seq_info: Dict[str, CosSin],
+        cycle_idx: int,
+        log_grads: bool = False,
+        grad_container: Optional[Dict[int, float]] = None,
+        total_unrolled: Optional[int] = None,
+        unrolled_offset: int = 0,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Run one local L_cycle with Full AttnRes.
+
+        Source accumulation is done ONLY inside this function:
+            sources = [cycle_input]
+            then append attn_output, mlp_output within the cycle.
+        """
+        hidden_states = hidden_states + input_embeddings  # [B, T, D]
+        sources: List[torch.Tensor] = [hidden_states]     # local sources for this cycle only
+
+        def _make_grad_hook(idx, container, total):
+            def hook(grad):
+                container[idx] = grad.detach().norm().item()
+                if len(container) == total:
+                    norm_tensor = torch.tensor([container[i] for i in range(total)])
+                    global_logger.store("grad_norm_per_layer", norm_tensor)
+            return hook
+
+        local_idx = 0
+        for layer_idx, layer in enumerate(self.layers):
+            attn_query = self.attn_queries[cycle_idx, layer_idx]  # [D]
+            mlp_query = self.mlp_queries[cycle_idx, layer_idx]    # [D]
+
+            hidden_states, sources = layer(
+                cos_sin=seq_info["cos_sin"],
+                sources=sources,
+                attn_query=attn_query,
+                mlp_query=mlp_query,
+            )
+
+            hidden_states = self._add_noise(hidden_states)
+
+            # Keep the final source aligned with the noisy hidden state
+            if self.config.noise_size > 0:
+                sources[-1] = hidden_states
+
+            if log_grads:
+                hidden_states.register_hook(
+                    _make_grad_hook(unrolled_offset + local_idx, grad_container, total_unrolled)
+                )
+            local_idx += 1
+
+        return hidden_states, local_idx
+
     def forward(
         self,
         carry: URMCarry,
@@ -165,45 +315,45 @@ class URM_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         hidden_states = carry.current_hidden
+
         if self.config.H_cycles > 1:
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
-                    for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        if self.config.noise_size > 0:
-                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
-                        for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                    for cycle_idx in range(self.config.L_cycles):
+                        hidden_states, _ = self._run_one_l_cycle(
+                            hidden_states=hidden_states,
+                            input_embeddings=input_embeddings,
+                            seq_info=seq_info,
+                            cycle_idx=cycle_idx,
+                            log_grads=False,
+                        )
 
-        # Gradient norm logging for unrolled layers
         _log_grads = global_logger.is_log and self.training
         if _log_grads:
             _grad_norms = {}
             _total_unrolled = self.config.L_cycles * len(self.layers)
-            def _make_grad_hook(idx, container, total):
-                def hook(grad):
-                    container[idx] = grad.detach().norm().item()
-                    if len(container) == total:
-                        norm_tensor = torch.tensor([container[i] for i in range(total)])
-                        global_logger.store("grad_norm_per_layer", norm_tensor)
-                return hook
+        else:
+            _grad_norms = None
+            _total_unrolled = None
 
         _unrolled_idx = 0
-        for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-            for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                if self.config.noise_size > 0:
-                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
-                if _log_grads:
-                    hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
-                    _unrolled_idx += 1
+        for cycle_idx in range(self.config.L_cycles):
+            hidden_states, used_layers = self._run_one_l_cycle(
+                hidden_states=hidden_states,
+                input_embeddings=input_embeddings,
+                seq_info=seq_info,
+                cycle_idx=cycle_idx,
+                log_grads=_log_grads,
+                grad_container=_grad_norms,
+                total_unrolled=_total_unrolled,
+                unrolled_offset=_unrolled_idx,
+            )
+            _unrolled_idx += used_layers
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
-
 
 class URM(nn.Module):
     def __init__(self, config_dict: dict):
