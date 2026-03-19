@@ -42,6 +42,7 @@ class URMConfig(BaseModel):
     forward_dtype: str = "bfloat16"
     use_act: bool = True
     noise_size: float = 0.0
+    noise_seed: int = 42
 
 
 class URMBlock(nn.Module):
@@ -123,6 +124,8 @@ class URM_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
+            
+        self.generator = torch.Generator(device="cuda").manual_seed(self.config.noise_seed)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -170,10 +173,17 @@ class URM_Inner(nn.Module):
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
                         hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        if self.config.noise_size > 0:
-                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                        if self.config.noise_size > 0:
+                            noise = torch.randn(
+                                hidden_states.shape,
+                                generator=self.generator,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                                layout=hidden_states.layout
+                            )
+                            hidden_states = hidden_states + noise * self.config.noise_size
 
         # Gradient norm logging for unrolled layers
         _log_grads = global_logger.is_log and self.training
@@ -194,7 +204,14 @@ class URM_Inner(nn.Module):
             for layer in self.layers:
                 hidden_states = layer(hidden_states=hidden_states, **seq_info)
                 if self.config.noise_size > 0:
-                            hidden_states = hidden_states + (torch.randn_like(hidden_states) * self.config.noise_size * 2 - self.config.noise_size)
+                    noise = torch.randn(
+                        hidden_states.shape,
+                        generator=self.generator,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                        layout=hidden_states.layout
+                    )
+                    hidden_states = hidden_states + noise * self.config.noise_size
                 if _log_grads:
                     hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
                     _unrolled_idx += 1
@@ -280,8 +297,8 @@ class URM(nn.Module):
                     norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.1)
                     norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.01)
                     if self.config.attn_dropout == 0.0:
-                        norm_diff_max = 0.01
-                        norm_diff_min = 0.005
+                        norm_diff_max = 0.8
+                        norm_diff_min = 0.1
                     if norm_diff_max != norm_diff_min:
                         norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
                     else:
