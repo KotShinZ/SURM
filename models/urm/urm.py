@@ -43,6 +43,8 @@ class URMConfig(BaseModel):
     use_act: bool = True
     noise_size: float = 0.0
     noise_seed: int = 42
+    norm_diff_max: float = 0.2
+    norm_diff_min: float = 0.1
 
 
 class URMBlock(nn.Module):
@@ -294,11 +296,9 @@ class URM(nn.Module):
                 
                 if self.config.use_act == False and self.training == True:  
                     #print("Hidden diff norm:", hidden_diff_norm)
-                    norm_diff_max = getattr(getattr(self.config, "config", None), "norm_diff_max", 0.1)
-                    norm_diff_min = getattr(getattr(self.config, "config", None), "norm_diff_min", 0.01)
-                    if self.config.attn_dropout == 0.0:
-                        norm_diff_max = 0.8
-                        norm_diff_min = 0.1
+                    norm_diff_max = self.config.norm_diff_max
+                    norm_diff_min = self.config.norm_diff_min
+                    
                     if norm_diff_max != norm_diff_min:
                         norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
                     else:
