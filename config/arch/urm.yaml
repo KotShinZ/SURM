@@ -13,7 +13,7 @@ expansion: 4
 H_cycles: 4
 L_cycles: 3
 
-loop_deltas: [0, 8]
+loop_deltas: [0]
 
 puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: rope
@@ -37,7 +37,7 @@ mlp_dropout: 0.0
 topk_sparsity: 0.0  # fraction of attention scores to drop (e.g. 0.8 = keep top 20%)
 
 use_act: False
-norm_diff_max: 0.1
-norm_diff_min: 0.05
+norm_diff_max: 0.03
+norm_diff_min: 0.01
 noise_size: 0.0
 noise_seed: 42
