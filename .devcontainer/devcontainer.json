@@ -13,7 +13,7 @@
   //"workspaceMount": "type=bind,source=${localWorkspaceFolder},target=/home/user",
   "updateRemoteUserUID": true,
   "postCreateCommand": "postCreateCommand.sh",
-  "runArgs": ["--gpus", "\"device=2\"", "--shm-size", "96gb"],
+  "runArgs": ["--gpus", "\"device=1\"", "--shm-size", "96gb"],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -63,7 +63,7 @@
     "ghcr.io/devcontainers/features/python": {}
   },
   //"forwardPorts": [8080, 3000, 8000]
-  "appPort": ["8004:8004", "8084:8084"],
+  "appPort": ["8005:8005", "8085:8085"],
   "containerEnv": {
     "HTTP_PROXY": "http://proxy11.omu.ac.jp:8080",
     "HTTPS_PROXY": "http://proxy11.omu.ac.jp:8080",
