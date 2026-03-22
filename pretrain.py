@@ -663,7 +663,7 @@ def evaluate(
         
         print("Starting evaluation... len(eval_loader) =", len(eval_loader))
         for set_name, batch, global_batch_size in eval_loader:
-            if processed_batches > 100:
+            if processed_batches > 50:
                 break
             
             processed_batches += 1
