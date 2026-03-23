@@ -185,15 +185,19 @@ def token_grid_to_digits(tokens: torch.Tensor | np.ndarray) -> np.ndarray:
 
 def build_trace_summary(batch_cpu: Dict[str, torch.Tensor], records: List[TraceRecord], sample_index: int) -> Dict[str, Any]:
     inputs = batch_cpu["inputs"][sample_index]
+    source_inputs = batch_cpu.get("source_inputs", batch_cpu["inputs"])[sample_index]
     labels = batch_cpu["labels"][sample_index]
     return {
-        "input_digits": token_grid_to_digits(inputs),
+        "input_digits": token_grid_to_digits(source_inputs),
+        "model_input_digits": token_grid_to_digits(inputs),
         "label_digits": token_grid_to_digits(labels),
         "trace_digits": [token_grid_to_digits(record.preds[sample_index]) for record in records],
         "trace_labels": [record.label for record in records],
         "batch_accuracy": [record.batch_accuracy for record in records],
         "batch_exact_accuracy": [record.batch_exact_accuracy for record in records],
         "sample_index": sample_index,
+        "input_clues": int((np.asarray(source_inputs) != 1).sum()),
+        "model_input_clues": int((np.asarray(inputs) != 1).sum()),
     }
 
 
@@ -284,10 +288,23 @@ def _grid_table_html(
 
 def render_trace_summary_html(summary: Dict[str, Any], max_cols: int = 4) -> str:
     input_digits = summary["input_digits"]
+    model_input_digits = summary["model_input_digits"]
     label_digits = summary["label_digits"]
     given_mask = input_digits > 0
 
-    panels = [_grid_table_html(input_digits, title="Input", given_mask=given_mask)]
+    panels = [
+        _grid_table_html(
+            input_digits,
+            title=f"Original Input\nclues={summary['input_clues']}",
+            given_mask=given_mask,
+        ),
+        _grid_table_html(
+            model_input_digits,
+            title=f"Model Input\nclues={summary['model_input_clues']}",
+            given_mask=given_mask,
+            label_digits=label_digits,
+        ),
+    ]
     for idx, (label, grid) in enumerate(zip(summary["trace_labels"], summary["trace_digits"])):
         batch_acc = summary["batch_accuracy"][idx]
         batch_exact = summary["batch_exact_accuracy"][idx]
