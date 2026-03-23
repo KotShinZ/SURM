@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
-from common import PuzzleDatasetMetadata
+from data.common import PuzzleDatasetMetadata
 
 
 cli = ArgParser()
