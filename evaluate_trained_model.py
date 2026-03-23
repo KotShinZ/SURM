@@ -1,508 +1,628 @@
-#!/usr/bin/env python3
-"""
-Standalone evaluation script for trained HRM models.
-Loads a checkpoint and evaluates it on a specified dataset.
-Supports both single and multi-GPU evaluation.
+# python evaluate_trained_model.py --checkpoint checkpoints/URM-sudoku-base --max_problems 4096 --loops 32 --batch_size 4096
 
-Usage:
-# Single GPU
-python evaluate_trained_model.py \
-    --checkpoint-path "/volume/pt-train/users/ztgao/loop_arcagi/checkpoints/URM-SwiGLU/step_518050.pt" \
-    --data-path /volume/pt-train/users/ztgao/loop_arcagi/data/arc-aug-1000 \
-    --output-dir eval_results
-    
-# Multi-GPU
-torchrun --nproc-per-node 8 evaluate_trained_model.py \
-    --checkpoint-path "/volume/pt-train/users/ztgao/loop_arcagi/checkpoints/Arc-aug-1000 ACT-torch/LoopedTransformerV6 zippy-bull/step_23825.pt" \
-    --data-path /volume/pt-train/users/ztgao/loop_arcagi/data/arc-aug-1000 \
-    --output-dir eval_results
-"""
-
-import os
-import json
 import argparse
+import json
+import math
+import os
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, List, Optional, Set
 
+import pydantic
 import torch
-import torch.distributed as dist
-import numpy as np
-import wandb
+import torch.nn.functional as F
+import yaml
+from omegaconf import OmegaConf
+from torch import nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf
-
-from pretrain import (
-    PretrainConfig,
-    create_dataloader, 
-    create_model,
-    create_evaluators,
-    evaluate,
-    load_checkpoint,
-    TrainState
-)
+from models.losses import IGNORE_LABEL_ID
+from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
 
 
-def setup_distributed():
-    """Initialize distributed training if in distributed environment."""
-    rank = 0
-    world_size = 1
-    cpu_group = None
-    
-    if "LOCAL_RANK" in os.environ:
-        # Initialize distributed
-        dist.init_process_group(backend="nccl")
-        
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
-        # CPU GLOO process group for evaluation
-        cpu_group = dist.new_group(backend="gloo")
-        assert dist.get_rank(cpu_group) == rank and dist.get_world_size(cpu_group) == world_size
-    
-    return rank, world_size, cpu_group
+class LossConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    name: str
 
 
-def load_config_from_checkpoint(checkpoint_path: Path) -> PretrainConfig:
-    import yaml
-    import re
+class ArchConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
 
-    checkpoint_dir = checkpoint_path.parent
-    cfg_path = checkpoint_dir / "all_config.yaml"
-    raw = cfg_path.read_text()
-
-    idx = raw.find("\nbeta1:")
-    if idx == -1:
-        raise RuntimeError("Cannot locate clean YAML block (beta1:)")
-
-    clean_yaml = raw[idx+1:]
-    flat = yaml.safe_load(clean_yaml)
-
-    # 提取 loops
-    m = re.search(r"\bloops:\s*(\d+)", raw)
-    loops = int(m.group(1)) if m else 16
-
-    # num_heads
-    m = re.search(r"\bnum_heads:\s*(\d+)", raw)
-    num_heads = int(m.group(1)) if m else 8
-
-    # num_layers
-    m = re.search(r"\bnum_layers:\s*(\d+)", raw)
-    num_layers = int(m.group(1)) if m else 4
-
-    # pos_encodings
-    m = re.search(r"\bpos_encodings:\s*(\w+)", raw)
-    pos_encodings = m.group(1) if m else "rope"
-
-    # puzzle_emb_ndim
-    m = re.search(r"\bpuzzle_emb_ndim:\s*(\d+)", raw)
-    puzzle_emb_ndim = int(m.group(1)) if m else 512
-
-    # hidden_size
-    m = re.search(r"\bhidden_size:\s*(\d+)", raw)
-    hidden_size = int(m.group(1)) if m else puzzle_emb_ndim
-
-    # expansion
-    m = re.search(r"\bexpansion:\s*(\d+)", raw)
-    expansion = int(m.group(1)) if m else 4
-
-    # H_cycles
-    m = re.search(r"\bH_cycles:\s*(\d+)", raw)
-    H_cycles = int(m.group(1)) if m else 2
-
-    # L_cycles
-    m = re.search(r"\bL_cycles:\s*(\d+)", raw)
-    L_cycles = int(m.group(1)) if m else 6
-
-    arch_name = "urm.urm@URM"
-
-    arch_loss = {
-        "loss_type": "stablemax_cross_entropy",
-        "name": "losses@ACTLossHead"
-    }
-
-    arch = {
-        "H_cycles": H_cycles,
-        "L_cycles": L_cycles,
-        "expansion": expansion,
-        "hidden_size": hidden_size,
-        "loop_deltas": [0, 8],
-        "loops": loops,
-        "loss": arch_loss,
-        "name": arch_name,
-        "num_heads": num_heads,
-        "num_layers": num_layers,
-        "pos_encodings": pos_encodings,
-        "puzzle_emb_ndim": puzzle_emb_ndim,
-    }
-
-    flat["arch"] = arch
-
-    return PretrainConfig(**flat)
+    name: str
+    loss: LossConfig
 
 
-def evaluate_checkpoint(
-    checkpoint_path: str,
-    data_path: str,
-    output_dir: str,
-    config_overrides: Optional[Dict[str, Any]] = None,
-    wandb_project: Optional[str] = None,
-    wandb_run_name: Optional[str] = None,
-    save_predictions: bool = False,
-    loop_offsets: Optional[List[int]] = None,
-):
-    """
-    Evaluate a trained model checkpoint on a specified dataset.
-    
-    Args:
-        checkpoint_path: Path to the model checkpoint
-        data_path: Path to the dataset for evaluation
-        output_dir: Directory to save evaluation results
-        config_overrides: Optional config overrides
-        wandb_project: Optional W&B project name
-        wandb_run_name: Optional W&B run name
-        save_predictions: Whether to save model predictions
-    """
-    # Setup distributed if needed
-    rank, world_size, cpu_group = setup_distributed()
-    
-    # Load config from checkpoint
-    checkpoint_path = Path(checkpoint_path)
-    if rank == 0:
-        print(f"Loading config from checkpoint: {checkpoint_path}")
-    
-    config = load_config_from_checkpoint(checkpoint_path)
+class EvaluatorConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
 
-    # Apply overrides
-    config.checkpoint_path = str(checkpoint_path.parent)
-    config.data_path = data_path
-    
-    if config_overrides:
-        from pretrain import EvaluatorConfig  # Local import to avoid circular during type checking
+    name: str
 
-        for key, value in config_overrides.items():
-            if key == "arch" and isinstance(value, dict):
-                # Handle nested arch config updates (e.g., halt_max_steps)
-                for arch_key, arch_value in value.items():
-                    if hasattr(config.arch, '__pydantic_extra__'):
-                        config.arch.__pydantic_extra__[arch_key] = arch_value
-                    else:
-                        setattr(config.arch, arch_key, arch_value)
-            elif key == "evaluators" and isinstance(value, list):
-                # Convert evaluator override dicts back into EvaluatorConfig objects
-                config.evaluators = [
-                    cfg if isinstance(cfg, EvaluatorConfig) else EvaluatorConfig(**cfg) for cfg in value
-                ]
-            else:
-                setattr(config, key, value)
-    
-    # Setup output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Prepare loop extrapolation settings
-    arch_params = getattr(config.arch, "__pydantic_extra__", {})
-    base_loops = arch_params.get("loops") if isinstance(arch_params, dict) else None
-    use_loop_extrapolation = loop_offsets is not None and len(loop_offsets) > 0
 
-    if use_loop_extrapolation and base_loops is None:
-        raise ValueError("Loop extrapolation requested, but the loaded config has no 'loops' parameter.")
+class PretrainConfig(pydantic.BaseModel):
+    arch: ArchConfig
+    data_path: str
+    evaluators: List[EvaluatorConfig] = []
+    global_batch_size: int
+    epochs: int
+    lr: float
+    lr_min_ratio: float
+    lr_warmup_steps: int
+    weight_decay: float
+    beta1: float
+    beta2: float
+    target_q_update_every: int
+    puzzle_emb_lr: float
+    puzzle_emb_weight_decay: float
+    grad_accum_steps: int = 1
+    project_name: Optional[str] = None
+    run_name: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+    load_checkpoint: Optional[str] = None
+    load_strict: bool = True
+    load_optimizer_state: bool = True
+    seed: int = 0
+    checkpoint_every_eval: bool = False
+    eval_interval: Optional[int] = None
+    eval_save_outputs: List[str] = []
+    loop_deltas: List[str] = []
+    ema: bool = False
+    ema_rate: float = 0.999
+    use_muon: bool = False
+    data_fraction: float = 1.0
+    masked_input: Optional[MaskedInputConfig] = None
 
-    loop_runs: List[Tuple[Optional[int], PretrainConfig]] = []
-    if use_loop_extrapolation:
-        for offset in loop_offsets or []:
-            loop_config = config.model_copy(deep=True)
-            loop_config.arch.__pydantic_extra__["loops"] = base_loops + offset  # type: ignore[index]
-            loop_runs.append((base_loops + offset, loop_config))
-    else:
-        loop_runs.append((base_loops, config))
 
-    # Load dataset once (independent of loop setting)
-    if rank == 0:
-        print(f"Loading evaluation dataset from: {data_path}")
+def _resolve_checkpoint_path(path: str) -> Optional[str]:
+    if os.path.isfile(path):
+        return path
 
-    try:
-        eval_loader, eval_metadata = create_dataloader(
-            config,
-            "test",
+    if os.path.isdir(path):
+        pattern = re.compile(r"step_(\d+)(?:\.pt)?$")
+        candidates = []
+        for file_name in os.listdir(path):
+            match = pattern.match(file_name)
+            if match:
+                candidates.append((int(match.group(1)), os.path.join(path, file_name)))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[-1][1]
+
+    return None
+
+
+def load_config_from_checkpoint_path(path: str) -> PretrainConfig:
+    resolved_path = _resolve_checkpoint_path(path)
+    checkpoint_dir = Path(resolved_path if resolved_path is not None else path)
+    if checkpoint_dir.is_file():
+        checkpoint_dir = checkpoint_dir.parent
+
+    candidates = [
+        checkpoint_dir / "config.yaml",
+        checkpoint_dir / "config.json",
+        checkpoint_dir / "all_config.yaml",
+        checkpoint_dir / ".hydra" / "config.yaml",
+    ]
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+
+        try:
+            conf = OmegaConf.load(candidate)
+            as_dict = OmegaConf.to_container(conf, resolve=True)
+            if isinstance(as_dict, dict):
+                return PretrainConfig(**as_dict)
+        except Exception:
+            pass
+
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                config_dict = json.load(f) if candidate.suffix == ".json" else yaml.safe_load(f)
+            if isinstance(config_dict, dict):
+                return PretrainConfig(**config_dict)
+        except Exception:
+            pass
+
+    raise FileNotFoundError(f"Could not find a valid config next to checkpoint path: {path}")
+
+
+def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size: int) -> DataLoader:
+    dataset = PuzzleDataset(
+        PuzzleDatasetConfig(
+            seed=config.seed,
+            dataset_path=config.data_path,
+            global_batch_size=global_batch_size,
             test_set_mode=True,
             epochs_per_iter=1,
-            global_batch_size=config.global_batch_size,
-            rank=rank,
-            world_size=world_size
-        )
-    except FileNotFoundError as e:
-        if rank == 0:
-            print(f"Error loading dataset: {e}")
-            print("Make sure the dataset exists and has a 'test' split")
+            rank=0,
+            num_replicas=1,
+            masked_input=config.masked_input,
+        ),
+        split=split,
+    )
+    print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
+    return DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=1,
+        prefetch_factor=8,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+    )
+
+
+def create_model_for_evaluation(config: PretrainConfig, metadata, device: torch.device) -> nn.Module:
+    arch_extra = config.arch.__pydantic_extra__ or {}
+    model_cfg = dict(
+        **arch_extra,
+        batch_size=config.global_batch_size,
+        vocab_size=metadata.vocab_size,
+        seq_len=metadata.seq_len,
+        num_puzzle_identifiers=metadata.num_puzzle_identifiers,
+        causal=False,
+    )
+
+    model_cls = load_model_class(config.arch.name)
+    loss_head_cls = load_model_class(config.arch.loss.name)
+
+    model = model_cls(model_cfg)
+    model = loss_head_cls(model, **(config.arch.loss.__pydantic_extra__ or {}))
+    model = model.to(device)
+    return model
+
+
+def _remap_state_dict_prefix_if_needed(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    model_keys = list(model.state_dict().keys())
+    if not model_keys or not state_dict:
+        return state_dict
+
+    model_has_orig_mod = model_keys[0].startswith("_orig_mod.")
+    ckpt_has_orig_mod = next(iter(state_dict)).startswith("_orig_mod.")
+
+    if model_has_orig_mod == ckpt_has_orig_mod:
+        return state_dict
+
+    if ckpt_has_orig_mod:
+        return {
+            key[len("_orig_mod."):] if key.startswith("_orig_mod.") else key: value
+            for key, value in state_dict.items()
+        }
+
+    return {f"_orig_mod.{key}": value for key, value in state_dict.items()}
+
+
+def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    model_key = next((key for key in model.state_dict().keys() if key.endswith("puzzle_emb.weights")), None)
+    state_key = next((key for key in state_dict.keys() if key.endswith("puzzle_emb.weights")), None)
+
+    if model_key is None or state_key is None:
         return
-    
-    # Load model weights once (rank 0) to reuse across loop runs
-    if rank == 0:
-        print(f"Loading checkpoint weights from: {checkpoint_path}")
 
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    expected_shape = model.state_dict()[model_key].shape
+    current_shape = state_dict[state_key].shape
+    if current_shape == expected_shape:
+        return
 
-        state_dict = None
-        if isinstance(checkpoint, dict):
-            for key in ("model", "state_dict", "model_state_dict"):
-                if key in checkpoint and isinstance(checkpoint[key], dict):
-                    state_dict = checkpoint[key]
-                    break
+    print(
+        "Resetting puzzle embedding because the stored shape does not match "
+        f"(found {tuple(current_shape)}, expected {tuple(expected_shape)})."
+    )
+    puzzle_emb = state_dict[state_key]
+    state_dict[state_key] = torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
 
-            if state_dict is None and "model_state_dict" in checkpoint:
-                state_dict = checkpoint["model_state_dict"]
 
-        if state_dict is None:
-            state_dict = checkpoint
+def load_model_weights(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+    strict: bool,
+) -> Optional[int]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = _remap_state_dict_prefix_if_needed(model, state_dict)
+    _resize_puzzle_embedding_if_needed(model, state_dict)
 
-        step = checkpoint.get('step', 0)
-    else:
-        state_dict = None
-        step = 0
+    load_result = model.load_state_dict(state_dict, strict=strict)
+    if not strict:
+        missing, unexpected = load_result
+        if missing:
+            print(f"Missing keys during checkpoint load: {missing}")
+        if unexpected:
+            print(f"Unexpected keys during checkpoint load: {unexpected}")
 
-    if world_size > 1:
-        step_tensor = torch.tensor([step], device='cuda')
-        dist.broadcast(step_tensor, src=0)
-        step = step_tensor.item()
+    if isinstance(checkpoint, dict):
+        step = checkpoint.get("step")
+        return None if step is None else int(step)
+    return None
 
-    loop_metrics: Dict[int, Dict[str, Any]] = {}
 
-    def convert_to_serializable(obj):
-        """Convert numpy types to Python native types for JSON serialization"""
-        import numpy as np
-        if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_to_serializable(v) for v in obj]
-        elif isinstance(obj, (np.integer, np.floating)):
-            return obj.item()
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
+def _valid_example_mask(labels: torch.Tensor) -> torch.Tensor:
+    return (labels != IGNORE_LABEL_ID).any(dim=1)
+
+
+def _finalize_metric_totals(metric_totals: Dict[str, float]) -> Dict[str, float]:
+    if not metric_totals:
+        return {}
+
+    count = max(metric_totals.get("count", 0.0), 1.0)
+    finalized: Dict[str, float] = {}
+    for key, value in metric_totals.items():
+        if key == "count":
+            finalized[key] = value
+        elif key.startswith("profile/"):
+            finalized[key] = value
         else:
-            return obj
-
-    for loop_value, loop_config in loop_runs:
-        if rank == 0:
-            loop_desc = f"loops={loop_value}" if loop_value is not None else "loops=default"
-            print(f"\n=== Evaluating with {loop_desc} ===")
-            print("Creating model...")
-
-        # Load model - we need to get training metadata for model creation
-        try:
-            train_loader, train_metadata = create_dataloader(
-                loop_config,
-                "train",
-                test_set_mode=False,
-                epochs_per_iter=1,
-                global_batch_size=loop_config.global_batch_size,
-                rank=rank,
-                world_size=world_size
-            )
-        except FileNotFoundError:
-            if rank == 0:
-                print("No train split found, using eval metadata for model creation")
-            train_metadata = eval_metadata
-
-        model, _, _ = create_model(loop_config, train_metadata, rank=rank, world_size=world_size)
-
-        if rank == 0:
-            model.load_state_dict(state_dict, strict=True)
-
-        if world_size > 1:
-            with torch.no_grad():
-                for param in list(model.parameters()) + list(model.buffers()):
-                    dist.broadcast(param, src=0)
-
-        if rank == 0:
-            print("Creating evaluators...")
-        evaluators = create_evaluators(loop_config, eval_metadata)
-
-        train_state = TrainState(
-            model=model,
-            optimizers=[],  # Not needed for evaluation
-            optimizer_lrs=[],  # Not needed for evaluation
-            carry=None,  # Will be initialized during evaluation
-            step=step,
-            total_steps=step + 1  # Just needs to be > step
-        )
-
-        model.eval()
-
-        if rank == 0:
-            print("Running evaluation...")
-            print(f"Dataset has {len(eval_metadata.sets)} test sets")
-
-        loop_output_dir = output_dir if not use_loop_extrapolation else output_dir / f"loops_{loop_value}"
-        loop_output_dir.mkdir(parents=True, exist_ok=True)
-
-        if save_predictions:
-            loop_config.eval_save_outputs = ["inputs", "preds", "puzzle_identifiers"]
-
-        if rank == 0 and wandb_project:
-            wandb_run = wandb_run_name or f"eval_{checkpoint_path.stem}"
-            if loop_value is not None:
-                wandb_run = f"{wandb_run}_loops{loop_value}"
-
-            wandb.init(
-                project=wandb_project,
-                name=wandb_run,
-                config=OmegaConf.to_container(OmegaConf.create(loop_config.__dict__)),
-                dir=str(loop_output_dir)
-            )
-
-        metrics = evaluate(
-            loop_config,
-            train_state,
-            eval_loader,
-            eval_metadata,
-            evaluators,
-            rank=rank,
-            world_size=world_size,
-            cpu_group=cpu_group
-        )
-
-        if rank == 0 and metrics is not None:
-            serializable_metrics = convert_to_serializable(metrics)
-
-            metrics_file = loop_output_dir / "metrics.json"
-            with open(metrics_file, 'w') as f:
-                json.dump(serializable_metrics, f, indent=2)
-
-            print("\nEvaluation Results:")
-            print("=" * 50)
-            for key, value in metrics.items():
-                if isinstance(value, dict):
-                    print(f"\n{key}:")
-                    for subkey, subvalue in value.items():
-                        print(f"  {subkey}: {subvalue:.4f}")
-                else:
-                    print(f"{key}: {value:.4f}")
-
-            print(f"\nResults saved to: {loop_output_dir}")
-
-            if use_loop_extrapolation and loop_value is not None:
-                loop_metrics[loop_value] = serializable_metrics
-
-            if wandb.run:
-                wandb.log(metrics)
-                wandb.finish()
-
-        if world_size > 1:
-            dist.barrier()
-
-    if use_loop_extrapolation and rank == 0 and len(loop_metrics):
-        summary_file = output_dir / "loop_extrapolation_metrics.json"
-        with open(summary_file, 'w') as f:
-            json.dump(loop_metrics, f, indent=2)
-
-    # Cleanup
-    if world_size > 1:
-        dist.destroy_process_group()
+            finalized[key] = value / count
+    return finalized
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained HRM model checkpoint")
-    parser.add_argument(
-        "--checkpoint-path",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint file"
-    )
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        default="/volume/pt-train/users/ztgao/loop_arcagi/data/arc-aug-1000",
-        help="Path to the dataset directory"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="eval_results",
-        help="Directory to save evaluation results"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=512,
-        help="Global batch size for evaluation"
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default=None,
-        help="W&B project name (optional)"
-    )
-    parser.add_argument(
-        "--wandb-run-name",
-        type=str,
-        default=None,
-        help="W&B run name (optional)"
-    )
-    parser.add_argument(
-        "--save-predictions",
-        action="store_true",
-        help="Save model predictions"
-    )
-    parser.add_argument(
-        "--submission-k",
-        type=int,
-        default=2,
-        help="Number of predictions per puzzle for submission"
-    )
-    parser.add_argument(
-        "--aggregated-voting",
-        action="store_true",
-        default=True,
-        help="Use aggregated voting across augmentations"
-    )
-    parser.add_argument(
-        "--loop-extrapolation",
-        action="store_true",
-        help="Evaluate the checkpoint with additional loop counts beyond training",
-    )
-    parser.add_argument(
-        "--loop-offsets",
-        type=str,
-        default="0,1,3,5,7,9",
-        help="Comma-separated list of loop count offsets to test during extrapolation",
+def _concat_saved_outputs(saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
+    concatenated: Dict[str, Dict[str, torch.Tensor]] = {}
+    for set_name, per_set_outputs in saved_outputs.items():
+        concatenated[set_name] = {}
+        for key, tensors in per_set_outputs.items():
+            concatenated[set_name][key] = torch.cat(tensors, dim=0) if tensors else torch.empty(0)
+    return concatenated
+
+
+def _estimate_total_batches(dataloader: DataLoader) -> Optional[int]:
+    dataset = dataloader.dataset
+    if not isinstance(dataset, PuzzleDataset):
+        return None
+
+    try:
+        dataset._lazy_load_dataset()
+    except Exception:
+        return None
+
+    if dataset._data is None:
+        return None
+
+    return sum(
+        math.ceil(len(per_set_data["inputs"]) / dataset.config.global_batch_size)
+        for per_set_data in dataset._data.values()
     )
 
-    args = parser.parse_args()
 
-    # pass_ks = [1, 2, 5, 10, 100, 1000]
-    pass_ks = [1]
-    loop_offsets = None
-    # if args.loop_extrapolation:
-    #     loop_offsets = [int(item) for item in args.loop_offsets.split(',') if item.strip()]
-    #     pass_ks = [1]
-        # pass_ks = [1, 2, 5, 10, 100, 1000]
+def _compute_batch_metric_sums(
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor],
+    final_steps: torch.Tensor,
+    keep_mask: torch.Tensor,
+) -> Dict[str, float]:
+    labels = batch["labels"]
+    selected_labels = labels[keep_mask]
+    selected_preds = preds["preds"][keep_mask]
+    selected_steps = final_steps[keep_mask]
 
-    config_overrides = {
-        "global_batch_size": args.batch_size,
-        "evaluators": [
-            {
-                "name": "ARC",
-                "submission_K": args.submission_k,
-                "aggregated_voting": args.aggregated_voting,
-                "pass_Ks": pass_ks
-            }
-        ]
+    token_mask = selected_labels != IGNORE_LABEL_ID
+    token_counts = token_mask.sum(dim=1)
+    valid_examples = token_counts > 0
+    if not torch.any(valid_examples):
+        return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "lm_loss": 0.0, "steps": 0.0}
+
+    selected_labels = selected_labels[valid_examples]
+    selected_preds = selected_preds[valid_examples]
+    selected_steps = selected_steps[valid_examples]
+    token_mask = token_mask[valid_examples]
+    token_counts = token_counts[valid_examples]
+
+    is_correct = token_mask & (selected_preds == selected_labels)
+    seq_token_accuracy = is_correct.to(torch.float32).sum(dim=1) / token_counts.clamp_min(1)
+    seq_exact_accuracy = (is_correct.sum(dim=1) == token_counts).to(torch.float32)
+
+    logits = preds["logits"][keep_mask][valid_examples]
+    if hasattr(model, "loss_fn"):
+        token_loss = model.loss_fn(logits, selected_labels, ignore_index=IGNORE_LABEL_ID)  # type: ignore[misc]
+    else:
+        token_loss = F.cross_entropy(
+            logits.to(torch.float32).view(-1, logits.shape[-1]),
+            selected_labels.to(torch.long).view(-1),
+            ignore_index=IGNORE_LABEL_ID,
+            reduction="none",
+        ).view(selected_labels.shape)
+    seq_lm_loss = token_loss.sum(dim=1) / token_counts.clamp_min(1)
+
+    return {
+        "count": float(valid_examples.sum().item()),
+        "accuracy": float(seq_token_accuracy.sum().item()),
+        "exact_accuracy": float(seq_exact_accuracy.sum().item()),
+        "lm_loss": float(seq_lm_loss.sum().item()),
+        "steps": float(selected_steps.to(torch.float32).sum().item()),
     }
 
-    evaluate_checkpoint(
-        checkpoint_path=args.checkpoint_path,
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        config_overrides=config_overrides,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-        save_predictions=args.save_predictions,
-        loop_offsets=loop_offsets
+
+def evaluate_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_problems: Optional[int],
+    max_batches: Optional[int],
+    save_predictions: bool,
+) -> tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, torch.Tensor]], int, int]:
+    model.eval()
+
+    return_keys: Set[str] = {"preds", "logits"}
+    if save_predictions:
+        return_keys.update({"q_halt_logits", "q_continue_logits"})
+
+    metric_totals_by_set: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
+
+    processed_batches = 0
+    processed_problems = 0
+    progress_total = _estimate_total_batches(dataloader)
+    if progress_total is not None and max_batches is not None:
+        progress_total = min(progress_total, max_batches)
+    if progress_total is not None and max_problems is not None:
+        progress_total = min(progress_total, math.ceil(max_problems / dataloader.dataset.config.global_batch_size))  # type: ignore[attr-defined]
+
+    with torch.inference_mode():
+        for batch_index, (set_name, batch, _global_batch_size) in enumerate(
+            tqdm(dataloader, desc="Evaluating", total=progress_total)
+        ):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            if max_problems is not None and processed_problems >= max_problems:
+                break
+
+            processed_batches += 1
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            with torch.device(str(device)):
+                carry = model.initial_carry(batch)  # type: ignore[misc]
+
+            while True:
+                carry, _loss, _metrics, preds, all_finish = model(
+                    carry=carry,
+                    batch=batch,
+                    return_keys=return_keys,
+                )
+                if all_finish:
+                    break
+
+            valid_example_mask = _valid_example_mask(batch["labels"])
+            keep_mask = valid_example_mask.clone()
+            if max_problems is not None:
+                remaining = max_problems - processed_problems
+                valid_indices = torch.nonzero(valid_example_mask, as_tuple=False).squeeze(-1)
+                if remaining <= 0:
+                    break
+                if valid_indices.numel() > remaining:
+                    keep_mask = torch.zeros_like(valid_example_mask)
+                    keep_mask[valid_indices[:remaining]] = True
+
+            batch_metric_sums = _compute_batch_metric_sums(
+                model=model,
+                batch=batch,
+                preds=preds,
+                final_steps=carry.steps,
+                keep_mask=keep_mask,
+            )
+            processed_problems += int(batch_metric_sums["count"])
+            for metric_name, metric_value in batch_metric_sums.items():
+                metric_totals_by_set[set_name][metric_name] += metric_value
+
+            if save_predictions:
+                for key, value in batch.items():
+                    if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs"}:
+                        saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())
+                for key, value in preds.items():
+                    saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())
+
+            if max_problems is not None and processed_problems >= max_problems:
+                break
+
+    finalized_by_set = {
+        set_name: _finalize_metric_totals(metric_totals)
+        for set_name, metric_totals in metric_totals_by_set.items()
+    }
+
+    overall_totals: Dict[str, float] = defaultdict(float)
+    for metric_totals in metric_totals_by_set.values():
+        for key, value in metric_totals.items():
+            overall_totals[key] += value
+    finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
+
+    return finalized_by_set, _concat_saved_outputs(saved_outputs), processed_batches, processed_problems
+
+
+def _default_output_path(
+    checkpoint_path: str,
+    split: str,
+    max_batches: Optional[int],
+    max_problems: Optional[int],
+    loops: Optional[int],
+    h_cycles: Optional[int],
+    l_cycles: Optional[int],
+) -> Path:
+    resolved_path = _resolve_checkpoint_path(checkpoint_path)
+    if resolved_path is None:
+        stem = f"evaluation_results_{split}"
+        if max_batches is not None:
+            stem += f"_max_batches_{max_batches}"
+        if max_problems is not None:
+            stem += f"_max_problems_{max_problems}"
+        if loops is not None:
+            stem += f"_loops_{loops}"
+        if h_cycles is not None:
+            stem += f"_H_cycles_{h_cycles}"
+        if l_cycles is not None:
+            stem += f"_L_cycles_{l_cycles}"
+        return Path(f"{stem}.pt")
+    checkpoint_file = Path(resolved_path)
+    stem = f"{checkpoint_file.stem}_evaluation_{split}"
+    if max_batches is not None:
+        stem += f"_max_batches_{max_batches}"
+    if max_problems is not None:
+        stem += f"_max_problems_{max_problems}"
+    if loops is not None:
+        stem += f"_loops_{loops}"
+    if h_cycles is not None:
+        stem += f"_H_cycles_{h_cycles}"
+    if l_cycles is not None:
+        stem += f"_L_cycles_{l_cycles}"
+    return checkpoint_file.parent / f"{stem}.pt"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate a trained checkpoint on a dataset split.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/URM-sudoku-base-good",
+        help="Checkpoint file or checkpoint directory.",
     )
+    parser.add_argument("--data_path", type=str, default=None, help="Override dataset path from the checkpoint config.")
+    parser.add_argument("--split", type=str, default="test", help="Dataset split to evaluate.")
+    parser.add_argument("--batch_size", type=int, default=None, help="Override the global batch size for evaluation.")
+    parser.add_argument(
+        "--max_problems",
+        type=int,
+        default=None,
+        help="Evaluate at most this many problems. Stops exactly at the requested number.",
+    )
+    parser.add_argument("--output", type=str, default=None, help="Optional .pt file to save metrics and outputs.")
+    parser.add_argument("--max_batches", type=int, default=None, help="Stop after this many batches for debugging.")
+    parser.add_argument(
+        "--loops",
+        type=int,
+        default=None,
+        help="Override the model loop count used while solving each problem.",
+    )
+    parser.add_argument(
+        "--H_cycles",
+        type=int,
+        default=None,
+        help="Override H_cycles for evaluation.",
+    )
+    parser.add_argument(
+        "--L_cycles",
+        type=int,
+        default=None,
+        help="Override L_cycles for evaluation.",
+    )
+    parser.add_argument("--device", type=str, default=None, help="Device to use, for example 'cuda' or 'cpu'.")
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        help="Also save inputs, labels, preds, logits, and halt logits to the output file.",
+    )
+    parser.add_argument(
+        "--no_strict_load",
+        action="store_true",
+        help="Allow missing or unexpected keys when loading the checkpoint.",
+    )
+    args = parser.parse_args()
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint)
+    if resolved_checkpoint_path is None:
+        raise FileNotFoundError(f"Could not resolve checkpoint path from: {args.checkpoint}")
+
+    print(f"Loading config from: {args.checkpoint}")
+    config = load_config_from_checkpoint_path(args.checkpoint)
+    if args.data_path is not None:
+        config.data_path = args.data_path
+    if args.batch_size is not None:
+        config.global_batch_size = args.batch_size
+    if args.loops is not None:
+        if config.arch.__pydantic_extra__ is None:
+            config.arch.__pydantic_extra__ = {}
+        config.arch.__pydantic_extra__["loops"] = args.loops
+    if args.H_cycles is not None:
+        if config.arch.__pydantic_extra__ is None:
+            config.arch.__pydantic_extra__ = {}
+        config.arch.__pydantic_extra__["H_cycles"] = args.H_cycles
+    if args.L_cycles is not None:
+        if config.arch.__pydantic_extra__ is None:
+            config.arch.__pydantic_extra__ = {}
+        config.arch.__pydantic_extra__["L_cycles"] = args.L_cycles
+
+    print(f"Using device: {device}")
+    print(f"Using dataset: {config.data_path} ({args.split})")
+    print(f"Using batch size: {config.global_batch_size}")
+    if args.max_problems is not None:
+        print(f"Evaluating at most {args.max_problems} problems")
+    if args.loops is not None:
+        print(f"Overriding loops to: {args.loops}")
+    if args.H_cycles is not None:
+        print(f"Overriding H_cycles to: {args.H_cycles}")
+    if args.L_cycles is not None:
+        print(f"Overriding L_cycles to: {args.L_cycles}")
+
+    dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
+    metadata = dataloader.dataset.metadata
+
+    print("Reconstructing model...")
+    model = create_model_for_evaluation(config, metadata, device=device)
+
+    print(f"Loading weights from: {resolved_checkpoint_path}")
+    step = load_model_weights(
+        model,
+        resolved_checkpoint_path,
+        device=device,
+        strict=not args.no_strict_load,
+    )
+
+    metrics_by_set, saved_outputs, processed_batches, processed_problems = evaluate_model(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        max_problems=args.max_problems,
+        max_batches=args.max_batches,
+        save_predictions=args.save_predictions,
+    )
+
+    print("")
+    print(f"Processed batches: {processed_batches}")
+    print(f"Processed problems: {processed_problems}")
+    if step is not None:
+        print(f"Checkpoint step: {step}")
+    for set_name, metrics in metrics_by_set.items():
+        print(f"[{set_name}]")
+        for key, value in sorted(metrics.items()):
+            print(f"  {key}: {value:.6f}")
+
+    output_path = (
+        Path(args.output)
+        if args.output is not None
+        else _default_output_path(
+            args.checkpoint,
+            args.split,
+            args.max_batches,
+            args.max_problems,
+            args.loops,
+            args.H_cycles,
+            args.L_cycles,
+        )
+    )
+    payload = {
+        "checkpoint": resolved_checkpoint_path,
+        "checkpoint_step": step,
+        "data_path": config.data_path,
+        "split": args.split,
+        "batch_size": config.global_batch_size,
+        "loops": (config.arch.__pydantic_extra__ or {}).get("loops"),
+        "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
+        "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
+        "max_batches": args.max_batches,
+        "max_problems": args.max_problems,
+        "processed_batches": processed_batches,
+        "processed_problems": processed_problems,
+        "metrics": metrics_by_set,
+    }
+    if args.save_predictions:
+        payload["outputs"] = saved_outputs
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, output_path)
+    print(f"\nSaved evaluation results to: {output_path}")
 
 
 if __name__ == "__main__":
