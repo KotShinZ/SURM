@@ -158,7 +158,7 @@ class PuzzleDataset(IterableDataset):
 
         return masked_inputs
 
-    def _collate_batch(self, batch, rng: np.random.Generator):
+    def _collate_batch(self, batch, rng: np.random.Generator, make_masked_inputs: bool = True):
         # Convert dtype
         batch = {k: v.astype(np.int32, copy=True) for k, v in batch.items()}
 
@@ -167,7 +167,7 @@ class PuzzleDataset(IterableDataset):
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
         masked_input_cfg = self.config.masked_input
-        if masked_input_cfg is not None and masked_input_cfg.enabled:
+        if masked_input_cfg is not None and masked_input_cfg.enabled and make_masked_inputs:
             if masked_input_cfg.preserve_source_inputs:
                 batch["source_inputs"] = batch["inputs"].copy()
             batch["inputs"] = self._make_masked_inputs(batch["labels"], rng)
@@ -215,7 +215,7 @@ class PuzzleDataset(IterableDataset):
                     "inputs": dataset["inputs"][local_start: local_end],
                     "labels": dataset["labels"][local_start: local_end],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                }, rng)
+                }, rng, make_masked_inputs=False)
 
                 yield set_name, batch, end_index - start_index
                 
