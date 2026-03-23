@@ -466,6 +466,7 @@ def load_actor(
         rank=0, num_replicas=1,
         global_batch_size=config.global_batch_size,
         test_set_mode=True, epochs_per_iter=1,
+        masked_input=getattr(config, "masked_input", None),
     )
     dataset = PuzzleDataset(ds_config, split="train")
     metadata = dataset.metadata
@@ -782,6 +783,7 @@ def main():
         global_batch_size=config.global_batch_size,
         test_set_mode=False,
         epochs_per_iter=max(1, args.total_steps // 100),
+        masked_input=getattr(config, "masked_input", None),
     )
     train_dataset = PuzzleDataset(ds_config, split="train")
     train_loader = DataLoader(
@@ -796,6 +798,7 @@ def main():
         rank=0, num_replicas=1,
         global_batch_size=config.global_batch_size,
         test_set_mode=True, epochs_per_iter=1,
+        masked_input=getattr(config, "masked_input", None),
     )
     eval_dataset = PuzzleDataset(eval_ds_config, split="test")
     eval_loader = DataLoader(

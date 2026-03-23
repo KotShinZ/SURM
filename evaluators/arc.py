@@ -39,7 +39,7 @@ def _crop(grid: np.ndarray):
 
 
 class ARC:
-    required_outputs = {"inputs", "puzzle_identifiers", "q_halt_logits", "preds"}
+    required_outputs = {"inputs", "source_inputs", "puzzle_identifiers", "q_halt_logits", "preds"}
     
     def __init__(self, data_path: str, eval_metadata: PuzzleDatasetMetadata, submission_K: int = 2, pass_Ks: Sequence[int] = (1, 2, 5, 10, 100, 1000), aggregated_voting: bool = True):
         super().__init__()
@@ -89,7 +89,9 @@ class ARC:
         outputs = {k: v[mask] for k, v in outputs.items()}
 
         # Get predictions
-        for identifier, input, pred, q, q_log_prob in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), q_values.numpy(), q_log_probs.numpy()):
+        input_key = "source_inputs" if "source_inputs" in outputs else "inputs"
+
+        for identifier, input, pred, q, q_log_prob in zip(outputs["puzzle_identifiers"].numpy(), outputs[input_key].numpy(), outputs["preds"].numpy(), q_values.numpy(), q_log_probs.numpy()):
             name = self.identifier_map[identifier]
             orig_name, _inverse_fn = inverse_aug(name)
 

@@ -56,3 +56,15 @@ online_aug:
   sudoku_row_col_perm: true
   # Sudoku: random transpose (swap rows ↔ columns)
   sudoku_transpose: true
+
+# Replace model inputs with a randomly masked version of the label sequence.
+# The model still predicts the full label sequence.
+masked_input:
+  enabled: true
+  min_mask_ratio: 0.1
+  max_mask_ratio: 0.5
+  # Shared default across current datasets:
+  # Sudoku: 1 = blank, ARC-AGI: 1 = EOS/unknown-like special token.
+  mask_token_id: 1
+  # Keep the original dataset input in batch["source_inputs"] for evaluators/debugging.
+  preserve_source_inputs: true

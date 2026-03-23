@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 # 元のコードで使用されているモジュールをインポート
 from models.muon import Muon
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
+from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
 
 from typing import List, Optional, Any, Dict
@@ -63,6 +63,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False
     ema_rate: float = 0.999
     use_muon: bool = False
+    masked_input: Optional[MaskedInputConfig] = None
 
 # --- Helper Functions ---
 
@@ -243,7 +244,8 @@ def main():
     
     ds_config = PuzzleDatasetConfig(
         seed=config.seed, dataset_path=config.data_path, rank=0, num_replicas=1,
-        global_batch_size=config.global_batch_size, test_set_mode=True, epochs_per_iter=1
+        global_batch_size=config.global_batch_size, test_set_mode=True, epochs_per_iter=1,
+        masked_input=config.masked_input,
     )
     dataset = PuzzleDataset(ds_config, split=args.split)
     metadata = dataset.metadata

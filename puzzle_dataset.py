@@ -13,6 +13,28 @@ from data.common import PuzzleDatasetMetadata
 from data.online_aug import OnlineAugConfig, apply_online_aug
 
 
+class MaskedInputConfig(pydantic.BaseModel):
+    enabled: bool = False
+    min_mask_ratio: float = 0.0
+    max_mask_ratio: float = 0.0
+    mask_token_id: int = 1
+    preserve_source_inputs: bool = True
+
+    @pydantic.model_validator(mode="after")
+    def _validate_ranges(self):
+        if not (0.0 <= self.min_mask_ratio <= 1.0):
+            raise ValueError(f"min_mask_ratio must be in [0, 1], got {self.min_mask_ratio}")
+        if not (0.0 <= self.max_mask_ratio <= 1.0):
+            raise ValueError(f"max_mask_ratio must be in [0, 1], got {self.max_mask_ratio}")
+        if self.min_mask_ratio > self.max_mask_ratio:
+            raise ValueError(
+                f"min_mask_ratio ({self.min_mask_ratio}) must be <= max_mask_ratio ({self.max_mask_ratio})"
+            )
+        if self.mask_token_id < 0:
+            raise ValueError(f"mask_token_id must be >= 0, got {self.mask_token_id}")
+        return self
+
+
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int, data_fraction: float = 1.0):
     # Pack examples into a full batch
     batch = []
@@ -60,6 +82,9 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # Online augmentation applied at training time (None = disabled)
     online_aug: Optional[OnlineAugConfig] = None
 
+    # Replace model inputs with randomly masked labels.
+    masked_input: Optional[MaskedInputConfig] = None
+
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -106,13 +131,46 @@ class PuzzleDataset(IterableDataset):
                 for field_name, mmap_mode in field_mmap_modes.items()
             }
 
-    def _collate_batch(self, batch):
+    def _make_masked_inputs(self, labels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        cfg = self.config.masked_input
+        assert cfg is not None
+
+        masked_inputs = np.where(labels == IGNORE_LABEL_ID, self.metadata.pad_id, labels).astype(np.int32, copy=True)
+        valid_mask = labels != IGNORE_LABEL_ID
+
+        for row_idx in range(masked_inputs.shape[0]):
+            valid_positions = np.flatnonzero(valid_mask[row_idx])
+            if valid_positions.size == 0:
+                continue
+
+            if cfg.min_mask_ratio == cfg.max_mask_ratio:
+                mask_ratio = cfg.min_mask_ratio
+            else:
+                mask_ratio = float(rng.uniform(cfg.min_mask_ratio, cfg.max_mask_ratio))
+
+            mask_count = int(round(valid_positions.size * mask_ratio))
+            mask_count = min(max(mask_count, 0), valid_positions.size)
+            if mask_count == 0:
+                continue
+
+            masked_positions = rng.choice(valid_positions, size=mask_count, replace=False)
+            masked_inputs[row_idx, masked_positions] = cfg.mask_token_id
+
+        return masked_inputs
+
+    def _collate_batch(self, batch, rng: np.random.Generator):
         # Convert dtype
-        batch = {k: v.astype(np.int32) for k, v in batch.items()}
+        batch = {k: v.astype(np.int32, copy=True) for k, v in batch.items()}
 
         # Convert ignore label IDs
         if self.metadata.ignore_label_id is not None:
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
+
+        masked_input_cfg = self.config.masked_input
+        if masked_input_cfg is not None and masked_input_cfg.enabled:
+            if masked_input_cfg.preserve_source_inputs:
+                batch["source_inputs"] = batch["inputs"].copy()
+            batch["inputs"] = self._make_masked_inputs(batch["labels"], rng)
 
         # Pad
         if batch["puzzle_identifiers"].size < self.local_batch_size:
@@ -121,15 +179,17 @@ class PuzzleDataset(IterableDataset):
             pad_values = {
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
-
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
+            if "source_inputs" in batch:
+                pad_values["source_inputs"] = self.metadata.pad_id
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
     
     def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
         for set_name, dataset in self._data.items():  # type: ignore
             total_examples = len(dataset["inputs"])
 
@@ -155,7 +215,7 @@ class PuzzleDataset(IterableDataset):
                     "inputs": dataset["inputs"][local_start: local_end],
                     "labels": dataset["labels"][local_start: local_end],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                })
+                }, rng)
 
                 yield set_name, batch, end_index - start_index
                 
@@ -198,7 +258,7 @@ class PuzzleDataset(IterableDataset):
                     "inputs": dataset["inputs"][batch_indices],
                     "labels": dataset["labels"][batch_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                })
+                }, rng)
 
                 if self.config.online_aug is not None and self.config.online_aug.enabled:
                     batch = apply_online_aug(batch, self.metadata.seq_len, self.config.online_aug)
