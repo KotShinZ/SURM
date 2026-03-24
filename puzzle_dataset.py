@@ -134,11 +134,16 @@ class PuzzleDataset(IterableDataset):
                 for field_name, mmap_mode in field_mmap_modes.items()
             }
 
-    def _make_masked_inputs(self, labels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    def _make_masked_inputs(
+        self,
+        source_inputs: np.ndarray,
+        labels: np.ndarray,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
         cfg = self.config.masked_input
         assert cfg is not None
 
-        masked_inputs = np.where(labels == IGNORE_LABEL_ID, self.metadata.pad_id, labels).astype(np.int32, copy=True)
+        masked_inputs = source_inputs.astype(np.int32, copy=True)
         valid_mask = labels != IGNORE_LABEL_ID
 
         for row_idx in range(masked_inputs.shape[0]):
@@ -148,6 +153,13 @@ class PuzzleDataset(IterableDataset):
             valid_positions = np.flatnonzero(valid_mask[row_idx])
             if valid_positions.size == 0:
                 continue
+
+            # Start from the full answer only for samples where masked-input mode is applied.
+            masked_inputs[row_idx] = np.where(
+                valid_mask[row_idx],
+                labels[row_idx],
+                self.metadata.pad_id,
+            ).astype(np.int32, copy=False)
 
             if cfg.min_mask_ratio == cfg.max_mask_ratio:
                 mask_ratio = cfg.min_mask_ratio
@@ -176,7 +188,7 @@ class PuzzleDataset(IterableDataset):
         if masked_input_cfg is not None and masked_input_cfg.enabled and make_masked_inputs:
             if masked_input_cfg.preserve_source_inputs:
                 batch["source_inputs"] = batch["inputs"].copy()
-            batch["inputs"] = self._make_masked_inputs(batch["labels"], rng)
+            batch["inputs"] = self._make_masked_inputs(batch["inputs"], batch["labels"], rng)
 
         # Pad
         if batch["puzzle_identifiers"].size < self.local_batch_size:

@@ -61,7 +61,7 @@ online_aug:
 # The model still predicts the full label sequence.
 masked_input:
   enabled: false
-  apply_probability: 0.2
+  apply_probability: 0.5
   min_mask_ratio: 0.1
   max_mask_ratio: 0.5
   # Shared default across current datasets:
