@@ -15,6 +15,7 @@ from data.online_aug import OnlineAugConfig, apply_online_aug
 
 class MaskedInputConfig(pydantic.BaseModel):
     enabled: bool = False
+    apply_probability: float = 1.0
     min_mask_ratio: float = 0.0
     max_mask_ratio: float = 0.0
     mask_token_id: int = 1
@@ -22,6 +23,8 @@ class MaskedInputConfig(pydantic.BaseModel):
 
     @pydantic.model_validator(mode="after")
     def _validate_ranges(self):
+        if not (0.0 <= self.apply_probability <= 1.0):
+            raise ValueError(f"apply_probability must be in [0, 1], got {self.apply_probability}")
         if not (0.0 <= self.min_mask_ratio <= 1.0):
             raise ValueError(f"min_mask_ratio must be in [0, 1], got {self.min_mask_ratio}")
         if not (0.0 <= self.max_mask_ratio <= 1.0):
@@ -139,6 +142,9 @@ class PuzzleDataset(IterableDataset):
         valid_mask = labels != IGNORE_LABEL_ID
 
         for row_idx in range(masked_inputs.shape[0]):
+            if rng.random() > cfg.apply_probability:
+                continue
+
             valid_positions = np.flatnonzero(valid_mask[row_idx])
             if valid_positions.size == 0:
                 continue
