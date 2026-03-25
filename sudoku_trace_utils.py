@@ -112,15 +112,7 @@ def _compute_accuracy_stats(preds: torch.Tensor, labels: torch.Tensor) -> tuple[
     return token_acc, exact_acc
 
 
-@torch.inference_mode()
-def trace_single_outer_loop(model, batch_gpu: Dict[str, torch.Tensor]) -> List[TraceRecord]:
-    loss_head = model
-    urm = loss_head.model
-    inner = urm.inner
-
-    with torch.device(str(batch_gpu["inputs"].device)):
-        carry = loss_head.initial_carry(batch_gpu)
-
+def _prepare_outer_loop_inputs(inner, carry, batch_gpu: Dict[str, torch.Tensor]) -> tuple[Any, Dict[str, torch.Tensor]]:
     carry_after_reset = inner.reset_carry(carry.halted, carry)
     current_data = {
         key: torch.where(
@@ -130,43 +122,29 @@ def trace_single_outer_loop(model, batch_gpu: Dict[str, torch.Tensor]) -> List[T
         )
         for key, value in carry.current_data.items()
     }
+    return carry_after_reset, current_data
 
+
+def _trace_inner_cycles(
+    inner,
+    carry_after_reset,
+    current_data: Dict[str, torch.Tensor],
+    *,
+    outer_loop_index: int,
+) -> tuple[List[TraceRecord], torch.Tensor]:
     seq_info = {"cos_sin": inner.rotary_emb()}
     input_embeddings = inner._input_embeddings(current_data["inputs"], current_data["puzzle_identifiers"])
     hidden_states = carry_after_reset.current_hidden
 
     records: List[TraceRecord] = []
 
-    if inner.config.H_cycles > 1:
-        for warmup_h in range(inner.config.H_cycles - 1):
-            for cycle_idx in range(inner.config.L_cycles):
-                hidden_states = hidden_states + input_embeddings
-                for layer in inner.layers:
-                    hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                logits = inner.lm_head(hidden_states)[:, inner.puzzle_emb_len:]
-                preds = logits.argmax(dim=-1)
-                batch_acc, batch_exact = _compute_accuracy_stats(preds, current_data["labels"])
-                records.append(
-                    TraceRecord(
-                        label=f"H{warmup_h + 1}/L{cycle_idx + 1}",
-                        preds=preds.detach().cpu(),
-                        logits=logits.detach().cpu(),
-                        batch_accuracy=batch_acc,
-                        batch_exact_accuracy=batch_exact,
-                    )
-                )
-
-    final_h_index = inner.config.H_cycles
-    for cycle_idx in range(inner.config.L_cycles):
-        hidden_states = hidden_states + input_embeddings
-        for layer in inner.layers:
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+    def append_record(label: str, hidden_states: torch.Tensor) -> None:
         logits = inner.lm_head(hidden_states)[:, inner.puzzle_emb_len:]
         preds = logits.argmax(dim=-1)
         batch_acc, batch_exact = _compute_accuracy_stats(preds, current_data["labels"])
         records.append(
             TraceRecord(
-                label=f"H{final_h_index}/L{cycle_idx + 1}",
+                label=f"loop={outer_loop_index} / {label}",
                 preds=preds.detach().cpu(),
                 logits=logits.detach().cpu(),
                 batch_accuracy=batch_acc,
@@ -174,7 +152,66 @@ def trace_single_outer_loop(model, batch_gpu: Dict[str, torch.Tensor]) -> List[T
             )
         )
 
+    if inner.config.H_cycles > 1:
+        for warmup_h in range(inner.config.H_cycles - 1):
+            for cycle_idx in range(inner.config.L_cycles):
+                hidden_states = hidden_states + input_embeddings
+                for layer in inner.layers:
+                    hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                append_record(f"H{warmup_h + 1}/L{cycle_idx + 1}", hidden_states)
+
+    final_h_index = inner.config.H_cycles
+    for cycle_idx in range(inner.config.L_cycles):
+        hidden_states = hidden_states + input_embeddings
+        for layer in inner.layers:
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+        append_record(f"H{final_h_index}/L{cycle_idx + 1}", hidden_states)
+
+    return records, hidden_states
+
+
+@torch.inference_mode()
+def trace_outer_loops(
+    model,
+    batch_gpu: Dict[str, torch.Tensor],
+    max_outer_loops: Optional[int] = None,
+) -> List[TraceRecord]:
+    loss_head = model
+    urm = loss_head.model
+    inner = urm.inner
+
+    with torch.device(str(batch_gpu["inputs"].device)):
+        carry = loss_head.initial_carry(batch_gpu)
+
+    total_outer_loops = int(urm.config.loops)
+    if max_outer_loops is not None:
+        total_outer_loops = min(total_outer_loops, max_outer_loops)
+
+    records: List[TraceRecord] = []
+    for outer_loop_index in range(1, total_outer_loops + 1):
+        carry_after_reset, current_data = _prepare_outer_loop_inputs(inner, carry, batch_gpu)
+        loop_records, hidden_states = _trace_inner_cycles(
+            inner,
+            carry_after_reset,
+            current_data,
+            outer_loop_index=outer_loop_index,
+        )
+        records.extend(loop_records)
+
+        next_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps) + 1
+        carry = type(carry)(
+            current_hidden=hidden_states.detach(),
+            steps=next_steps,
+            halted=(next_steps >= urm.config.loops),
+            current_data=current_data,
+        )
+
     return records
+
+
+@torch.inference_mode()
+def trace_single_outer_loop(model, batch_gpu: Dict[str, torch.Tensor]) -> List[TraceRecord]:
+    return trace_outer_loops(model, batch_gpu, max_outer_loops=1)
 
 
 def token_grid_to_digits(tokens: torch.Tensor | np.ndarray) -> np.ndarray:
