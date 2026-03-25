@@ -1,5 +1,5 @@
 from typing import Tuple, List, Dict, Optional
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn.functional as F
@@ -11,8 +11,14 @@ from models.sparse_embedding import CastedSparseEmbedding
 from logger import global_logger
 
 @dataclass
+class URMInnerCarry:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+@dataclass
 class URMCarry:
-    current_hidden: torch.Tensor
+    inner_carry: URMInnerCarry
     steps: Optional[torch.Tensor] = None
     halted: Optional[torch.Tensor] = None
     current_data: Optional[Dict[str, torch.Tensor]] = None
@@ -118,7 +124,11 @@ class URM_Inner(nn.Module):
 
         self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
 
-        self.init_hidden = nn.Buffer(
+        self.H_init = nn.Buffer(
+            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
+            persistent=True,
+        )
+        self.L_init = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
@@ -128,6 +138,24 @@ class URM_Inner(nn.Module):
             self.q_head.bias.fill_(-5)
             
         self.generator = torch.Generator(device="cuda").manual_seed(self.config.noise_seed)
+
+    def reasoning_module(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
+
+    def _maybe_add_noise(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.config.noise_size <= 0:
+            return hidden_states
+        noise = torch.randn(
+            hidden_states.shape,
+            generator=self.generator,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            layout=hidden_states.layout
+        )
+        return hidden_states + noise * self.config.noise_size
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -143,9 +171,15 @@ class URM_Inner(nn.Module):
             )
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int) -> URMCarry:
-        return URMCarry(
-            current_hidden=torch.empty(
+    def empty_carry(self, batch_size: int) -> URMInnerCarry:
+        return URMInnerCarry(
+            z_H=torch.empty(
+                batch_size,
+                self.config.seq_len + self.puzzle_emb_len,
+                self.config.hidden_size,
+                dtype=self.forward_dtype,
+            ),
+            z_L=torch.empty(
                 batch_size,
                 self.config.seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
@@ -153,45 +187,44 @@ class URM_Inner(nn.Module):
             ),
         )
 
-    def reset_carry(self, reset_flag: torch.Tensor, carry: URMCarry) -> URMCarry:
-        new_hidden = torch.where(
+    def reset_carry(self, reset_flag: torch.Tensor, carry: URMInnerCarry) -> URMInnerCarry:
+        new_z_H = torch.where(
             reset_flag.view(-1, 1, 1),
-            self.init_hidden,
-            carry.current_hidden
+            self.H_init,
+            carry.z_H
         )
-        return replace(carry, current_hidden=new_hidden)
+        new_z_L = torch.where(
+            reset_flag.view(-1, 1, 1),
+            self.L_init,
+            carry.z_L
+        )
+        return URMInnerCarry(z_H=new_z_H, z_L=new_z_L)
 
     def forward(
         self,
-        carry: URMCarry,
+        carry: URMInnerCarry,
         batch: Dict[str, torch.Tensor]
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[URMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(cos_sin=self.rotary_emb())
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
-        hidden_states = carry.current_hidden
+        z_H = carry.z_H
+        z_L = carry.z_L
         if self.config.H_cycles > 1:
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                        if self.config.noise_size > 0:
-                            noise = torch.randn(
-                                hidden_states.shape,
-                                generator=self.generator,
-                                dtype=hidden_states.dtype,
-                                device=hidden_states.device,
-                                layout=hidden_states.layout
-                            )
-                            hidden_states = hidden_states + noise * self.config.noise_size
+                        z_L = self.reasoning_module(z_L, z_H + input_embeddings, **seq_info)
+                        z_L = self._maybe_add_noise(z_L)
+
+                    z_H = self.reasoning_module(z_H, z_L, **seq_info)
+                    z_H = self._maybe_add_noise(z_H)
 
         # Gradient norm logging for unrolled layers
         _log_grads = global_logger.is_log and self.training
         if _log_grads:
             _grad_norms = {}
-            _total_unrolled = self.config.L_cycles * len(self.layers)
+            _total_unrolled = (self.config.L_cycles + 1) * len(self.layers)
             def _make_grad_hook(idx, container, total):
                 def hook(grad):
                     container[idx] = grad.detach().norm().item()
@@ -202,25 +235,25 @@ class URM_Inner(nn.Module):
 
         _unrolled_idx = 0
         for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
+            z_L = z_L + z_H + input_embeddings
             for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                if self.config.noise_size > 0:
-                    noise = torch.randn(
-                        hidden_states.shape,
-                        generator=self.generator,
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                        layout=hidden_states.layout
-                    )
-                    hidden_states = hidden_states + noise * self.config.noise_size
+                z_L = layer(hidden_states=z_L, **seq_info)
+                z_L = self._maybe_add_noise(z_L)
                 if _log_grads:
-                    hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                    z_L.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
                     _unrolled_idx += 1
 
-        new_carry = replace(carry, current_hidden=hidden_states.detach())
-        output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
+        z_H = z_H + z_L
+        for layer in self.layers:
+            z_H = layer(hidden_states=z_H, **seq_info)
+            z_H = self._maybe_add_noise(z_H)
+            if _log_grads:
+                z_H.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                _unrolled_idx += 1
+
+        new_carry = URMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
@@ -238,7 +271,7 @@ class URM(nn.Module):
         batch_size = batch["inputs"].shape[0]
         base = self.inner.empty_carry(batch_size)
         return URMCarry(
-            current_hidden=base.current_hidden,
+            inner_carry=base,
             steps=torch.zeros((batch_size,), dtype=torch.int32),
             halted=torch.ones((batch_size,), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
@@ -255,7 +288,7 @@ class URM(nn.Module):
         compute_target_q=False
     ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
 
-        new_carry = self.inner.reset_carry(carry.halted, carry)
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         new_current_data = {
             k: torch.where(
@@ -266,11 +299,12 @@ class URM(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits) = self.inner(new_carry, new_current_data)
+        new_inner_carry2, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
         
-        hidden_diff_norm = self.norm_func(new_carry2.current_hidden.detach(), new_carry.current_hidden.detach())
-        sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
-        steps_count = torch.bincount(new_carry2.steps.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
+        hidden_diff_norm = self.norm_func(new_inner_carry2.z_H.detach(), new_inner_carry.z_H.detach())
+        step_bucket = (new_steps + 1).cpu()
+        sum_norm_with_steps = torch.bincount(step_bucket, weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
+        steps_count = torch.bincount(step_bucket, minlength=self.config.loops + 1) # (loops + 1,)
         mean_norm_with_steps = sum_norm_with_steps / steps_count.clamp_min(1)
         # print(mean_norm_with_steps)
         if global_logger.is_log:
@@ -309,7 +343,7 @@ class URM(nn.Module):
 
         return (
             URMCarry(
-                current_hidden=new_carry2.current_hidden,
+                inner_carry=new_inner_carry2,
                 steps=new_steps,
                 halted=halted,
                 current_data=new_current_data,
