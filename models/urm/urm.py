@@ -5,6 +5,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
+try:
+    from torchdiffeq import odeint, odeint_adjoint
+except ImportError:
+    odeint = None
+    odeint_adjoint = None
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, RotaryEmbedding2D, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
@@ -45,6 +50,8 @@ class URMConfig(BaseModel):
     noise_seed: int = 42
     norm_diff_max: float = 0.2
     norm_diff_min: float = 0.1
+    use_neural_ode: bool = False
+    neural_ode_use_adjoint: bool = True
 
 
 class URMBlock(nn.Module):
@@ -129,6 +136,75 @@ class URM_Inner(nn.Module):
             
         self.generator = torch.Generator(device="cuda").manual_seed(self.config.noise_seed)
 
+    def _add_noise(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.config.noise_size <= 0:
+            return hidden_states
+        noise = torch.randn(
+            hidden_states.shape,
+            generator=self.generator,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            layout=hidden_states.layout
+        )
+        return hidden_states + noise * self.config.noise_size
+
+    def _run_cycle(
+        self,
+        hidden_states: torch.Tensor,
+        input_embeddings: torch.Tensor,
+        seq_info: Dict[str, CosSin],
+        after_layer=None,
+        noise_per_layer: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + input_embeddings
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            if noise_per_layer:
+                hidden_states = self._add_noise(hidden_states)
+            if after_layer is not None:
+                after_layer(hidden_states)
+        if not noise_per_layer:
+            hidden_states = self._add_noise(hidden_states)
+        return hidden_states
+
+    def _run_neural_ode_cycles(
+        self,
+        hidden_states: torch.Tensor,
+        input_embeddings: torch.Tensor,
+        seq_info: Dict[str, CosSin],
+    ) -> torch.Tensor:
+        if self.config.noise_size > 0:
+            raise ValueError("use_neural_ode=True requires noise_size=0 because torchdiffeq expects deterministic dynamics.")
+        if odeint is None or odeint_adjoint is None:
+            raise ImportError("torchdiffeq is required when use_neural_ode=True.")
+
+        integration_times = torch.tensor(
+            [0.0, float(self.config.L_cycles)],
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+
+        def ode_func(_t, state):
+            model_state = state.to(hidden_states.dtype)
+            next_state = self._run_cycle(model_state, input_embeddings, seq_info)
+            return (next_state - model_state).to(state.dtype)
+
+        ode_kwargs = dict(method="euler", options={"step_size": 1.0})
+        if self.config.neural_ode_use_adjoint and self.training:
+            adjoint_params = tuple(self.layers.parameters())
+            if input_embeddings.requires_grad:
+                adjoint_params = adjoint_params + (input_embeddings,)
+            solution = odeint_adjoint(
+                ode_func,
+                hidden_states,
+                integration_times,
+                adjoint_params=adjoint_params,
+                **ode_kwargs,
+            )
+        else:
+            solution = odeint(ode_func, hidden_states, integration_times, **ode_kwargs)
+        return solution[-1].to(hidden_states.dtype)
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         embedding = self.embed_tokens(input.to(torch.int32))
 
@@ -174,21 +250,15 @@ class URM_Inner(nn.Module):
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-                        for layer in self.layers:
-                            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                        if self.config.noise_size > 0:
-                            noise = torch.randn(
-                                hidden_states.shape,
-                                generator=self.generator,
-                                dtype=hidden_states.dtype,
-                                device=hidden_states.device,
-                                layout=hidden_states.layout
-                            )
-                            hidden_states = hidden_states + noise * self.config.noise_size
+                        hidden_states = self._run_cycle(
+                            hidden_states,
+                            input_embeddings,
+                            seq_info,
+                            noise_per_layer=False,
+                        )
 
         # Gradient norm logging for unrolled layers
-        _log_grads = global_logger.is_log and self.training
+        _log_grads = global_logger.is_log and self.training and not self.config.use_neural_ode
         if _log_grads:
             _grad_norms = {}
             _total_unrolled = self.config.L_cycles * len(self.layers)
@@ -200,23 +270,24 @@ class URM_Inner(nn.Module):
                         global_logger.store("grad_norm_per_layer", norm_tensor)
                 return hook
 
-        _unrolled_idx = 0
-        for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
-            for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
-                if self.config.noise_size > 0:
-                    noise = torch.randn(
-                        hidden_states.shape,
-                        generator=self.generator,
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                        layout=hidden_states.layout
-                    )
-                    hidden_states = hidden_states + noise * self.config.noise_size
+        if self.config.use_neural_ode:
+            hidden_states = self._run_neural_ode_cycles(hidden_states, input_embeddings, seq_info)
+        else:
+            _unrolled_idx = 0
+
+            def _after_layer(hidden: torch.Tensor) -> None:
+                nonlocal _unrolled_idx
                 if _log_grads:
-                    hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                    hidden.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
                     _unrolled_idx += 1
+
+            for _ in range(self.config.L_cycles):
+                hidden_states = self._run_cycle(
+                    hidden_states,
+                    input_embeddings,
+                    seq_info,
+                    after_layer=_after_layer,
+                )
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
