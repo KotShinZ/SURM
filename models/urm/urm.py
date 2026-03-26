@@ -45,6 +45,7 @@ class URMConfig(BaseModel):
     loops: int
     L_cycles: int
     H_cycles: int
+    H_cycles_no_grad: Optional[int] = 0
     forward_dtype: str = "bfloat16"
     use_act: bool = True
     noise_size: float = 0.0
@@ -210,9 +211,13 @@ class URM_Inner(nn.Module):
 
         z_H = carry.z_H
         z_L = carry.z_L
-        if self.config.H_cycles > 1:
+        H_cycles_no_grad = self.config.H_cycles - 1 if self.config.H_cycles_no_grad is None else self.config.H_cycles_no_grad
+        H_cycles_no_grad = max(0, min(H_cycles_no_grad, self.config.H_cycles))
+        H_cycles_with_grad = self.config.H_cycles - H_cycles_no_grad
+
+        if self.config.H_cycles > H_cycles_no_grad and H_cycles_no_grad > 0:
             with torch.no_grad():
-                for _ in range(self.config.H_cycles - 1):
+                for _ in range(H_cycles_no_grad):
                     for _ in range(self.config.L_cycles):
                         z_L = self.reasoning_module(z_L, z_H + input_embeddings, **seq_info)
                         z_L = self._maybe_add_noise(z_L)
@@ -221,10 +226,10 @@ class URM_Inner(nn.Module):
                     z_H = self._maybe_add_noise(z_H)
 
         # Gradient norm logging for unrolled layers
-        _log_grads = global_logger.is_log and self.training
+        _log_grads = global_logger.is_log and self.training and H_cycles_with_grad > 0
         if _log_grads:
             _grad_norms = {}
-            _total_unrolled = (self.config.L_cycles + 1) * len(self.layers)
+            _total_unrolled = H_cycles_with_grad * (self.config.L_cycles + 1) * len(self.layers)
             def _make_grad_hook(idx, container, total):
                 def hook(grad):
                     container[idx] = grad.detach().norm().item()
@@ -234,22 +239,23 @@ class URM_Inner(nn.Module):
                 return hook
 
         _unrolled_idx = 0
-        for _ in range(self.config.L_cycles):
-            z_L = z_L + z_H + input_embeddings
-            for layer in self.layers:
-                z_L = layer(hidden_states=z_L, **seq_info)
-                z_L = self._maybe_add_noise(z_L)
-                if _log_grads:
-                    z_L.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
-                    _unrolled_idx += 1
+        for _ in range(H_cycles_with_grad):
+            for _ in range(self.config.L_cycles):
+                z_L = z_L + z_H + input_embeddings
+                for layer in self.layers:
+                    z_L = layer(hidden_states=z_L, **seq_info)
+                    z_L = self._maybe_add_noise(z_L)
+                    if _log_grads:
+                        z_L.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                        _unrolled_idx += 1
 
-        z_H = z_H + z_L
-        for layer in self.layers:
-            z_H = layer(hidden_states=z_H, **seq_info)
-            z_H = self._maybe_add_noise(z_H)
-            if _log_grads:
-                z_H.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
-                _unrolled_idx += 1
+            z_H = z_H + z_L
+            for layer in self.layers:
+                z_H = layer(hidden_states=z_H, **seq_info)
+                z_H = self._maybe_add_noise(z_H)
+                if _log_grads:
+                    z_H.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                    _unrolled_idx += 1
 
         new_carry = URMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
