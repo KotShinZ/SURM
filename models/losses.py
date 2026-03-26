@@ -107,6 +107,7 @@ import torch
 import torch.nn.functional as F
 import torch._dynamo as dynamo
 from torch import nn
+import math
 
 
 IGNORE_LABEL_ID = -100
@@ -163,10 +164,19 @@ class ACTLossHead(nn.Module):
         profile = outputs.get("profile")
         labels = new_carry.current_data["labels"]
 
+        B, SeqLen = labels.shape
+        H = W = int(math.sqrt(SeqLen)) # 9x9グリッドを想定
+        V = outputs["logits"].shape[-1] // 9 # 語彙数 (vocab_size)
+
+        # ロジットを [B, SeqLen, 9マス, V] に変形
+        logits_3x3 = outputs["logits"].view(B, SeqLen, 9, V) # (B, SeqLen, 9, V)
+        # 代表値として「自分自身のマス（3x3の中心＝インデックス4）」のロジットを使用
+        center_logits = logits_3x3[:, :, 4, :] # (B, SeqLen, V)
+
         # Correctness
         with torch.no_grad():
             # Preds
-            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+            outputs["preds"] = torch.argmax(center_logits, dim=-1)
 
             # Correctness
             mask = labels != IGNORE_LABEL_ID
@@ -190,11 +200,50 @@ class ACTLossHead(nn.Module):
             if use_act:
                 metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
 
-        # Losses
-        # FIXME: Assuming the batch is always full
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
+        # ==========================================
+        # 1. 3x3 周囲マスの予測ロス (LM Loss)
+        # ==========================================
+        labels_2d = labels.view(B, H, W).float()
+        # 画面外を IGNORE_LABEL_ID でパディングしてからUnfold
+        labels_pad = F.pad(labels_2d.unsqueeze(1), (1, 1, 1, 1), value=IGNORE_LABEL_ID)
+        labels_unfold = F.unfold(labels_pad, kernel_size=3).transpose(1, 2).long() # [B, SeqLen, 9]
+
+        lm_loss_patch = self.loss_fn(logits_3x3.reshape(-1, V), labels_unfold.reshape(-1), ignore_index=IGNORE_LABEL_ID)
+        lm_loss_patch = lm_loss_patch.view(B, SeqLen, 9)
+        # 9マス分のロスを足し合わせる
+        valid_patch_mask = (labels_unfold != IGNORE_LABEL_ID)
+        lm_loss_patch = torch.where(valid_patch_mask, lm_loss_patch, 0.0)
+        
+        # 9マスのうち、有効なマスの数（パディング以外）をカウント
+        valid_patch_counts = valid_patch_mask.sum(dim=-1).clamp_min(1) # [B, SeqLen]
+        
+        # 単純な sum ではなく、有効なマス数で割ってLossのスケールを元の実装に合わせる
+        lm_loss = ((lm_loss_patch.sum(dim=-1) / valid_patch_counts) / loss_divisor).sum()
         metrics["lm_loss"] = lm_loss.detach()
 
+        # ==========================================
+        # 2. 重複マスの予測一貫性ロス (Consistency Loss)
+        # ==========================================
+        # Fold を使って、同じマスに対する異なるセルからの予測を足し合わせる
+        logits_for_fold = logits_3x3.permute(0, 3, 2, 1).reshape(B, V * 9, SeqLen)
+        summed_logits = F.fold(logits_for_fold, output_size=(H, W), kernel_size=3, padding=1) # [B, V, H, W]
+        
+        # 重複回数をカウントして平均を取る
+        ones = torch.ones_like(logits_for_fold[:, :9, :])
+        counts = F.fold(ones, output_size=(H, W), kernel_size=3, padding=1)
+        mean_logits = summed_logits / counts # [B, V, H, W]
+        
+        # 再びUnfoldしてパッチの形に戻し、自身の予測と平均予測の誤差（MSE）を取る
+        mean_unfolded = F.unfold(mean_logits, kernel_size=3, padding=1)
+        mean_unfolded = mean_unfolded.view(B, V, 9, SeqLen).permute(0, 3, 2, 1) # [B, SeqLen, 9, V]
+        
+        valid_mask_9 = (labels_unfold != IGNORE_LABEL_ID).unsqueeze(-1).float()
+        consistency_loss = F.mse_loss(logits_3x3, mean_unfolded.detach(), reduction='none')
+        consistency_loss = (consistency_loss * valid_mask_9).sum() / valid_mask_9.sum().clamp_min(1)
+        metrics["consistency_loss"] = consistency_loss.detach()
+
+        # ==========================================
+        
         q_halt_loss = 0
         q_continue_loss = 0
         if use_act:
@@ -228,7 +277,10 @@ class ACTLossHead(nn.Module):
             if k in outputs:
                 returned_outputs[k] = outputs[k].detach()
 
-        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+        # consistency_loss の重み（係数）は必要に応じて調整してください
+        consistency_weight = 1.0
+        total_loss = lm_loss + (consistency_weight * consistency_loss) + 0.5 * (q_halt_loss + q_continue_loss)
+        
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
 

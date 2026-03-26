@@ -5,7 +5,7 @@ mkdir -p $checkpoint_path
 torchrun --nproc-per-node 1 pretrain.py \
 data_path=data/sudoku-extreme-1k-aug-1000 \
 arch=urm arch.loops=32 arch.H_cycles=1 arch.L_cycles=24 arch.num_layers=1 \
-arch.grid_height=0 arch.grid_width=0 \
+arch.grid_height=9 arch.grid_width=9 \
 evaluators="[]" \
 epochs=50000 \
 data_fraction=1 \
