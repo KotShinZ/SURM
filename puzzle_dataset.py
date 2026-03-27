@@ -92,7 +92,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # "full_sequence": all valid labels.
     # "all": Sudoku targets only. Use original 0-cells, or masked_input positions when masked_input is applied.
     target_mask_mode: str = "full_sequence"
-    target_mask_empty_token_id: int = 0
+    target_mask_empty_token_id: int = 1
 
     @pydantic.model_validator(mode="after")
     def _validate_target_mask_mode(self):

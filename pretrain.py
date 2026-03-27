@@ -147,7 +147,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Which tokens should contribute to loss/accuracy.
     target_mask_mode: str = "full_sequence"
-    target_mask_empty_token_id: int = 0
+    target_mask_empty_token_id: int = 1
 
 
 
