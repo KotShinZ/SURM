@@ -1,4 +1,4 @@
-# python evaluate_trained_model.py --checkpoint checkpoints/URM-sudoku-base --max_problems 4096 --loops 32 --batch_size 4096
+# python evaluate_trained_model.py --checkpoint checkpoints/URM-sudoku-base --max_problems 4096 --loops 32 --batch_size 4096 --hidden_diff_threshold 0.1
 
 import argparse
 import json
@@ -6,8 +6,10 @@ import math
 import os
 import re
 from collections import defaultdict
+from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
+import time
 
 import pydantic
 import torch
@@ -289,6 +291,116 @@ def _estimate_total_batches(dataloader: DataLoader) -> Optional[int]:
     )
 
 
+def _unwrap_eval_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "model", model)
+
+
+def _supports_hidden_pruning(model: nn.Module) -> bool:
+    base_model = _unwrap_eval_model(model)
+    inner = getattr(base_model, "inner", None)
+    return (
+        inner is not None
+        and hasattr(inner, "reset_carry")
+        and hasattr(inner, "lm_head")
+        and hasattr(inner, "q_head")
+        and hasattr(inner, "puzzle_emb_len")
+    )
+
+
+def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    return torch.norm(x1 - x2, dim=(1, 2)) / (1e-7 + torch.norm(x1 + x2, dim=(1, 2)) / 2)
+
+
+def _index_structure(obj: Any, indices: torch.Tensor) -> Any:
+    if obj is None:
+        return None
+    if torch.is_tensor(obj):
+        return obj.index_select(0, indices)
+    if isinstance(obj, dict):
+        return {key: _index_structure(value, indices) for key, value in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_index_structure(value, indices) for value in obj)
+    if isinstance(obj, list):
+        return [_index_structure(value, indices) for value in obj]
+    if is_dataclass(obj):
+        return type(obj)(**{field.name: _index_structure(getattr(obj, field.name), indices) for field in fields(obj)})
+    return obj
+
+
+def _run_heads_from_hidden(
+    model: nn.Module,
+    hidden_states: torch.Tensor,
+    return_keys: Set[str],
+) -> Dict[str, torch.Tensor]:
+    base_model = _unwrap_eval_model(model)
+    inner = getattr(base_model, "inner", None)
+    if inner is None:
+        raise ValueError("This model does not expose an inner module for hidden-state pruning.")
+
+    logits = inner.lm_head(hidden_states)[:, inner.puzzle_emb_len :]
+    outputs: Dict[str, torch.Tensor] = {
+        "logits": logits,
+        "preds": torch.argmax(logits, dim=-1),
+    }
+
+    if "q_halt_logits" in return_keys or "q_continue_logits" in return_keys:
+        q_logits = inner.q_head(hidden_states[:, 0]).to(torch.float32)
+        if "q_halt_logits" in return_keys:
+            outputs["q_halt_logits"] = q_logits[..., 0]
+        if "q_continue_logits" in return_keys:
+            outputs["q_continue_logits"] = q_logits[..., 1]
+
+    return outputs
+
+
+def _allocate_prediction_buffers(
+    template_outputs: Dict[str, torch.Tensor],
+    batch_size: int,
+) -> Dict[str, torch.Tensor]:
+    return {
+        key: torch.empty((batch_size, *value.shape[1:]), dtype=value.dtype, device=value.device)
+        for key, value in template_outputs.items()
+    }
+
+
+def _merge_pruned_predictions(
+    model: nn.Module,
+    batch_size: int,
+    return_keys: Set[str],
+    active_indices: torch.Tensor,
+    active_preds: Optional[Dict[str, torch.Tensor]],
+    active_steps: Optional[torch.Tensor],
+    pruned_chunks: List[Dict[str, torch.Tensor]],
+) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    merged_preds: Optional[Dict[str, torch.Tensor]] = None
+    merged_steps: Optional[torch.Tensor] = None
+
+    if active_preds is not None and active_steps is not None and active_indices.numel() > 0:
+        merged_preds = _allocate_prediction_buffers(active_preds, batch_size)
+        merged_steps = torch.empty((batch_size,), dtype=active_steps.dtype, device=active_steps.device)
+        for key, value in active_preds.items():
+            merged_preds[key][active_indices] = value
+        merged_steps[active_indices] = active_steps
+
+    for chunk in pruned_chunks:
+        chunk_preds = _run_heads_from_hidden(model, chunk["hidden"], return_keys=return_keys)
+        chunk_indices = chunk["indices"]
+        chunk_steps = chunk["steps"]
+
+        if merged_preds is None:
+            merged_preds = _allocate_prediction_buffers(chunk_preds, batch_size)
+            merged_steps = torch.empty((batch_size,), dtype=chunk_steps.dtype, device=chunk_steps.device)
+
+        for key, value in chunk_preds.items():
+            merged_preds[key][chunk_indices] = value
+        merged_steps[chunk_indices] = chunk_steps
+
+    if merged_preds is None or merged_steps is None:
+        raise RuntimeError("Failed to collect predictions for the evaluated batch.")
+
+    return merged_preds, merged_steps
+
+
 def _compute_batch_metric_sums(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
@@ -345,6 +457,7 @@ def evaluate_model(
     max_problems: Optional[int],
     max_batches: Optional[int],
     save_predictions: bool,
+    hidden_diff_threshold: Optional[float],
 ) -> tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, torch.Tensor]], int, int]:
     model.eval()
 
@@ -363,6 +476,14 @@ def evaluate_model(
     if progress_total is not None and max_problems is not None:
         progress_total = min(progress_total, math.ceil(max_problems / dataloader.dataset.config.global_batch_size))  # type: ignore[attr-defined]
 
+    hidden_pruning_enabled = (
+        hidden_diff_threshold is not None
+        and hidden_diff_threshold > 0
+        and _supports_hidden_pruning(model)
+    )
+    if hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
+        print("Hidden-state pruning is not supported by this model; running standard evaluation.")
+
     with torch.inference_mode():
         for batch_index, (set_name, batch, _global_batch_size) in enumerate(
             tqdm(dataloader, desc="Evaluating", total=progress_total)
@@ -374,17 +495,69 @@ def evaluate_model(
 
             processed_batches += 1
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            batch_size = batch["inputs"].shape[0]
             with torch.device(str(device)):
                 carry = model.initial_carry(batch)  # type: ignore[misc]
 
+            active_batch = batch
+            active_indices = torch.arange(batch_size, device=device)
+            pruned_chunks: List[Dict[str, torch.Tensor]] = []
+            preds: Optional[Dict[str, torch.Tensor]] = None
+
             while True:
+                carry_before_step = None
+                if hidden_pruning_enabled and active_indices.numel() > 0 and hasattr(carry, "current_hidden"):
+                    carry_before_step = carry #_unwrap_eval_model(model).inner.reset_carry(carry.halted, carry)
+
                 carry, _loss, _metrics, preds, all_finish = model(
                     carry=carry,
-                    batch=batch,
+                    batch=active_batch,
                     return_keys=return_keys,
                 )
+
+                if hidden_pruning_enabled and carry_before_step is not None and not all_finish:
+                    hidden_diff_norm = _hidden_diff_norm(
+                        carry.current_hidden.detach(),
+                        carry_before_step.current_hidden.detach(),
+                    )
+                    pruned_mask = hidden_diff_norm <= hidden_diff_threshold
+                    if torch.any(pruned_mask):
+                        pruned_indices = torch.nonzero(pruned_mask, as_tuple=False).squeeze(-1)
+                        pruned_chunks.append(
+                            {
+                                "indices": active_indices[pruned_indices].detach().clone(),
+                                "hidden": carry.current_hidden[pruned_mask].detach(),
+                                "steps": carry.steps[pruned_mask].detach(),
+                            }
+                        )
+
+                        keep_indices = torch.nonzero(~pruned_mask, as_tuple=False).squeeze(-1)
+                        if keep_indices.numel() == 0:
+                            active_indices = active_indices[:0]
+                            preds = None
+                            break
+
+                        active_indices = active_indices[keep_indices]
+                        active_batch = {key: value.index_select(0, keep_indices) for key, value in active_batch.items()}
+                        carry = _index_structure(carry, keep_indices)
+
                 if all_finish:
                     break
+
+            if hidden_pruning_enabled and pruned_chunks:
+                preds, final_steps = _merge_pruned_predictions(
+                    model=model,
+                    batch_size=batch_size,
+                    return_keys=return_keys,
+                    active_indices=active_indices,
+                    active_preds=preds,
+                    active_steps=carry.steps if preds is not None else None,
+                    pruned_chunks=pruned_chunks,
+                )
+            else:
+                if preds is None:
+                    raise RuntimeError("Model evaluation did not produce predictions for the batch.")
+                final_steps = carry.steps
 
             valid_example_mask = _valid_example_mask(batch["labels"])
             keep_mask = valid_example_mask.clone()
@@ -401,7 +574,7 @@ def evaluate_model(
                 model=model,
                 batch=batch,
                 preds=preds,
-                final_steps=carry.steps,
+                final_steps=final_steps,
                 keep_mask=keep_mask,
             )
             processed_problems += int(batch_metric_sums["count"])
@@ -440,7 +613,13 @@ def _default_output_path(
     loops: Optional[int],
     h_cycles: Optional[int],
     l_cycles: Optional[int],
+    hidden_diff_threshold: Optional[float],
 ) -> Path:
+    threshold_suffix = ""
+    if hidden_diff_threshold is not None and hidden_diff_threshold > 0:
+        threshold_value = f"{hidden_diff_threshold:g}".replace("-", "m").replace(".", "_")
+        threshold_suffix = f"_hidden_diff_threshold_{threshold_value}"
+
     resolved_path = _resolve_checkpoint_path(checkpoint_path)
     if resolved_path is None:
         stem = f"evaluation_results_{split}"
@@ -454,6 +633,7 @@ def _default_output_path(
             stem += f"_H_cycles_{h_cycles}"
         if l_cycles is not None:
             stem += f"_L_cycles_{l_cycles}"
+        stem += threshold_suffix
         return Path(f"{stem}.pt")
     checkpoint_file = Path(resolved_path)
     stem = f"{checkpoint_file.stem}_evaluation_{split}"
@@ -467,6 +647,7 @@ def _default_output_path(
         stem += f"_H_cycles_{h_cycles}"
     if l_cycles is not None:
         stem += f"_L_cycles_{l_cycles}"
+    stem += threshold_suffix
     return checkpoint_file.parent / f"{stem}.pt"
 
 
@@ -514,6 +695,12 @@ def main() -> None:
         help="Also save inputs, labels, preds, logits, and halt logits to the output file.",
     )
     parser.add_argument(
+        "--hidden_diff_threshold",
+        type=float,
+        default=None,
+        help="Prune examples from the carry during evaluation when the relative hidden-state change is at or below this threshold.",
+    )
+    parser.add_argument(
         "--no_strict_load",
         action="store_true",
         help="Allow missing or unexpected keys when loading the checkpoint.",
@@ -555,6 +742,8 @@ def main() -> None:
         print(f"Overriding H_cycles to: {args.H_cycles}")
     if args.L_cycles is not None:
         print(f"Overriding L_cycles to: {args.L_cycles}")
+    if args.hidden_diff_threshold is not None and args.hidden_diff_threshold > 0:
+        print(f"Using hidden diff pruning threshold: {args.hidden_diff_threshold}")
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
@@ -569,7 +758,7 @@ def main() -> None:
         device=device,
         strict=not args.no_strict_load,
     )
-
+    start_time = time.time()
     metrics_by_set, saved_outputs, processed_batches, processed_problems = evaluate_model(
         model=model,
         dataloader=dataloader,
@@ -577,9 +766,13 @@ def main() -> None:
         max_problems=args.max_problems,
         max_batches=args.max_batches,
         save_predictions=args.save_predictions,
+        hidden_diff_threshold=args.hidden_diff_threshold,
     )
+    end_time = time.time()
+    elapsed_time = end_time - start_time
 
     print("")
+    print(f"Evaluation completed in {elapsed_time:.2f} seconds.")
     print(f"Processed batches: {processed_batches}")
     print(f"Processed problems: {processed_problems}")
     if step is not None:
@@ -600,6 +793,7 @@ def main() -> None:
             args.loops,
             args.H_cycles,
             args.L_cycles,
+            args.hidden_diff_threshold,
         )
     )
     payload = {
@@ -611,6 +805,7 @@ def main() -> None:
         "loops": (config.arch.__pydantic_extra__ or {}).get("loops"),
         "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
         "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
+        "hidden_diff_threshold": args.hidden_diff_threshold,
         "max_batches": args.max_batches,
         "max_problems": args.max_problems,
         "processed_batches": processed_batches,
