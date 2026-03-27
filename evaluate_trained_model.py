@@ -18,7 +18,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.losses import IGNORE_LABEL_ID
+from models.losses import IGNORE_LABEL_ID, get_target_mask
 from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
 
@@ -74,6 +74,8 @@ class PretrainConfig(pydantic.BaseModel):
     use_muon: bool = False
     data_fraction: float = 1.0
     masked_input: Optional[MaskedInputConfig] = None
+    target_mask_mode: str = "full_sequence"
+    target_mask_empty_token_id: int = 0
 
 
 def _resolve_checkpoint_path(path: str) -> Optional[str]:
@@ -142,6 +144,8 @@ def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size
             rank=0,
             num_replicas=1,
             masked_input=config.masked_input,
+            target_mask_mode=config.target_mask_mode,
+            target_mask_empty_token_id=config.target_mask_empty_token_id,
         ),
         split=split,
     )
@@ -301,7 +305,8 @@ def _compute_batch_metric_sums(
     selected_preds = preds["preds"][keep_mask]
     selected_steps = final_steps[keep_mask]
 
-    token_mask = selected_labels != IGNORE_LABEL_ID
+    selected_batch = {key: value[keep_mask] for key, value in batch.items()}
+    token_mask = get_target_mask(selected_batch, selected_labels)
     token_counts = token_mask.sum(dim=1)
     valid_examples = token_counts > 0
     if not torch.any(valid_examples):
@@ -327,7 +332,7 @@ def _compute_batch_metric_sums(
             ignore_index=IGNORE_LABEL_ID,
             reduction="none",
         ).view(selected_labels.shape)
-    seq_lm_loss = token_loss.sum(dim=1) / token_counts.clamp_min(1)
+    seq_lm_loss = (token_loss * token_mask).sum(dim=1) / token_counts.clamp_min(1)
 
     return {
         "count": float(valid_examples.sum().item()),
@@ -410,7 +415,7 @@ def evaluate_model(
 
             if save_predictions:
                 for key, value in batch.items():
-                    if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs"}:
+                    if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs", "target_mask"}:
                         saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())
                 for key, value in preds.items():
                     saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())

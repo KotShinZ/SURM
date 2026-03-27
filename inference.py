@@ -64,6 +64,8 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999
     use_muon: bool = False
     masked_input: Optional[MaskedInputConfig] = None
+    target_mask_mode: str = "full_sequence"
+    target_mask_empty_token_id: int = 0
 
 # --- Helper Functions ---
 
@@ -191,6 +193,9 @@ def inference(model, dataloader, output_keys: List[str], device="cuda"):
             if "labels" in batch:
                 if "labels" not in targets: targets["labels"] = []
                 targets["labels"].append(batch["labels"])
+            if "target_mask" in batch:
+                if "target_mask" not in targets: targets["target_mask"] = []
+                targets["target_mask"].append(batch["target_mask"])
             
             # Safety break for quick testing
             if i >= 10 and len(dataloader) > 10:
@@ -202,7 +207,11 @@ def inference(model, dataloader, output_keys: List[str], device="cuda"):
     
     return final_results, final_targets
 
-def calculate_accuracy(predictions: torch.Tensor, targets: torch.Tensor):
+def calculate_accuracy(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    target_mask: Optional[torch.Tensor] = None,
+):
     print("\n--- Accuracy Calculation ---")
     
     # logits (3次元: [Batch, SeqLen, Vocab]) の場合は argmax をとる
@@ -215,11 +224,29 @@ def calculate_accuracy(predictions: torch.Tensor, targets: torch.Tensor):
         min_len = min(predictions.shape[1], targets.shape[1])
         predictions = predictions[:, :min_len]
         targets = targets[:, :min_len]
+        if target_mask is not None:
+            target_mask = target_mask[:, :min_len]
+
+    if target_mask is None:
+        target_mask = torch.ones_like(targets, dtype=torch.bool)
+    else:
+        target_mask = target_mask.to(torch.bool)
 
     # 正誤判定
-    correct_matrix = (predictions == targets)
-    avg_acc = correct_matrix.float().mean().item()
-    exact_acc = correct_matrix.all(dim=1).float().mean().item()
+    correct_matrix = target_mask & (predictions == targets)
+    token_counts = target_mask.sum(dim=1)
+    valid_examples = token_counts > 0
+    if not torch.any(valid_examples):
+        print("No supervised tokens found in targets.")
+        print("----------------------------\n")
+        return 0.0, 0.0
+
+    avg_acc = (
+        correct_matrix[valid_examples].float().sum(dim=1) / token_counts[valid_examples].clamp_min(1)
+    ).mean().item()
+    exact_acc = (
+        correct_matrix[valid_examples].sum(dim=1) == token_counts[valid_examples]
+    ).float().mean().item()
 
     print(f"Element-wise Accuracy (Average): {avg_acc * 100:.2f}%")
     print(f"Exact Match Accuracy (All Correct): {exact_acc * 100:.2f}%")
@@ -246,6 +273,8 @@ def main():
         seed=config.seed, dataset_path=config.data_path, rank=0, num_replicas=1,
         global_batch_size=config.global_batch_size, test_set_mode=True, epochs_per_iter=1,
         masked_input=config.masked_input,
+        target_mask_mode=config.target_mask_mode,
+        target_mask_empty_token_id=config.target_mask_empty_token_id,
     )
     dataset = PuzzleDataset(ds_config, split=args.split)
     metadata = dataset.metadata
@@ -306,7 +335,7 @@ def main():
         print(f"[!] Neither 'outputs' nor 'logits' found in results. Available keys: {list(results.keys())}")
 
     if predictions_tensor is not None and has_labels:
-        calculate_accuracy(predictions_tensor, targets["labels"])
+        calculate_accuracy(predictions_tensor, targets["labels"], targets.get("target_mask"))
     else:
         print("\n[!] Cannot calculate accuracy.")
         if not has_labels:

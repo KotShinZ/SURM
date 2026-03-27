@@ -27,7 +27,7 @@ from models.layers import (
     apply_rotary_pos_emb,
 )
 from models.sparse_embedding import CastedSparseEmbedding
-from models.losses import IGNORE_LABEL_ID, stablemax_cross_entropy, softmax_cross_entropy
+from models.losses import IGNORE_LABEL_ID, get_target_mask, stablemax_cross_entropy, softmax_cross_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -453,13 +453,13 @@ class EBTLossHead(nn.Module):
         labels = new_carry.current_data["labels"]
 
         # --- mask & divisor (no grad needed) ---
-        mask = labels != IGNORE_LABEL_ID
+        mask = get_target_mask(new_carry.current_data, labels)
         loss_counts = mask.sum(-1)
         loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
 
         # --- reconstruction loss (gradient required) ---
         lm_loss = (
-            self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor
+            self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) * mask / loss_divisor
         ).sum()
 
         # --- metrics (no grad) ---

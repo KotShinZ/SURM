@@ -69,3 +69,9 @@ masked_input:
   mask_token_id: 1
   # Keep the original dataset input in batch["source_inputs"] for evaluators/debugging.
   preserve_source_inputs: true
+
+# Which tokens contribute to loss/accuracy.
+# full_sequence: all valid labels (ARC default).
+# all: Sudoku-only target cells. Uses original 0-cells, or masked_input positions when masked_input is applied.
+target_mask_mode: full_sequence
+target_mask_empty_token_id: 0

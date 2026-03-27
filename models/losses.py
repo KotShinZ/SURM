@@ -101,7 +101,7 @@
 
 #         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 
-from typing import Any, Tuple, Dict, Set, Optional
+from typing import Any, Tuple, Dict, Set, Optional, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -141,6 +141,14 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
+def get_target_mask(current_data: Mapping[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    target_mask = current_data.get("target_mask")
+    valid_mask = labels != IGNORE_LABEL_ID
+    if target_mask is None:
+        return valid_mask
+    return target_mask.to(torch.bool) & valid_mask
+
+
 class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
@@ -169,7 +177,7 @@ class ACTLossHead(nn.Module):
             outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
             # Correctness
-            mask = labels != IGNORE_LABEL_ID
+            mask = get_target_mask(new_carry.current_data, labels)
             loss_counts = mask.sum(-1)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
@@ -192,7 +200,7 @@ class ACTLossHead(nn.Module):
 
         # Losses
         # FIXME: Assuming the batch is always full
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) * mask / loss_divisor).sum()
         metrics["lm_loss"] = lm_loss.detach()
 
         q_halt_loss = 0

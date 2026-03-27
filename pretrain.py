@@ -145,6 +145,10 @@ class PretrainConfig(pydantic.BaseModel):
     # Replace model inputs with a randomly masked version of the labels.
     masked_input: Optional[MaskedInputConfig] = None
 
+    # Which tokens should contribute to loss/accuracy.
+    target_mask_mode: str = "full_sequence"
+    target_mask_empty_token_id: int = 0
+
 
 
 @dataclass
@@ -167,7 +171,12 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            data_fraction=data_fraction, online_aug=online_aug, masked_input=config.masked_input, **kwargs
+            data_fraction=data_fraction,
+            online_aug=online_aug,
+            masked_input=config.masked_input,
+            target_mask_mode=config.target_mask_mode,
+            target_mask_empty_token_id=config.target_mask_empty_token_id,
+            **kwargs,
         ),
         split=split,
     )

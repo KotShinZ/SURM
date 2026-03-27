@@ -88,6 +88,21 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # Replace model inputs with randomly masked labels.
     masked_input: Optional[MaskedInputConfig] = None
 
+    # Which tokens should contribute to loss/accuracy.
+    # "full_sequence": all valid labels.
+    # "all": Sudoku targets only. Use original 0-cells, or masked_input positions when masked_input is applied.
+    target_mask_mode: str = "full_sequence"
+    target_mask_empty_token_id: int = 0
+
+    @pydantic.model_validator(mode="after")
+    def _validate_target_mask_mode(self):
+        if self.target_mask_mode not in {"full_sequence", "all"}:
+            raise ValueError(
+                "target_mask_mode must be one of {'full_sequence', 'all'}, "
+                f"got {self.target_mask_mode!r}"
+            )
+        return self
+
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -138,12 +153,14 @@ class PuzzleDataset(IterableDataset):
         self,
         source_inputs: np.ndarray,
         labels: np.ndarray,
+        target_mask: np.ndarray,
         rng: np.random.Generator,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         cfg = self.config.masked_input
         assert cfg is not None
 
         masked_inputs = source_inputs.astype(np.int32, copy=True)
+        updated_target_mask = target_mask.astype(bool, copy=True)
         valid_mask = labels != IGNORE_LABEL_ID
 
         for row_idx in range(masked_inputs.shape[0]):
@@ -174,7 +191,18 @@ class PuzzleDataset(IterableDataset):
             masked_positions = rng.choice(valid_positions, size=mask_count, replace=False)
             masked_inputs[row_idx, masked_positions] = cfg.mask_token_id
 
-        return masked_inputs
+            if self.config.target_mask_mode == "all":
+                updated_target_mask[row_idx] = False
+                updated_target_mask[row_idx, masked_positions] = True
+
+        return masked_inputs, updated_target_mask
+
+    def _build_target_mask(self, inputs: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        valid_mask = labels != IGNORE_LABEL_ID
+        if self.config.target_mask_mode == "full_sequence":
+            return valid_mask
+
+        return valid_mask & (inputs == self.config.target_mask_empty_token_id)
 
     def _collate_batch(self, batch, rng: np.random.Generator, make_masked_inputs: bool = True):
         # Convert dtype
@@ -184,11 +212,18 @@ class PuzzleDataset(IterableDataset):
         if self.metadata.ignore_label_id is not None:
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
+        batch["target_mask"] = self._build_target_mask(batch["inputs"], batch["labels"]).astype(np.bool_, copy=False)
+
         masked_input_cfg = self.config.masked_input
         if masked_input_cfg is not None and masked_input_cfg.enabled and make_masked_inputs:
             if masked_input_cfg.preserve_source_inputs:
                 batch["source_inputs"] = batch["inputs"].copy()
-            batch["inputs"] = self._make_masked_inputs(batch["inputs"], batch["labels"], rng)
+            batch["inputs"], batch["target_mask"] = self._make_masked_inputs(
+                batch["inputs"],
+                batch["labels"],
+                batch["target_mask"],
+                rng,
+            )
 
         # Pad
         if batch["puzzle_identifiers"].size < self.local_batch_size:
@@ -197,7 +232,8 @@ class PuzzleDataset(IterableDataset):
             pad_values = {
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
-                "puzzle_identifiers": self.metadata.blank_identifier_id
+                "puzzle_identifiers": self.metadata.blank_identifier_id,
+                "target_mask": False,
             }
             if "source_inputs" in batch:
                 pad_values["source_inputs"] = self.metadata.pad_id
