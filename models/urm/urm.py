@@ -33,6 +33,10 @@ class URMConfig(BaseModel):
     grid_width: int = 0   # Grid width  for 2D RoPE (0 = use 1D RoPE)
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
+    attention_type: str = "full"
+    attention_window_size: int = -1
+    attention_window_size_2d: int = 1
+    attention_topk: int = 0
     topk_sparsity: float = 0.0
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -50,6 +54,7 @@ class URMConfig(BaseModel):
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
+        puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
         self.self_attn = Attention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
@@ -57,6 +62,13 @@ class URMBlock(nn.Module):
             num_key_value_heads=config.num_heads,
             causal=False,
             attn_dropout=config.attn_dropout,
+            attention_type=config.attention_type,
+            attention_window_size=config.attention_window_size,
+            attention_window_size_2d=config.attention_window_size_2d,
+            attention_topk=config.attention_topk,
+            grid_height=config.grid_height,
+            grid_width=config.grid_width,
+            prefix_seq_len=puzzle_prefix_len,
             topk_sparsity=config.topk_sparsity,
         )
         self.mlp = ConvSwiGLU(

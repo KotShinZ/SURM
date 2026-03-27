@@ -1,11 +1,8 @@
-from typing import Tuple, Optional
-from contextlib import nullcontext
+from typing import Callable, Tuple, Optional
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn.functional import scaled_dot_product_attention
-import einops
 import math
 
 try:
@@ -13,10 +10,16 @@ try:
 except ImportError:
     from flash_attn import flash_attn_func
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+except ImportError:
+    flex_attention = None
+
 from models.common import trunc_normal_init_
 
 
 CosSin = Tuple[torch.Tensor, ...]
+ScoreMod = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def _find_multiple(a, b):
@@ -172,7 +175,23 @@ class RotaryEmbedding2D(nn.Module):
         return self.cos_row, self.sin_row, self.cos_col, self.sin_col
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0, topk_sparsity=0.0):
+    def __init__(
+        self,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_key_value_heads,
+        causal=False,
+        attn_dropout=0.0,
+        topk_sparsity=0.0,
+        attention_type: str = "full",
+        attention_window_size: int = -1,
+        attention_window_size_2d: int = 1,
+        attention_topk: int = 0,
+        grid_height: int = 0,
+        grid_width: int = 0,
+        prefix_seq_len: int = 0,
+    ):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -182,66 +201,124 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
         self.attn_dropout = attn_dropout
-        self.topk_sparsity = topk_sparsity  # fraction of scores to drop (e.g. 0.8 = keep top 20%)
+        self.topk_sparsity = topk_sparsity
+        self.attention_type = attention_type.lower()
+        self.attention_window_size = attention_window_size
+        self.attention_window_size_2d = attention_window_size_2d
+        self.attention_topk = attention_topk
+        self.grid_height = grid_height
+        self.grid_width = grid_width
+        self.prefix_seq_len = prefix_seq_len
+
+        if self.attention_type not in {"full", "swa", "swa2d", "lsa", "topk"}:
+            raise ValueError(f"Unsupported attention_type: {attention_type}")
+        if self.attention_type in {"swa2d", "lsa", "topk"} and flex_attention is None:
+            raise ImportError(
+                f"attention_type='{attention_type}' requires torch.nn.attention.flex_attention"
+            )
 
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def _topk_attention(self, query, key, value, dropout_p):
-        """Manual attention with percentile-based top-k sparsity masking.
+    def _masked_score(self, score: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+        return torch.where(keep, score, torch.full_like(score, float("-inf")))
 
-        Keeps only the top (1 - topk_sparsity) fraction of attention scores per
-        query position and replaces the rest with -inf before softmax.
-        """
-        # query: [bs, seq_len, num_heads, head_dim]
-        # Transpose to [bs, num_heads, seq_len, head_dim]
+    def _flex_attention_output(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        score_mod: ScoreMod,
+    ) -> torch.Tensor:
+        assert flex_attention is not None
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        attn_output = flex_attention(
+            q,
+            k,
+            v,
+            score_mod=score_mod,
+            enable_gqa=self.num_key_value_heads != self.num_heads,
+        )
+        return attn_output.transpose(1, 2).contiguous()
+
+    def _lsa_score_mod(self) -> ScoreMod:
+        def score_mod(score, batch, head, q_idx, kv_idx):
+            return self._masked_score(score, q_idx != kv_idx)
+        return score_mod
+
+    def _swa2d_score_mod(self) -> ScoreMod:
+        if self.grid_height <= 0 or self.grid_width <= 0:
+            raise ValueError("attention_type='SWA2D' requires grid_height > 0 and grid_width > 0")
+
+        prefix_len = self.prefix_seq_len
+        grid_area = self.grid_height * self.grid_width
+        window = self.attention_window_size_2d
+
+        def score_mod(score, batch, head, q_idx, kv_idx):
+            q_is_prefix = q_idx < prefix_len
+            kv_is_prefix = kv_idx < prefix_len
+            q_is_grid = (q_idx >= prefix_len) & (q_idx < prefix_len + grid_area)
+            kv_is_grid = (kv_idx >= prefix_len) & (kv_idx < prefix_len + grid_area)
+
+            q_grid_idx = q_idx - prefix_len
+            kv_grid_idx = kv_idx - prefix_len
+
+            q_row = torch.div(q_grid_idx, self.grid_width, rounding_mode="floor")
+            q_col = torch.remainder(q_grid_idx, self.grid_width)
+            kv_row = torch.div(kv_grid_idx, self.grid_width, rounding_mode="floor")
+            kv_col = torch.remainder(kv_grid_idx, self.grid_width)
+
+            local_grid = (
+                q_is_grid
+                & kv_is_grid
+                & (torch.abs(q_row - kv_row) <= window)
+                & (torch.abs(q_col - kv_col) <= window)
+            )
+            overflow = (~q_is_grid & ~q_is_prefix) | (~kv_is_grid & ~kv_is_prefix)
+            keep = q_is_prefix | kv_is_prefix | local_grid | overflow
+            return self._masked_score(score, keep)
+
+        return score_mod
+
+    def _topk_keep_mask(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
         q = query.transpose(1, 2)
         k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-
-        # GQA: expand key/value heads to match query heads
         if self.num_key_value_heads != self.num_heads:
             repeat_factor = self.num_heads // self.num_key_value_heads
             k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        # [bs, num_heads, seq_len_q, seq_len_k]
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        scores = torch.matmul(
+            q.to(torch.float32),
+            k.transpose(-2, -1).to(torch.float32),
+        ) * (1.0 / math.sqrt(self.head_dim))
 
-        # Causal mask
         if self.causal:
-            seq_len_q, seq_len_k = attn_scores.shape[-2], attn_scores.shape[-1]
+            seq_len_q, seq_len_k = scores.shape[-2], scores.shape[-1]
             causal_mask = torch.triu(
-                torch.ones(seq_len_q, seq_len_k, device=attn_scores.device, dtype=torch.bool),
+                torch.ones(seq_len_q, seq_len_k, device=scores.device, dtype=torch.bool),
                 diagonal=1,
             )
-            attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+            scores = scores.masked_fill(causal_mask, float("-inf"))
 
-        # Top-k sparsity: compute per-query threshold via quantile
-        # Number of keys to keep per query
-        seq_len_k = attn_scores.shape[-1]
-        k_keep = max(1, int(seq_len_k * (1.0 - self.topk_sparsity)))
+        seq_len_k = scores.shape[-1]
+        if self.attention_topk > 0:
+            k_keep = min(self.attention_topk, seq_len_k)
+        elif self.topk_sparsity > 0.0:
+            k_keep = max(1, int(seq_len_k * (1.0 - self.topk_sparsity)))
+        else:
+            raise ValueError("attention_type='topK' requires attention_topk > 0 or topk_sparsity > 0")
 
-        # kthvalue needs the k-th smallest, so we want the (seq_len_k - k_keep + 1)-th smallest
-        # Equivalent: find the top k_keep values and mask the rest
-        # Use topk for efficiency
-        topk_vals, _ = attn_scores.topk(k_keep, dim=-1)  # [bs, num_heads, seq_len_q, k_keep]
-        # Threshold is the minimum of the top-k values (i.e., the k-th largest)
-        threshold = topk_vals[..., -1:]  # [bs, num_heads, seq_len_q, 1]
-        # Mask scores below threshold
-        sparse_mask = attn_scores < threshold
-        attn_scores = attn_scores.masked_fill(sparse_mask, float('-inf'))
+        topk_indices = scores.topk(k_keep, dim=-1).indices
+        keep_mask = torch.zeros_like(scores, dtype=torch.bool)
+        keep_mask.scatter_(-1, topk_indices, True)
+        return keep_mask
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        if dropout_p > 0.0:
-            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
-
-        # [bs, num_heads, seq_len_q, head_dim]
-        attn_output = torch.matmul(attn_weights, v)
-        # Back to [bs, seq_len, num_heads, head_dim]
-        return attn_output.transpose(1, 2).contiguous()
+    def _topk_score_mod(self, keep_mask: torch.Tensor) -> ScoreMod:
+        def score_mod(score, batch, head, q_idx, kv_idx):
+            return self._masked_score(score, keep_mask[batch, head, q_idx, kv_idx])
+        return score_mod
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, window_size=-1) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -266,15 +343,52 @@ class Attention(nn.Module):
                 query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         dropout_p = self.attn_dropout if self.training else 0.0
+        effective_window_size = self.attention_window_size if window_size == -1 else window_size
 
-        if self.topk_sparsity > 0.0:
-            # Top-k sparse attention (manual computation)
-            attn_output = self._topk_attention(query, key, value, dropout_p)
+        if self.attention_type == "full":
+            attn_output = flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                causal=self.causal,
+                window_size=(-1, -1),
+                dropout_p=dropout_p,
+            )
+        elif self.attention_type == "swa":
+            attn_output = flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                causal=self.causal,
+                window_size=(effective_window_size, effective_window_size),
+                dropout_p=dropout_p,
+            )
+        elif self.attention_type == "lsa":
+            if seq_len <= 1:
+                attn_output = flash_attn_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    causal=self.causal,
+                    window_size=(-1, -1),
+                    dropout_p=dropout_p,
+                )
+            else:
+                attn_output = self._flex_attention_output(query, key, value, self._lsa_score_mod())
+        elif self.attention_type == "swa2d":
+            attn_output = self._flex_attention_output(query, key, value, self._swa2d_score_mod())
+        elif self.attention_type == "topk":
+            keep_mask = self._topk_keep_mask(query, key)
+            attn_output = self._flex_attention_output(query, key, value, self._topk_score_mod(keep_mask))
         else:
-            # flash attn
-            attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal, window_size=(window_size, window_size), dropout_p=dropout_p)
-            if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-                attn_output = attn_output[0]
+            raise AssertionError(f"Unhandled attention_type: {self.attention_type}")
+
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+        if attn_output.dim() == 4 and attn_output.shape[1] == self.num_heads and attn_output.shape[2] == seq_len:
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        elif attn_output.dim() != 4:
+            raise RuntimeError(f"Unexpected attention output shape: {tuple(attn_output.shape)}")
 
         # attn_output: [batch_size, num_heads, seq_len, head_dim]
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
