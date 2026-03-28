@@ -74,4 +74,4 @@ masked_input:
 # full_sequence: all valid labels (ARC default).
 # all: Sudoku-only target cells. Uses original 0-cells, or masked_input positions when masked_input is applied.
 target_mask_mode: full_sequence
-target_mask_empty_token_id: 0
+target_mask_empty_token_id: 1
