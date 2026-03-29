@@ -60,7 +60,7 @@ online_aug:
 # Replace model inputs with a randomly masked version of the label sequence.
 # The model still predicts the full label sequence.
 masked_input:
-  enabled: true
+  enabled: false
   apply_probability: 0.2
   min_mask_ratio: 0.1
   max_mask_ratio: 0.5

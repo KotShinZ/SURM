@@ -142,10 +142,22 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_type: str,
+        diff_L_loss_enabled: bool = False,
+        diff_L_loss_weight: float = 0.01,
+    ):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.diff_L_loss_enabled = diff_L_loss_enabled
+        self.diff_L_loss_weight = diff_L_loss_weight
+
+        model_config = getattr(self.model, "config", None)
+        if model_config is not None and hasattr(model_config, "diff_L_loss_enabled"):
+            model_config.diff_L_loss_enabled = diff_L_loss_enabled
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -231,6 +243,12 @@ class ACTLossHead(nn.Module):
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+            
+        diff_L_loss = outputs.get("diff_L")
+        if self.diff_L_loss_enabled and diff_L_loss is not None:
+            diff_L_loss_mean = diff_L_loss.mean() * self.diff_L_loss_weight
+            total_loss = total_loss + diff_L_loss_mean
+            metrics["diff_L_loss"] = diff_L_loss_mean.detach()
 
         return (
             new_carry,

@@ -49,6 +49,7 @@ class URMConfig(BaseModel):
     noise_seed: int = 42
     norm_diff_max: float = 0.2
     norm_diff_min: float = 0.1
+    diff_L_loss_enabled: bool = False
 
 
 class URMBlock(nn.Module):
@@ -177,7 +178,7 @@ class URM_Inner(nn.Module):
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor]
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(cos_sin=self.rotary_emb())
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
@@ -211,12 +212,16 @@ class URM_Inner(nn.Module):
                         norm_tensor = torch.tensor([container[i] for i in range(total)])
                         global_logger.store("grad_norm_per_layer", norm_tensor)
                 return hook
-
+        
         _unrolled_idx = 0
+        diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
         for _ in range(self.config.L_cycles):
             hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
             for layer in self.layers:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
+                pre_hidden_states = hidden_states
+                hidden_states = layer(hidden_states=pre_hidden_states, **seq_info)
+                if diff_L is not None:
+                    diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
                 if self.config.noise_size > 0:
                     noise = torch.randn(
                         hidden_states.shape,
@@ -233,7 +238,7 @@ class URM_Inner(nn.Module):
         new_carry = replace(carry, current_hidden=hidden_states.detach())
         output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
 
 class URM(nn.Module):
@@ -278,7 +283,7 @@ class URM(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits) = self.inner(new_carry, new_current_data)
+        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
         
         hidden_diff_norm = self.norm_func(new_carry2.current_hidden.detach(), new_carry.current_hidden.detach())
         sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
@@ -293,6 +298,8 @@ class URM(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
         }
+        if diff_L is not None:
+            outputs["diff_L"] = diff_L
 
         with torch.no_grad():
             new_steps = new_steps + 1
@@ -318,6 +325,7 @@ class URM(nn.Module):
                     # print("Hidden diff norm:", hidden_diff_norm)
                     # print("Norm diff threshold:", norm_diff_threshold+ self.config.attn_dropout)
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
+                # halted = torch.ones_like(halted)
 
         return (
             URMCarry(
