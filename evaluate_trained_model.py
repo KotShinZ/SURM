@@ -450,6 +450,28 @@ def _compute_batch_metric_sums(
     }
 
 
+def _power_of_two_loop_checkpoints(loops: Optional[int]) -> List[int]:
+    if loops is None or loops < 2:
+        return []
+
+    checkpoints: List[int] = []
+    current = 2
+    while current <= loops:
+        checkpoints.append(current)
+        current *= 2
+    return checkpoints
+
+
+def _uniform_step_value(steps: torch.Tensor) -> Optional[int]:
+    if steps.numel() == 0:
+        return None
+
+    first_step = steps[0]
+    if bool(torch.all(steps == first_step).item()):
+        return int(first_step.item())
+    return None
+
+
 def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,
@@ -458,14 +480,20 @@ def evaluate_model(
     max_batches: Optional[int],
     save_predictions: bool,
     hidden_diff_threshold: Optional[float],
-) -> tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, torch.Tensor]], int, int]:
+    loop_checkpoints: Optional[List[int]] = None,
+) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
     model.eval()
 
     return_keys: Set[str] = {"preds", "logits"}
     if save_predictions:
         return_keys.update({"q_halt_logits", "q_continue_logits"})
+    metric_return_keys: Set[str] = {"preds", "logits"}
+    loop_checkpoints = sorted(set(loop_checkpoints or []))
 
     metric_totals_by_set: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    loop_metric_totals_by_step: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(float))
+    )
     saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
 
     processed_batches = 0
@@ -496,6 +524,18 @@ def evaluate_model(
             processed_batches += 1
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             batch_size = batch["inputs"].shape[0]
+
+            valid_example_mask = _valid_example_mask(batch["labels"])
+            keep_mask = valid_example_mask.clone()
+            if max_problems is not None:
+                remaining = max_problems - processed_problems
+                valid_indices = torch.nonzero(valid_example_mask, as_tuple=False).squeeze(-1)
+                if remaining <= 0:
+                    break
+                if valid_indices.numel() > remaining:
+                    keep_mask = torch.zeros_like(valid_example_mask)
+                    keep_mask[valid_indices[:remaining]] = True
+
             with torch.device(str(device)):
                 carry = model.initial_carry(batch)  # type: ignore[misc]
 
@@ -503,6 +543,7 @@ def evaluate_model(
             active_indices = torch.arange(batch_size, device=device)
             pruned_chunks: List[Dict[str, torch.Tensor]] = []
             preds: Optional[Dict[str, torch.Tensor]] = None
+            captured_loop_checkpoints: Set[int] = set()
 
             while True:
                 carry_before_step = None
@@ -514,6 +555,39 @@ def evaluate_model(
                     batch=active_batch,
                     return_keys=return_keys,
                 )
+
+                current_step = _uniform_step_value(carry.steps)
+                if (
+                    current_step is not None
+                    and current_step in loop_checkpoints
+                    and current_step not in captured_loop_checkpoints
+                ):
+                    if hidden_pruning_enabled and pruned_chunks:
+                        checkpoint_preds, checkpoint_steps = _merge_pruned_predictions(
+                            model=model,
+                            batch_size=batch_size,
+                            return_keys=metric_return_keys,
+                            active_indices=active_indices,
+                            active_preds=preds,
+                            active_steps=carry.steps if preds is not None else None,
+                            pruned_chunks=pruned_chunks,
+                        )
+                    else:
+                        if preds is None:
+                            raise RuntimeError("Model evaluation did not produce predictions for the batch.")
+                        checkpoint_preds = preds
+                        checkpoint_steps = carry.steps
+
+                    checkpoint_metric_sums = _compute_batch_metric_sums(
+                        model=model,
+                        batch=batch,
+                        preds=checkpoint_preds,
+                        final_steps=checkpoint_steps,
+                        keep_mask=keep_mask,
+                    )
+                    for metric_name, metric_value in checkpoint_metric_sums.items():
+                        loop_metric_totals_by_step[current_step][set_name][metric_name] += metric_value
+                    captured_loop_checkpoints.add(current_step)
 
                 if hidden_pruning_enabled and carry_before_step is not None and not all_finish:
                     hidden_diff_norm = _hidden_diff_norm(
@@ -559,17 +633,6 @@ def evaluate_model(
                     raise RuntimeError("Model evaluation did not produce predictions for the batch.")
                 final_steps = carry.steps
 
-            valid_example_mask = _valid_example_mask(batch["labels"])
-            keep_mask = valid_example_mask.clone()
-            if max_problems is not None:
-                remaining = max_problems - processed_problems
-                valid_indices = torch.nonzero(valid_example_mask, as_tuple=False).squeeze(-1)
-                if remaining <= 0:
-                    break
-                if valid_indices.numel() > remaining:
-                    keep_mask = torch.zeros_like(valid_example_mask)
-                    keep_mask[valid_indices[:remaining]] = True
-
             batch_metric_sums = _compute_batch_metric_sums(
                 model=model,
                 batch=batch,
@@ -602,7 +665,26 @@ def evaluate_model(
             overall_totals[key] += value
     finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
 
-    return finalized_by_set, _concat_saved_outputs(saved_outputs), processed_batches, processed_problems
+    finalized_loop_metrics_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
+    for loop_step, metric_totals_by_set_at_step in sorted(loop_metric_totals_by_step.items()):
+        finalized_loop_metrics_by_step[loop_step] = {
+            set_name: _finalize_metric_totals(metric_totals)
+            for set_name, metric_totals in metric_totals_by_set_at_step.items()
+        }
+
+        overall_loop_totals: Dict[str, float] = defaultdict(float)
+        for metric_totals in metric_totals_by_set_at_step.values():
+            for key, value in metric_totals.items():
+                overall_loop_totals[key] += value
+        finalized_loop_metrics_by_step[loop_step]["overall"] = _finalize_metric_totals(overall_loop_totals)
+
+    return (
+        finalized_by_set,
+        finalized_loop_metrics_by_step,
+        _concat_saved_outputs(saved_outputs),
+        processed_batches,
+        processed_problems,
+    )
 
 
 def _default_output_path(
@@ -747,6 +829,10 @@ def main() -> None:
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
+    effective_loops = (config.arch.__pydantic_extra__ or {}).get("loops")
+    loop_checkpoints = _power_of_two_loop_checkpoints(effective_loops)
+    if loop_checkpoints:
+        print(f"Reporting intermediate metrics at power-of-two loops: {loop_checkpoints}")
 
     print("Reconstructing model...")
     model = create_model_for_evaluation(config, metadata, device=device)
@@ -759,7 +845,7 @@ def main() -> None:
         strict=not args.no_strict_load,
     )
     start_time = time.time()
-    metrics_by_set, saved_outputs, processed_batches, processed_problems = evaluate_model(
+    metrics_by_set, loop_metrics_by_step, saved_outputs, processed_batches, processed_problems = evaluate_model(
         model=model,
         dataloader=dataloader,
         device=device,
@@ -767,6 +853,7 @@ def main() -> None:
         max_batches=args.max_batches,
         save_predictions=args.save_predictions,
         hidden_diff_threshold=args.hidden_diff_threshold,
+        loop_checkpoints=loop_checkpoints,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -781,6 +868,17 @@ def main() -> None:
         print(f"[{set_name}]")
         for key, value in sorted(metrics.items()):
             print(f"  {key}: {value:.6f}")
+
+    if loop_metrics_by_step:
+        print("")
+        print("Intermediate metrics at power-of-two loops:")
+        for loop_step, metrics_per_set in loop_metrics_by_step.items():
+            print(f"[loop={loop_step}]")
+            for set_name, metrics in metrics_per_set.items():
+                print(f"  [{set_name}]")
+                for key in ("accuracy", "exact_accuracy", "lm_loss"):
+                    if key in metrics:
+                        print(f"    {key}: {metrics[key]:.6f}")
 
     output_path = (
         Path(args.output)
@@ -811,6 +909,7 @@ def main() -> None:
         "processed_batches": processed_batches,
         "processed_problems": processed_problems,
         "metrics": metrics_by_set,
+        "power_of_two_loop_metrics": loop_metrics_by_step,
     }
     if args.save_predictions:
         payload["outputs"] = saved_outputs
