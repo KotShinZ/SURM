@@ -25,6 +25,60 @@ class DataProcessConfig(BaseModel):
 
     subsample_size: Optional[int] = None
     aug: bool = False
+    num_aug: int = 0
+
+
+def add_random_walls(inp: np.ndarray, out: np.ndarray, max_added_walls: int = 10):
+    aug_inp = inp.copy()
+    aug_out = out.copy()
+
+    # Only add walls to open cells that are not part of the solution path.
+    candidate_mask = (aug_inp == ord(" ")) & (aug_out == ord(" "))
+    candidates = np.argwhere(candidate_mask)
+
+    if len(candidates) == 0 or max_added_walls <= 0:
+        return aug_inp, aug_out
+
+    num_walls = np.random.randint(1, min(max_added_walls, len(candidates)) + 1)
+    chosen = candidates[np.random.choice(len(candidates), size=num_walls, replace=False)]
+
+    aug_inp[chosen[:, 0], chosen[:, 1]] = ord("#")
+    aug_out[chosen[:, 0], chosen[:, 1]] = ord("#")
+    return aug_inp, aug_out
+
+
+def swap_start_goal(inp: np.ndarray, out: np.ndarray):
+    aug_inp = inp.copy()
+    aug_out = out.copy()
+
+    for arr in (aug_inp, aug_out):
+        start_mask = arr == ord("S")
+        goal_mask = arr == ord("G")
+        arr[start_mask] = ord("G")
+        arr[goal_mask] = ord("S")
+
+    return aug_inp, aug_out
+
+
+def augment_maze(inp: np.ndarray, out: np.ndarray):
+    aug_inp = inp.copy()
+    aug_out = out.copy()
+
+    for _ in range(8):
+        trans_id = np.random.randint(0, 8)
+        aug_inp = dihedral_transform(inp, trans_id)
+        aug_out = dihedral_transform(out, trans_id)
+
+        wall_budget = np.random.randint(0, 11)
+        aug_inp, aug_out = add_random_walls(aug_inp, aug_out, max_added_walls=wall_budget)
+
+        if np.random.rand() < 0.5:
+            aug_inp, aug_out = swap_start_goal(aug_inp, aug_out)
+
+        if not (np.array_equal(aug_inp, inp) and np.array_equal(aug_out, out)):
+            return aug_inp, aug_out
+
+    return aug_inp, aug_out
 
 
 def convert_subset(set_name: str, config: DataProcessConfig):
@@ -65,11 +119,25 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     results["puzzle_indices"].append(0)
     results["group_indices"].append(0)
     
-    for inp, out in zip(tqdm(inputs), labels):
-        # Dihedral transformations for augmentation
-        for aug_idx in range(8 if (set_name == "train" and config.aug) else 1):
-            results["inputs"].append(dihedral_transform(inp, aug_idx))
-            results["labels"].append(dihedral_transform(out, aug_idx))
+    num_augments = 0
+    use_legacy_dihedral_aug = set_name == "train" and config.aug and config.num_aug == 0
+    if set_name == "train":
+        num_augments = config.num_aug if config.num_aug > 0 else (7 if use_legacy_dihedral_aug else 0)
+
+    print(f"Number of augmentations per puzzle: {num_augments}")
+
+    for orig_inp, orig_out in zip(tqdm(inputs), labels):
+        for aug_idx in range(1 + num_augments):
+            if aug_idx == 0:
+                inp, out = orig_inp, orig_out
+            elif use_legacy_dihedral_aug:
+                inp = dihedral_transform(orig_inp, aug_idx)
+                out = dihedral_transform(orig_out, aug_idx)
+            else:
+                inp, out = augment_maze(orig_inp, orig_out)
+
+            results["inputs"].append(inp)
+            results["labels"].append(out)
             example_id += 1
             puzzle_id += 1
             

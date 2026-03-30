@@ -64,6 +64,12 @@ python -m data.build_sudoku_dataset \
   --subsample-size 1000 \
   --num-aug 1000
 
+# Maze
+python -m data.build_maze_dataset \
+  --output-dir data/maze-30x30-hard-1k-aug-1000 \
+  --subsample-size 1000 \
+  --num-aug 1000
+
 # upload ARC-AGI-1
 export HF_TOKEN=YOUR_HF_TOKEN
 python -m data.upload_arc_dataset \
