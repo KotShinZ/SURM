@@ -1,4 +1,5 @@
 from typing import Optional
+from collections import deque
 import math
 import os
 import csv
@@ -26,6 +27,7 @@ class DataProcessConfig(BaseModel):
     subsample_size: Optional[int] = None
     aug: bool = False
     num_aug: int = 0
+    rebuild: bool = False
 
 
 def add_random_walls(inp: np.ndarray, out: np.ndarray, max_added_walls: int = 10):
@@ -58,6 +60,122 @@ def swap_start_goal(inp: np.ndarray, out: np.ndarray):
         arr[goal_mask] = ord("S")
 
     return aug_inp, aug_out
+
+
+def solve_maze_bfs(grid: np.ndarray):
+    start_pos = np.argwhere(grid == ord("S"))
+    goal_pos = np.argwhere(grid == ord("G"))
+
+    if len(start_pos) != 1 or len(goal_pos) != 1:
+        return None
+
+    start = tuple(start_pos[0])
+    goal = tuple(goal_pos[0])
+    queue = deque([start])
+    parents = {start: None}
+
+    while queue:
+        row, col = queue.popleft()
+        if (row, col) == goal:
+            break
+
+        for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n_row = row + d_row
+            n_col = col + d_col
+
+            if not (0 <= n_row < grid.shape[0] and 0 <= n_col < grid.shape[1]):
+                continue
+            if grid[n_row, n_col] == ord("#"):
+                continue
+
+            nxt = (n_row, n_col)
+            if nxt in parents:
+                continue
+
+            parents[nxt] = (row, col)
+            queue.append(nxt)
+
+    if goal not in parents:
+        return None
+
+    path = []
+    cur = goal
+    while cur is not None:
+        path.append(cur)
+        cur = parents[cur]
+
+    path.reverse()
+    return path
+
+
+def render_maze_label(inp: np.ndarray, path):
+    out = inp.copy()
+
+    for row, col in path[1:-1]:
+        out[row, col] = ord("o")
+
+    return out
+
+
+def relocate_start_goal(grid: np.ndarray):
+    open_cells = np.argwhere(grid == ord(" "))
+    if len(open_cells) < 2:
+        return None
+
+    selected = open_cells[np.random.choice(len(open_cells), size=2, replace=False)]
+    rebuilt = grid.copy()
+    rebuilt[selected[0, 0], selected[0, 1]] = ord("S")
+    rebuilt[selected[1, 0], selected[1, 1]] = ord("G")
+    return rebuilt
+
+
+def balance_random_walls(grid: np.ndarray, max_wall_changes: int = 10):
+    rebuilt = grid.copy()
+
+    wall_cells = np.argwhere(rebuilt == ord("#"))
+    open_cells = np.argwhere(rebuilt == ord(" "))
+    max_changes = min(max_wall_changes, len(wall_cells), len(open_cells))
+
+    if max_changes <= 0:
+        return rebuilt
+
+    num_changes = np.random.randint(0, max_changes + 1)
+    if num_changes == 0:
+        return rebuilt
+
+    removed_walls = wall_cells[np.random.choice(len(wall_cells), size=num_changes, replace=False)]
+    rebuilt[removed_walls[:, 0], removed_walls[:, 1]] = ord(" ")
+
+    add_candidate_mask = rebuilt == ord(" ")
+    add_candidate_mask[removed_walls[:, 0], removed_walls[:, 1]] = False
+    add_candidates = np.argwhere(add_candidate_mask)
+    if len(add_candidates) < num_changes:
+        return grid.copy()
+
+    added_walls = add_candidates[np.random.choice(len(add_candidates), size=num_changes, replace=False)]
+    rebuilt[added_walls[:, 0], added_walls[:, 1]] = ord("#")
+    return rebuilt
+
+
+def rebuild_maze(inp: np.ndarray, max_wall_changes: int = 10, max_retries: int = 24):
+    for _ in range(max_retries):
+        rebuilt = dihedral_transform(inp, np.random.randint(0, 8)).copy()
+        rebuilt[(rebuilt == ord("S")) | (rebuilt == ord("G"))] = ord(" ")
+        rebuilt = balance_random_walls(rebuilt, max_wall_changes=max_wall_changes)
+
+        rebuilt = relocate_start_goal(rebuilt)
+        if rebuilt is None:
+            continue
+
+        path = solve_maze_bfs(rebuilt)
+        if path is None:
+            continue
+
+        label = render_maze_label(rebuilt, path)
+        if not np.array_equal(rebuilt, inp):
+            return rebuilt, label
+
+    return None
 
 
 def augment_maze(inp: np.ndarray, out: np.ndarray):
@@ -134,7 +252,11 @@ def convert_subset(set_name: str, config: DataProcessConfig):
                 inp = dihedral_transform(orig_inp, aug_idx)
                 out = dihedral_transform(orig_out, aug_idx)
             else:
-                inp, out = augment_maze(orig_inp, orig_out)
+                rebuilt = rebuild_maze(orig_inp) if config.rebuild else None
+                if rebuilt is not None:
+                    inp, out = rebuilt
+                else:
+                    inp, out = augment_maze(orig_inp, orig_out)
 
             results["inputs"].append(inp)
             results["labels"].append(out)
