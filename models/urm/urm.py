@@ -45,6 +45,7 @@ class URMConfig(BaseModel):
     H_cycles: int
     forward_dtype: str = "bfloat16"
     use_act: bool = True
+    input_embedding_noise_size: float = 0.0
     noise_size: float = 0.0
     noise_seed: int = 42
     norm_diff_max: float = 0.2
@@ -154,7 +155,19 @@ class URM_Inner(nn.Module):
                 (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding),
                 dim=-2,
             )
-        return self.embed_scale * embedding
+        embedding = self.embed_scale * embedding
+
+        if self.config.input_embedding_noise_size > 0:
+            noise = torch.randn(
+                embedding.shape,
+                generator=self.generator,
+                dtype=embedding.dtype,
+                device=embedding.device,
+                layout=embedding.layout,
+            )
+            embedding = embedding + noise * self.config.input_embedding_noise_size
+
+        return embedding
 
     def empty_carry(self, batch_size: int) -> URMCarry:
         return URMCarry(
