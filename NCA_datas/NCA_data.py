@@ -9,7 +9,7 @@
 #
 # What this script does:
 #   - samples random discrete NCA rules
-#   - rolls out trajectories on a 12x12 grid
+#   - rolls out trajectories on a configurable HxW grid
 #   - filters trajectories by gzip complexity band
 #   - tokenizes each frame with 2x2 patches + <grid>, </grid>
 #   - saves train/val arrays and metadata
@@ -63,7 +63,9 @@ def get_device() -> torch.device:
 @dataclass
 class NCAConfig:
     # Paper-aligned defaults
-    grid_size: int = 12
+    grid_size: Optional[int] = None
+    grid_height: int = 12
+    grid_width: int = 12
     num_colors: int = 10
     temperature: float = 1e-3
     identity_bias: float = 0.0
@@ -100,6 +102,12 @@ class NCAConfig:
     # Visualization
     num_vis_examples: int = 6
 
+    def __post_init__(self) -> None:
+        # Backward compatibility: if grid_size is provided, use the same size for both sides.
+        if self.grid_size is not None:
+            self.grid_height = self.grid_size
+            self.grid_width = self.grid_size
+
     @property
     def patch_vocab_size(self) -> int:
         return self.num_colors ** (self.patch_size ** 2)
@@ -117,13 +125,31 @@ class NCAConfig:
         return self.patch_vocab_size + 2
 
     @property
+    def grid_shape(self) -> Tuple[int, int]:
+        return self.grid_height, self.grid_width
+
+    @property
+    def patches_per_height(self) -> int:
+        assert self.grid_height % self.patch_size == 0
+        return self.grid_height // self.patch_size
+
+    @property
+    def patches_per_width(self) -> int:
+        assert self.grid_width % self.patch_size == 0
+        return self.grid_width // self.patch_size
+
+    @property
     def patches_per_side(self) -> int:
-        assert self.grid_size % self.patch_size == 0
-        return self.grid_size // self.patch_size
+        if self.grid_height != self.grid_width:
+            raise ValueError(
+                "patches_per_side is only defined for square grids. "
+                "Use patches_per_height and patches_per_width instead."
+            )
+        return self.patches_per_height
 
     @property
     def tokens_per_frame(self) -> int:
-        return self.patches_per_side ** 2 + 2
+        return self.patches_per_height * self.patches_per_width + 2
 
 
 # ============================================================
@@ -176,7 +202,7 @@ class RandomDiscreteNCA(nn.Module):
         logits = logits / max(self.cfg.temperature, 1e-8)
         probs = torch.softmax(logits, dim=-1)
         flat = probs.view(-1, self.cfg.num_colors)
-        nxt = torch.multinomial(flat, num_samples=1).view(self.cfg.grid_size, self.cfg.grid_size)
+        nxt = torch.multinomial(flat, num_samples=1).view_as(state)
         return nxt
 
 
@@ -188,16 +214,16 @@ def sample_initial_state(cfg: NCAConfig, device: torch.device) -> torch.Tensor:
     return torch.randint(
         low=0,
         high=cfg.num_colors,
-        size=(cfg.grid_size, cfg.grid_size),
+        size=cfg.grid_shape,
         device=device,
         dtype=torch.long,
     )
     # out = torch.zeros(
-    #     size=(cfg.grid_size, cfg.grid_size),
+    #     size=cfg.grid_shape,
     #     device=device,
     #     dtype=torch.long,
     # )
-    # out[cfg.grid_size // 2, cfg.grid_size // 2] = 1
+    # out[cfg.grid_height // 2, cfg.grid_width // 2] = 1
     return out
 
 
@@ -253,7 +279,8 @@ class NCATokenizer:
     def decode_frame(self, frame_tokens: np.ndarray) -> np.ndarray:
         # frame_tokens excludes start/end
         p = self.patch
-        nh = nw = self.cfg.patches_per_side
+        nh = self.cfg.patches_per_height
+        nw = self.cfg.patches_per_width
         vals = frame_tokens.astype(np.int64)[:, None]
         digits = (vals // self.base[None, :]) % self.num_colors
         frame = digits.reshape(nh, nw, p, p).transpose(0, 2, 1, 3).reshape(nh * p, nw * p)
