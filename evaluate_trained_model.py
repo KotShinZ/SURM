@@ -451,11 +451,11 @@ def _compute_batch_metric_sums(
 
 
 def _power_of_two_loop_checkpoints(loops: Optional[int]) -> List[int]:
-    if loops is None or loops < 2:
+    if loops is None or loops < 1:
         return []
 
     checkpoints: List[int] = []
-    current = 2
+    current = 1
     while current <= loops:
         checkpoints.append(current)
         current *= 2
