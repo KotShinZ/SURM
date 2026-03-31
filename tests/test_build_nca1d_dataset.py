@@ -74,18 +74,28 @@ class BuildNCA1DDatasetTests(unittest.TestCase):
             self.assertEqual(saved_config["final_image_shape"], [6, 5])
             self.assertEqual(saved_config["seq_len"], 30)
             self.assertEqual(saved_config["vocab_size"], 6)
+            self.assertEqual(saved_config["resolved_state_height_min"], 6)
+            self.assertEqual(saved_config["resolved_state_height_max"], 6)
+            self.assertEqual(saved_config["resolved_rollout_steps_min"], 5)
+            self.assertEqual(saved_config["resolved_rollout_steps_max"], 5)
 
             train_inputs = np.load(dataset_dir / "train" / "all__inputs.npy")
             train_labels = np.load(dataset_dir / "train" / "all__labels.npy")
             train_gzip = np.load(dataset_dir / "train" / "all__gzip_ratio.npy")
             train_puzzle_indices = np.load(dataset_dir / "train" / "all__puzzle_indices.npy")
             train_group_indices = np.load(dataset_dir / "train" / "all__group_indices.npy")
+            train_state_heights = np.load(dataset_dir / "train" / "all__state_heights.npy")
+            train_num_frames = np.load(dataset_dir / "train" / "all__num_frames.npy")
+            train_rollout_steps = np.load(dataset_dir / "train" / "all__rollout_steps.npy")
 
             self.assertEqual(train_inputs.shape, (3, config.seq_len))
             self.assertEqual(train_labels.shape, (3, config.seq_len))
             self.assertEqual(train_gzip.shape, (3,))
             self.assertEqual(train_puzzle_indices.tolist(), [0, 1, 2, 3])
             self.assertEqual(train_group_indices.tolist(), [0, 1, 2, 3])
+            self.assertEqual(train_state_heights.tolist(), [6, 6, 6])
+            self.assertEqual(train_num_frames.tolist(), [5, 5, 5])
+            self.assertEqual(train_rollout_steps.tolist(), [5, 5, 5])
             self.assertTrue(np.all(train_inputs >= config.token_offset))
             self.assertTrue(np.all(train_inputs <= config.token_offset + config.num_colors - 1))
             np.testing.assert_array_equal(train_inputs, train_labels)
@@ -119,6 +129,68 @@ class BuildNCA1DDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(batch["inputs"].shape), (2, config.seq_len))
             self.assertEqual(tuple(batch["labels"].shape), (2, config.seq_len))
             self.assertEqual(tuple(batch["puzzle_identifiers"].shape), (2,))
+
+    def test_build_dataset_supports_random_state_heights_and_rollout_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_dir = Path(tmp_dir) / "nca1d-variable"
+            config = NCA1DDataConfig(
+                output_dir=str(dataset_dir),
+                train_size=8,
+                test_size=4,
+                seed=13,
+                state_height=6,
+                state_height_min=4,
+                state_height_max=8,
+                num_colors=4,
+                patch_size=1,
+                rollout_steps=6,
+                rollout_steps_min=3,
+                rollout_steps_max=7,
+                time_subsample=1,
+                batch_candidate_size=4,
+                max_sampling_rounds=20,
+                save_dtype="int32",
+            )
+
+            build_dataset(config)
+
+            with open(dataset_dir / "config.json") as f:
+                saved_config = json.load(f)
+
+            self.assertEqual(saved_config["resolved_state_height_min"], 4)
+            self.assertEqual(saved_config["resolved_state_height_max"], 8)
+            self.assertEqual(saved_config["resolved_rollout_steps_min"], 3)
+            self.assertEqual(saved_config["resolved_rollout_steps_max"], 7)
+            self.assertEqual(saved_config["final_image_shape"], [8, 7])
+            self.assertEqual(saved_config["seq_len"], 56)
+
+            train_inputs = np.load(dataset_dir / "train" / "all__inputs.npy")
+            train_state_heights = np.load(dataset_dir / "train" / "all__state_heights.npy")
+            train_num_frames = np.load(dataset_dir / "train" / "all__num_frames.npy")
+            train_rollout_steps = np.load(dataset_dir / "train" / "all__rollout_steps.npy")
+
+            self.assertEqual(train_inputs.shape, (8, 56))
+            self.assertTrue(np.all(train_state_heights >= 4))
+            self.assertTrue(np.all(train_state_heights <= 8))
+            self.assertTrue(np.all(train_rollout_steps >= 3))
+            self.assertTrue(np.all(train_rollout_steps <= 7))
+            self.assertTrue(np.all(train_num_frames >= 3))
+            self.assertTrue(np.all(train_num_frames <= 7))
+
+            self.assertGreater(len(np.unique(train_state_heights)), 1)
+            self.assertGreater(len(np.unique(train_rollout_steps)), 1)
+
+            decoded = unflatten_time_image(
+                train_inputs[0],
+                image_height=int(train_state_heights[0]),
+                num_frames=int(train_num_frames[0]),
+                token_offset=config.token_offset,
+                padded_height=config.final_image_shape[0],
+                padded_num_frames=config.final_image_shape[1],
+            )
+            self.assertEqual(decoded.shape, (int(train_state_heights[0]), int(train_num_frames[0])))
+            self.assertTrue(np.all(decoded >= 0))
+            self.assertTrue(np.all(decoded < config.num_colors))
 
 
 if __name__ == "__main__":

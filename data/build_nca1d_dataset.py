@@ -38,6 +38,8 @@ class NCA1DDataConfig(BaseModel):
     seed: int = 0
 
     state_height: int = 16
+    state_height_min: Optional[int] = None
+    state_height_max: Optional[int] = None
     state_width: int = 1
 
     num_colors: int = 8
@@ -50,6 +52,8 @@ class NCA1DDataConfig(BaseModel):
     patch_size: int = 1
 
     rollout_steps: int = 64
+    rollout_steps_min: Optional[int] = None
+    rollout_steps_max: Optional[int] = None
     time_subsample: int = 1
     start_step: int = 0
 
@@ -63,6 +67,30 @@ class NCA1DDataConfig(BaseModel):
     token_offset: int = 2
     save_dtype: str = "int32"
 
+    @property
+    def sampled_state_height_min(self) -> int:
+        return self.state_height if self.state_height_min is None else self.state_height_min
+
+    @property
+    def sampled_state_height_max(self) -> int:
+        return self.state_height if self.state_height_max is None else self.state_height_max
+
+    @property
+    def sampled_rollout_steps_min(self) -> int:
+        return self.rollout_steps if self.rollout_steps_min is None else self.rollout_steps_min
+
+    @property
+    def sampled_rollout_steps_max(self) -> int:
+        return self.rollout_steps if self.rollout_steps_max is None else self.rollout_steps_max
+
+    @property
+    def valid_state_heights(self) -> list[int]:
+        return [
+            height
+            for height in range(self.sampled_state_height_min, self.sampled_state_height_max + 1)
+            if height % self.patch_size == 0
+        ]
+
     @model_validator(mode="after")
     def _validate(self) -> "NCA1DDataConfig":
         if self.train_size <= 0:
@@ -71,6 +99,15 @@ class NCA1DDataConfig(BaseModel):
             raise ValueError(f"test_size must be > 0, got {self.test_size}")
         if self.state_height <= 0:
             raise ValueError(f"state_height must be > 0, got {self.state_height}")
+        if self.sampled_state_height_min <= 0:
+            raise ValueError(
+                f"state_height_min/state_height must be > 0, got {self.sampled_state_height_min}"
+            )
+        if self.sampled_state_height_min > self.sampled_state_height_max:
+            raise ValueError(
+                "state_height_min must be <= state_height_max, "
+                f"got min={self.sampled_state_height_min}, max={self.sampled_state_height_max}"
+            )
         if self.state_width != 1:
             raise ValueError(
                 f"state_width must be 1 for the requested 1xH -> HxT dataset, got {self.state_width}"
@@ -79,13 +116,29 @@ class NCA1DDataConfig(BaseModel):
             raise ValueError(f"num_colors must be > 1, got {self.num_colors}")
         if self.patch_size <= 0:
             raise ValueError(f"patch_size must be > 0, got {self.patch_size}")
-        if self.state_height % self.patch_size != 0 or self.state_width % self.patch_size != 0:
+        if self.state_width % self.patch_size != 0:
             raise ValueError(
-                "state_height and state_width must both be divisible by patch_size, "
-                f"got {(self.state_height, self.state_width)} and patch_size={self.patch_size}"
+                "state_width must be divisible by patch_size, "
+                f"got state_width={self.state_width} and patch_size={self.patch_size}"
+            )
+        if not self.valid_state_heights:
+            raise ValueError(
+                "No valid state heights in the requested range are divisible by patch_size, "
+                f"got range=({self.sampled_state_height_min}, {self.sampled_state_height_max}) "
+                f"and patch_size={self.patch_size}"
             )
         if self.rollout_steps <= 0:
             raise ValueError(f"rollout_steps must be > 0, got {self.rollout_steps}")
+        if self.sampled_rollout_steps_min <= 0:
+            raise ValueError(
+                "rollout_steps_min/rollout_steps must be > 0, "
+                f"got {self.sampled_rollout_steps_min}"
+            )
+        if self.sampled_rollout_steps_min > self.sampled_rollout_steps_max:
+            raise ValueError(
+                "rollout_steps_min must be <= rollout_steps_max, "
+                f"got min={self.sampled_rollout_steps_min}, max={self.sampled_rollout_steps_max}"
+            )
         if self.time_subsample <= 0:
             raise ValueError(f"time_subsample must be > 0, got {self.time_subsample}")
         if self.start_step < 0:
@@ -116,12 +169,16 @@ class NCA1DDataConfig(BaseModel):
         return self
 
     @property
+    def max_num_frames(self) -> int:
+        return math.ceil(self.sampled_rollout_steps_max / self.time_subsample)
+
+    @property
     def num_frames(self) -> int:
-        return math.ceil(self.rollout_steps / self.time_subsample)
+        return self.max_num_frames
 
     @property
     def final_image_shape(self) -> tuple[int, int]:
-        return self.state_height, self.num_frames
+        return self.sampled_state_height_max, self.max_num_frames
 
     @property
     def seq_len(self) -> int:
@@ -158,6 +215,35 @@ def make_nca_config(config: NCA1DDataConfig) -> NCAConfig:
     )
 
 
+def make_nca_config_for_sample(
+    config: NCA1DDataConfig,
+    state_height: int,
+    rollout_steps: int,
+) -> NCAConfig:
+    return NCAConfig(
+        grid_height=state_height,
+        grid_width=config.state_width,
+        num_colors=config.num_colors,
+        temperature=config.temperature,
+        identity_bias=config.identity_bias,
+        conv_channels=config.conv_channels,
+        hidden_dim=config.hidden_dim,
+        patch_size=config.patch_size,
+        seq_len=config.seq_len,
+        rollout_steps=rollout_steps,
+        time_subsample=config.time_subsample,
+        start_step=config.start_step,
+        gzip_threshold_low=config.gzip_threshold_low or 0.0,
+        gzip_threshold_high=config.gzip_threshold_high,
+        batch_candidate_size=config.batch_candidate_size,
+        max_sampling_rounds=config.max_sampling_rounds,
+        train_size=config.train_size,
+        val_size=config.test_size,
+        out_dir=config.output_dir,
+        save_dtype=config.save_dtype,
+    )
+
+
 def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
     if trajectory.ndim != 3:
         raise ValueError(f"trajectory must have shape [T, H, W], got ndim={trajectory.ndim}")
@@ -168,10 +254,28 @@ def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
     return np.squeeze(trajectory, axis=2).T.astype(np.int16, copy=False)
 
 
-def flatten_time_image(time_image: np.ndarray, token_offset: int) -> np.ndarray:
+def flatten_time_image(
+    time_image: np.ndarray,
+    token_offset: int,
+    padded_height: Optional[int] = None,
+    padded_num_frames: Optional[int] = None,
+) -> np.ndarray:
     if time_image.ndim != 2:
         raise ValueError(f"time_image must have shape [H, T], got ndim={time_image.ndim}")
-    return time_image.astype(np.int32, copy=False).reshape(-1) + token_offset
+    image_height, num_frames = time_image.shape
+    padded_height = image_height if padded_height is None else padded_height
+    padded_num_frames = num_frames if padded_num_frames is None else padded_num_frames
+
+    if image_height > padded_height or num_frames > padded_num_frames:
+        raise ValueError(
+            "time_image must fit inside the padded canvas, "
+            f"got image_shape={(image_height, num_frames)} and "
+            f"padded_shape={(padded_height, padded_num_frames)}"
+        )
+
+    canvas = np.zeros((padded_height, padded_num_frames), dtype=np.int32)
+    canvas[:image_height, :num_frames] = time_image.astype(np.int32, copy=False) + token_offset
+    return canvas.reshape(-1)
 
 
 def unflatten_time_image(
@@ -179,8 +283,13 @@ def unflatten_time_image(
     image_height: int,
     num_frames: int,
     token_offset: int,
+    padded_height: Optional[int] = None,
+    padded_num_frames: Optional[int] = None,
 ) -> np.ndarray:
-    return flat_tokens.reshape(image_height, num_frames) - token_offset
+    padded_height = image_height if padded_height is None else padded_height
+    padded_num_frames = num_frames if padded_num_frames is None else padded_num_frames
+    canvas = flat_tokens.reshape(padded_height, padded_num_frames)
+    return canvas[:image_height, :num_frames] - token_offset
 
 
 def _passes_gzip_filter(score: float, config: NCA1DDataConfig) -> bool:
@@ -194,6 +303,9 @@ def _passes_gzip_filter(score: float, config: NCA1DDataConfig) -> bool:
 def _make_split_arrays(
     flat_images: list[np.ndarray],
     gzip_scores: list[float],
+    state_heights: list[int],
+    num_frames: list[int],
+    rollout_steps: list[int],
     config: NCA1DDataConfig,
 ) -> Dict[str, np.ndarray]:
     num_examples = len(flat_images)
@@ -208,6 +320,9 @@ def _make_split_arrays(
         "puzzle_indices": np.arange(num_examples + 1, dtype=np.int32),
         "group_indices": np.arange(num_examples + 1, dtype=np.int32),
         "gzip_ratio": np.asarray(gzip_scores, dtype=np.float32),
+        "state_heights": np.asarray(state_heights, dtype=np.int32),
+        "num_frames": np.asarray(num_frames, dtype=np.int32),
+        "rollout_steps": np.asarray(rollout_steps, dtype=np.int32),
     }
     return results
 
@@ -215,11 +330,13 @@ def _make_split_arrays(
 def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfig) -> Dict[str, np.ndarray]:
     seed_everything(seed)
     device = get_device()
-    nca_config = make_nca_config(config)
-    tokenizer = NCATokenizer(nca_config)
+    rng = np.random.default_rng(seed)
 
     flat_images: list[np.ndarray] = []
     gzip_scores: list[float] = []
+    state_heights: list[int] = []
+    num_frames: list[int] = []
+    rollout_steps: list[int] = []
 
     total_candidates = config.batch_candidate_size * config.max_sampling_rounds
     progress = tqdm(total=size, desc=f"Generating {split_name}", leave=False)
@@ -228,6 +345,16 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     while len(flat_images) < size and rounds < config.max_sampling_rounds:
         rounds += 1
         for _candidate_idx in range(config.batch_candidate_size):
+            sampled_state_height = int(rng.choice(config.valid_state_heights))
+            sampled_rollout_steps = int(
+                rng.integers(config.sampled_rollout_steps_min, config.sampled_rollout_steps_max + 1)
+            )
+            nca_config = make_nca_config_for_sample(
+                config,
+                state_height=sampled_state_height,
+                rollout_steps=sampled_rollout_steps,
+            )
+            tokenizer = NCATokenizer(nca_config)
             rule = RandomDiscreteNCA(nca_config).to(device)
             trajectory = rollout_trajectory(rule, nca_config, device=device)
             gzip_score = score_trajectory_gzip(trajectory, tokenizer)
@@ -236,10 +363,18 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
                 continue
 
             time_image = trajectory_to_time_image(trajectory)
-            flat_image = flatten_time_image(time_image, config.token_offset)
+            flat_image = flatten_time_image(
+                time_image,
+                config.token_offset,
+                padded_height=config.final_image_shape[0],
+                padded_num_frames=config.final_image_shape[1],
+            )
 
             flat_images.append(flat_image)
             gzip_scores.append(gzip_score)
+            state_heights.append(sampled_state_height)
+            num_frames.append(int(time_image.shape[1]))
+            rollout_steps.append(sampled_rollout_steps)
             progress.update(1)
 
             if len(flat_images) >= size:
@@ -254,7 +389,14 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
             "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
         )
 
-    return _make_split_arrays(flat_images, gzip_scores, config)
+    return _make_split_arrays(
+        flat_images,
+        gzip_scores,
+        state_heights,
+        num_frames,
+        rollout_steps,
+        config,
+    )
 
 
 def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA1DDataConfig) -> None:
@@ -282,6 +424,9 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
     np.save(split_dir / "all__puzzle_indices.npy", split_arrays["puzzle_indices"])
     np.save(split_dir / "all__group_indices.npy", split_arrays["group_indices"])
     np.save(split_dir / "all__gzip_ratio.npy", split_arrays["gzip_ratio"])
+    np.save(split_dir / "all__state_heights.npy", split_arrays["state_heights"])
+    np.save(split_dir / "all__num_frames.npy", split_arrays["num_frames"])
+    np.save(split_dir / "all__rollout_steps.npy", split_arrays["rollout_steps"])
 
     with open(split_dir / "summary.json", "w") as f:
         json.dump(
@@ -294,6 +439,12 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
                 "gzip_ratio_std": float(split_arrays["gzip_ratio"].std()),
                 "gzip_ratio_min": float(split_arrays["gzip_ratio"].min()),
                 "gzip_ratio_max": float(split_arrays["gzip_ratio"].max()),
+                "state_height_min": int(split_arrays["state_heights"].min()),
+                "state_height_max": int(split_arrays["state_heights"].max()),
+                "num_frames_min": int(split_arrays["num_frames"].min()),
+                "num_frames_max": int(split_arrays["num_frames"].max()),
+                "rollout_steps_min": int(split_arrays["rollout_steps"].min()),
+                "rollout_steps_max": int(split_arrays["rollout_steps"].max()),
             },
             f,
             indent=2,
@@ -308,10 +459,17 @@ def save_dataset_config(config: NCA1DDataConfig) -> None:
         json.dump(
             {
                 **config.model_dump(),
-                "num_frames": config.num_frames,
+                "resolved_state_height_min": config.sampled_state_height_min,
+                "resolved_state_height_max": config.sampled_state_height_max,
+                "resolved_rollout_steps_min": config.sampled_rollout_steps_min,
+                "resolved_rollout_steps_max": config.sampled_rollout_steps_max,
+                "num_frames": config.max_num_frames,
+                "max_num_frames": config.max_num_frames,
                 "seq_len": config.seq_len,
                 "vocab_size": config.vocab_size,
                 "final_image_shape": list(config.final_image_shape),
+                "sample_random_state_height": config.sampled_state_height_min != config.sampled_state_height_max,
+                "sample_random_rollout_steps": config.sampled_rollout_steps_min != config.sampled_rollout_steps_max,
                 "time_axis": "width",
                 "value_encoding": {
                     "pad": 0,
