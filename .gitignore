@@ -9,6 +9,7 @@ data/sudoku-extreme-full/*
 kaggle/combined/arc-agi_training-challenges copy.json
 .devcontainer/devcontainer.json
 data/**
+!data/build_nca1d_dataset.py
 NCA_datas/nca_dataset_colab_demo/metadata.json
 NCA_datas/nca_dataset_colab_demo/train_gzip_ratio.npy
 NCA_datas/nca_dataset_colab_demo/train_input_ids.npy
