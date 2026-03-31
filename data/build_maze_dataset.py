@@ -238,15 +238,17 @@ def convert_subset(set_name: str, config: DataProcessConfig):
     results["group_indices"].append(0)
     
     num_augments = 0
-    use_legacy_dihedral_aug = set_name == "train" and config.aug and config.num_aug == 0
+    use_legacy_dihedral_aug = set_name == "train" and config.aug and config.num_aug == 0 and config.rebuild == False
     if set_name == "train":
         num_augments = config.num_aug if config.num_aug > 0 else (7 if use_legacy_dihedral_aug else 0)
 
     print(f"Number of augmentations per puzzle: {num_augments}")
+    print(f"Using legacy dihedral augmentation: {use_legacy_dihedral_aug}")
+    print(f"Using rebuild-based augmentation: {config.rebuild and not use_legacy_dihedral_aug}")
 
     for orig_inp, orig_out in zip(tqdm(inputs), labels):
         for aug_idx in range(1 + num_augments):
-            if aug_idx == 0:
+            if aug_idx == 0 and config.rebuild == False:
                 inp, out = orig_inp, orig_out
             elif use_legacy_dihedral_aug:
                 inp = dihedral_transform(orig_inp, aug_idx)
@@ -256,6 +258,7 @@ def convert_subset(set_name: str, config: DataProcessConfig):
                 if rebuilt is not None:
                     inp, out = rebuilt
                 else:
+                    # print("Rebuild failed, falling back to augmentation.")
                     inp, out = augment_maze(orig_inp, orig_out)
 
             results["inputs"].append(inp)
