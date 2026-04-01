@@ -56,22 +56,31 @@ class URMConfig(BaseModel):
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
-        puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
-        self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=False,
-            attn_dropout=config.attn_dropout,
-            attention_type=config.attention_type,
-            attention_window_size=config.attention_window_size,
-            attention_window_size_2d=config.attention_window_size_2d,
-            attention_topk=config.attention_topk,
-            grid_height=config.grid_height,
-            grid_width=config.grid_width,
-            prefix_seq_len=puzzle_prefix_len,
-            topk_sparsity=config.topk_sparsity,
+        self.puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
+        # self.self_attn = Attention(
+        #     hidden_size=config.hidden_size,
+        #     head_dim=config.hidden_size // config.num_heads,
+        #     num_heads=config.num_heads,
+        #     num_key_value_heads=config.num_heads,
+        #     causal=False,
+        #     attn_dropout=config.attn_dropout,
+        #     attention_type=config.attention_type,
+        #     attention_window_size=config.attention_window_size,
+        #     attention_window_size_2d=config.attention_window_size_2d,
+        #     attention_topk=config.attention_topk,
+        #     grid_height=config.grid_height,
+        #     grid_width=config.grid_width,
+        #     prefix_seq_len=puzzle_prefix_len,
+        #     topk_sparsity=config.topk_sparsity,
+        # )
+        self.grid_height = config.grid_height
+        self.grid_width = config.grid_width
+        self.grid_tokens = self.grid_height * self.grid_width
+        self.attn = nn.Conv2d(
+            in_channels=config.hidden_size,
+            out_channels=config.hidden_size,
+            kernel_size=7,
+            padding=3,
         )
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
@@ -81,7 +90,24 @@ class URMBlock(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
+        # attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
+        prefix = hidden_states[:, :self.puzzle_prefix_len]
+        grid = hidden_states[:, self.puzzle_prefix_len:]
+        batch_size, seq_len, hidden_size = grid.shape
+        if seq_len != self.grid_tokens:
+            raise ValueError(f"Expected {self.grid_tokens} grid tokens, got {seq_len}.")
+        grid = grid.transpose(1, 2).reshape(batch_size, hidden_size, self.grid_height, self.grid_width)
+        attn_output = F.conv2d(
+            grid,
+            self.attn.weight.to(grid.dtype),
+            self.attn.bias.to(grid.dtype) if self.attn.bias is not None else None,
+            stride=self.attn.stride,
+            padding=self.attn.padding,
+            dilation=self.attn.dilation,
+            groups=self.attn.groups,
+        )
+        attn_output = attn_output.reshape(batch_size, hidden_size, seq_len).transpose(1, 2)
+        attn_output = torch.cat((prefix, attn_output), dim=1)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
