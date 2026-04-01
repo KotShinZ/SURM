@@ -5,7 +5,7 @@ mkdir -p $checkpoint_path
 torchrun --nproc-per-node 1 pretrain.py \
 data_path=data/maze \
 arch=urm arch.loops=32 arch.H_cycles=1 arch.L_cycles=6 arch.num_layers=4 \
-arch.grid_height=0 arch.grid_width=0 \
+arch.grid_height=30 arch.grid_width=30 \
 evaluators="[]" \
 epochs=10000 \
 data_fraction=1 \
