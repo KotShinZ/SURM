@@ -28,7 +28,8 @@
         "codezombiech.gitignore",
         "coolcline.coolcline",
         "ms-python.black-formatter",
-        "shd101wyy.markdown-preview-enhanced"
+        "shd101wyy.markdown-preview-enhanced",
+        "openai.chatgpt"
       ],
       "settings": {
         "editor.formatOnSave": false,
@@ -63,7 +64,7 @@
     "ghcr.io/devcontainers/features/python": {}
   },
   //"forwardPorts": [8080, 3000, 8000]
-  "appPort": ["8005:8005", "8085:8085"],
+  "appPort": ["8035:8035", "8125:8125"],
   "containerEnv": {
     "HTTP_PROXY": "http://proxy11.omu.ac.jp:8080",
     "HTTPS_PROXY": "http://proxy11.omu.ac.jp:8080",
