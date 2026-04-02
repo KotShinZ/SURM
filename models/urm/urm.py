@@ -54,34 +54,39 @@ class URMConfig(BaseModel):
 
 
 class URMBlock(nn.Module):
-    def __init__(self, config: URMConfig) -> None:
+    def __init__(self, config: URMConfig, isconv=False) -> None:
         super().__init__()
         self.puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
-        # self.self_attn = Attention(
-        #     hidden_size=config.hidden_size,
-        #     head_dim=config.hidden_size // config.num_heads,
-        #     num_heads=config.num_heads,
-        #     num_key_value_heads=config.num_heads,
-        #     causal=False,
-        #     attn_dropout=config.attn_dropout,
-        #     attention_type=config.attention_type,
-        #     attention_window_size=config.attention_window_size,
-        #     attention_window_size_2d=config.attention_window_size_2d,
-        #     attention_topk=config.attention_topk,
-        #     grid_height=config.grid_height,
-        #     grid_width=config.grid_width,
-        #     prefix_seq_len=puzzle_prefix_len,
-        #     topk_sparsity=config.topk_sparsity,
-        # )
+        self.isconv = isconv
+        if not isconv:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False,
+                attn_dropout=config.attn_dropout,
+                attention_type=config.attention_type,
+                attention_window_size=config.attention_window_size,
+                attention_window_size_2d=config.attention_window_size_2d,
+                attention_topk=config.attention_topk,
+                grid_height=config.grid_height,
+                grid_width=config.grid_width,
+                prefix_seq_len=self.puzzle_prefix_len,
+                topk_sparsity=config.topk_sparsity,
+            )
+        else:
+            self.attn = nn.Conv2d(
+                in_channels=config.hidden_size,
+                out_channels=config.hidden_size,
+                kernel_size=3,
+                padding=1,
+                groups=config.hidden_size
+            )
         self.grid_height = config.grid_height
         self.grid_width = config.grid_width
         self.grid_tokens = self.grid_height * self.grid_width
-        self.attn = nn.Conv2d(
-            in_channels=config.hidden_size,
-            out_channels=config.hidden_size,
-            kernel_size=7,
-            padding=3,
-        )
+        
         self.mlp = ConvSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
@@ -97,17 +102,20 @@ class URMBlock(nn.Module):
         if seq_len != self.grid_tokens:
             raise ValueError(f"Expected {self.grid_tokens} grid tokens, got {seq_len}.")
         grid = grid.transpose(1, 2).reshape(batch_size, hidden_size, self.grid_height, self.grid_width)
-        attn_output = F.conv2d(
-            grid,
-            self.attn.weight.to(grid.dtype),
-            self.attn.bias.to(grid.dtype) if self.attn.bias is not None else None,
-            stride=self.attn.stride,
-            padding=self.attn.padding,
-            dilation=self.attn.dilation,
-            groups=self.attn.groups,
-        )
-        attn_output = attn_output.reshape(batch_size, hidden_size, seq_len).transpose(1, 2)
-        attn_output = torch.cat((prefix, attn_output), dim=1)
+        if self.isconv:
+            attn_output = F.conv2d(
+                grid,
+                self.attn.weight.to(grid.dtype),
+                self.attn.bias.to(grid.dtype) if self.attn.bias is not None else None,
+                stride=self.attn.stride,
+                padding=self.attn.padding,
+                dilation=self.attn.dilation,
+                groups=self.attn.groups,
+            )
+            attn_output = attn_output.reshape(batch_size, hidden_size, seq_len).transpose(1, 2)
+            attn_output = torch.cat((prefix, attn_output), dim=1)
+        else:
+            attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
@@ -156,7 +164,7 @@ class URM_Inner(nn.Module):
                 base=self.config.rope_theta,
             )
 
-        self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
+        self.layers = nn.ModuleList([URMBlock(self.config, isconv=i % 2 == 1) for i in range(self.config.num_layers)])
 
         self.init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
