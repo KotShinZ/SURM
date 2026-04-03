@@ -307,6 +307,12 @@ def _supports_hidden_pruning(model: nn.Module) -> bool:
     )
 
 
+def _act_early_stop_enabled(model: nn.Module) -> bool:
+    base_model = _unwrap_eval_model(model)
+    config = getattr(base_model, "config", None)
+    return bool(getattr(config, "use_act", False))
+
+
 def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return torch.norm(x1 - x2, dim=(1, 2)) / (1e-7 + torch.norm(x1 + x2, dim=(1, 2)) / 2)
 
@@ -370,7 +376,7 @@ def _merge_pruned_predictions(
     active_indices: torch.Tensor,
     active_preds: Optional[Dict[str, torch.Tensor]],
     active_steps: Optional[torch.Tensor],
-    pruned_chunks: List[Dict[str, torch.Tensor]],
+    pruned_chunks: List[Dict[str, Any]],
 ) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
     merged_preds: Optional[Dict[str, torch.Tensor]] = None
     merged_steps: Optional[torch.Tensor] = None
@@ -383,7 +389,11 @@ def _merge_pruned_predictions(
         merged_steps[active_indices] = active_steps
 
     for chunk in pruned_chunks:
-        chunk_preds = _run_heads_from_hidden(model, chunk["hidden"], return_keys=return_keys)
+        chunk_outputs = chunk.get("outputs")
+        if chunk_outputs is not None:
+            chunk_preds = {key: value for key, value in chunk_outputs.items() if key in return_keys}
+        else:
+            chunk_preds = _run_heads_from_hidden(model, chunk["hidden"], return_keys=return_keys)
         chunk_indices = chunk["indices"]
         chunk_steps = chunk["steps"]
 
@@ -399,6 +409,33 @@ def _merge_pruned_predictions(
         raise RuntimeError("Failed to collect predictions for the evaluated batch.")
 
     return merged_preds, merged_steps
+
+
+def _append_pruned_chunk(
+    pruned_chunks: List[Dict[str, Any]],
+    model: nn.Module,
+    active_indices: torch.Tensor,
+    carry: Any,
+    preds: Optional[Dict[str, torch.Tensor]],
+    prune_mask: torch.Tensor,
+) -> None:
+    pruned_indices = torch.nonzero(prune_mask, as_tuple=False).squeeze(-1)
+    if pruned_indices.numel() == 0:
+        return
+
+    chunk: Dict[str, Any] = {
+        "indices": active_indices[pruned_indices].detach().clone(),
+        "steps": carry.steps[prune_mask].detach(),
+    }
+
+    if hasattr(carry, "current_hidden") and _supports_hidden_pruning(model):
+        chunk["hidden"] = carry.current_hidden[prune_mask].detach()
+    else:
+        if preds is None:
+            raise RuntimeError("Model evaluation did not produce predictions for the pruned examples.")
+        chunk["outputs"] = {key: value[prune_mask].detach() for key, value in preds.items()}
+
+    pruned_chunks.append(chunk)
 
 
 def _compute_batch_metric_sums(
@@ -462,6 +499,28 @@ def _power_of_two_loop_checkpoints(loops: Optional[int]) -> List[int]:
     return checkpoints
 
 
+def _finished_fraction_by_loop(
+    completed_step_counts: Dict[int, float],
+    total_count: float,
+    loop_steps: List[int],
+) -> Dict[int, float]:
+    if total_count <= 0:
+        return {loop_step: 0.0 for loop_step in loop_steps}
+
+    sorted_step_counts = sorted((int(step), float(count)) for step, count in completed_step_counts.items())
+    finished_fraction_by_loop: Dict[int, float] = {}
+    cumulative_finished = 0.0
+    count_index = 0
+
+    for loop_step in sorted(loop_steps):
+        while count_index < len(sorted_step_counts) and sorted_step_counts[count_index][0] <= loop_step:
+            cumulative_finished += sorted_step_counts[count_index][1]
+            count_index += 1
+        finished_fraction_by_loop[loop_step] = cumulative_finished / total_count
+
+    return finished_fraction_by_loop
+
+
 def _uniform_step_value(steps: torch.Tensor) -> Optional[int]:
     if steps.numel() == 0:
         return None
@@ -485,6 +544,9 @@ def evaluate_model(
     model.eval()
 
     return_keys: Set[str] = {"preds", "logits"}
+    act_early_stop_enabled = _act_early_stop_enabled(model)
+    if act_early_stop_enabled:
+        return_keys.add("q_halt_logits")
     if save_predictions:
         return_keys.update({"q_halt_logits", "q_continue_logits"})
     metric_return_keys: Set[str] = {"preds", "logits"}
@@ -494,6 +556,8 @@ def evaluate_model(
     loop_metric_totals_by_step: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(float))
     )
+    completed_step_counts_by_set: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    completed_total_counts_by_set: Dict[str, float] = defaultdict(float)
     saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
 
     processed_batches = 0
@@ -541,7 +605,7 @@ def evaluate_model(
 
             active_batch = batch
             active_indices = torch.arange(batch_size, device=device)
-            pruned_chunks: List[Dict[str, torch.Tensor]] = []
+            pruned_chunks: List[Dict[str, Any]] = []
             preds: Optional[Dict[str, torch.Tensor]] = None
             captured_loop_checkpoints: Set[int] = set()
 
@@ -562,7 +626,7 @@ def evaluate_model(
                     and current_step in loop_checkpoints
                     and current_step not in captured_loop_checkpoints
                 ):
-                    if hidden_pruning_enabled and pruned_chunks:
+                    if pruned_chunks:
                         checkpoint_preds, checkpoint_steps = _merge_pruned_predictions(
                             model=model,
                             batch_size=batch_size,
@@ -589,36 +653,62 @@ def evaluate_model(
                         loop_metric_totals_by_step[current_step][set_name][metric_name] += metric_value
                     captured_loop_checkpoints.add(current_step)
 
+                model_halted_mask: Optional[torch.Tensor] = None
+                if hasattr(carry, "halted") and carry.halted is not None and not all_finish:
+                    model_halted_mask = carry.halted
+
+                act_pruned_mask: Optional[torch.Tensor] = model_halted_mask
+                if act_early_stop_enabled and preds is not None and not all_finish:
+                    q_halt_logits = preds.get("q_halt_logits")
+                    if q_halt_logits is None:
+                        raise RuntimeError("ACT early stopping requires q_halt_logits during evaluation.")
+                    q_halt_pruned_mask = q_halt_logits > 0
+                    act_pruned_mask = (
+                        q_halt_pruned_mask
+                        if act_pruned_mask is None
+                        else (act_pruned_mask | q_halt_pruned_mask)
+                    )
+
+                hidden_pruned_mask: Optional[torch.Tensor] = None
                 if hidden_pruning_enabled and carry_before_step is not None and not all_finish:
                     hidden_diff_norm = _hidden_diff_norm(
                         carry.current_hidden.detach(),
                         carry_before_step.current_hidden.detach(),
                     )
-                    pruned_mask = hidden_diff_norm <= hidden_diff_threshold
-                    if torch.any(pruned_mask):
-                        pruned_indices = torch.nonzero(pruned_mask, as_tuple=False).squeeze(-1)
-                        pruned_chunks.append(
-                            {
-                                "indices": active_indices[pruned_indices].detach().clone(),
-                                "hidden": carry.current_hidden[pruned_mask].detach(),
-                                "steps": carry.steps[pruned_mask].detach(),
-                            }
-                        )
+                    hidden_pruned_mask = hidden_diff_norm <= hidden_diff_threshold
 
-                        keep_indices = torch.nonzero(~pruned_mask, as_tuple=False).squeeze(-1)
-                        if keep_indices.numel() == 0:
-                            active_indices = active_indices[:0]
-                            preds = None
-                            break
+                prune_mask: Optional[torch.Tensor] = None
+                if act_pruned_mask is not None and hidden_pruned_mask is not None:
+                    prune_mask = act_pruned_mask | hidden_pruned_mask
+                elif act_pruned_mask is not None:
+                    prune_mask = act_pruned_mask
+                else:
+                    prune_mask = hidden_pruned_mask
 
-                        active_indices = active_indices[keep_indices]
-                        active_batch = {key: value.index_select(0, keep_indices) for key, value in active_batch.items()}
-                        carry = _index_structure(carry, keep_indices)
+                if prune_mask is not None and torch.any(prune_mask):
+                    _append_pruned_chunk(
+                        pruned_chunks=pruned_chunks,
+                        model=model,
+                        active_indices=active_indices,
+                        carry=carry,
+                        preds=preds,
+                        prune_mask=prune_mask,
+                    )
+
+                    keep_indices = torch.nonzero(~prune_mask, as_tuple=False).squeeze(-1)
+                    if keep_indices.numel() == 0:
+                        active_indices = active_indices[:0]
+                        preds = None
+                        break
+
+                    active_indices = active_indices[keep_indices]
+                    active_batch = {key: value.index_select(0, keep_indices) for key, value in active_batch.items()}
+                    carry = _index_structure(carry, keep_indices)
 
                 if all_finish:
                     break
 
-            if hidden_pruning_enabled and pruned_chunks:
+            if pruned_chunks:
                 preds, final_steps = _merge_pruned_predictions(
                     model=model,
                     batch_size=batch_size,
@@ -640,6 +730,13 @@ def evaluate_model(
                 final_steps=final_steps,
                 keep_mask=keep_mask,
             )
+            selected_final_steps = final_steps[keep_mask]
+            if selected_final_steps.numel() > 0:
+                unique_steps, counts = torch.unique(selected_final_steps.to(torch.int64), return_counts=True)
+                completed_total_counts_by_set[set_name] += float(selected_final_steps.numel())
+                for step_value, count_value in zip(unique_steps.tolist(), counts.tolist()):
+                    completed_step_counts_by_set[set_name][int(step_value)] += float(count_value)
+
             processed_problems += int(batch_metric_sums["count"])
             for metric_name, metric_value in batch_metric_sums.items():
                 metric_totals_by_set[set_name][metric_name] += metric_value
@@ -666,17 +763,42 @@ def evaluate_model(
     finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
 
     finalized_loop_metrics_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
+    loop_steps = sorted(loop_metric_totals_by_step)
+    finished_fraction_by_loop_by_set = {
+        set_name: _finished_fraction_by_loop(completed_step_counts, completed_total_counts_by_set[set_name], loop_steps)
+        for set_name, completed_step_counts in completed_step_counts_by_set.items()
+    }
+    overall_completed_step_counts: Dict[int, float] = defaultdict(float)
+    overall_completed_total_count = 0.0
+    for set_name, completed_step_counts in completed_step_counts_by_set.items():
+        overall_completed_total_count += completed_total_counts_by_set[set_name]
+        for step_value, count_value in completed_step_counts.items():
+            overall_completed_step_counts[step_value] += count_value
+    overall_finished_fraction_by_loop = _finished_fraction_by_loop(
+        dict(overall_completed_step_counts),
+        overall_completed_total_count,
+        loop_steps,
+    )
+
     for loop_step, metric_totals_by_set_at_step in sorted(loop_metric_totals_by_step.items()):
         finalized_loop_metrics_by_step[loop_step] = {
             set_name: _finalize_metric_totals(metric_totals)
             for set_name, metric_totals in metric_totals_by_set_at_step.items()
         }
+        for set_name, finished_fraction_by_loop in finished_fraction_by_loop_by_set.items():
+            finalized_loop_metrics_by_step[loop_step].setdefault(set_name, {})
+            finalized_loop_metrics_by_step[loop_step][set_name]["finished_fraction"] = finished_fraction_by_loop[
+                loop_step
+            ]
 
         overall_loop_totals: Dict[str, float] = defaultdict(float)
         for metric_totals in metric_totals_by_set_at_step.values():
             for key, value in metric_totals.items():
                 overall_loop_totals[key] += value
         finalized_loop_metrics_by_step[loop_step]["overall"] = _finalize_metric_totals(overall_loop_totals)
+        finalized_loop_metrics_by_step[loop_step]["overall"]["finished_fraction"] = overall_finished_fraction_by_loop[
+            loop_step
+        ]
 
     return (
         finalized_by_set,
@@ -716,7 +838,7 @@ def _default_output_path(
         if l_cycles is not None:
             stem += f"_L_cycles_{l_cycles}"
         stem += threshold_suffix
-        return Path(f"{stem}.pt")
+        return Path(f"{stem}.json")
     checkpoint_file = Path(resolved_path)
     stem = f"{checkpoint_file.stem}_evaluation_{split}"
     if max_batches is not None:
@@ -730,7 +852,11 @@ def _default_output_path(
     if l_cycles is not None:
         stem += f"_L_cycles_{l_cycles}"
     stem += threshold_suffix
-    return checkpoint_file.parent / f"{stem}.pt"
+    return checkpoint_file.parent / f"{stem}.json"
+
+
+def _sidecar_predictions_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_outputs.pt")
 
 
 def main() -> None:
@@ -750,7 +876,12 @@ def main() -> None:
         default=None,
         help="Evaluate at most this many problems. Stops exactly at the requested number.",
     )
-    parser.add_argument("--output", type=str, default=None, help="Optional .pt file to save metrics and outputs.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional path to save the evaluation summary as JSON.",
+    )
     parser.add_argument("--max_batches", type=int, default=None, help="Stop after this many batches for debugging.")
     parser.add_argument(
         "--loops",
@@ -774,7 +905,7 @@ def main() -> None:
     parser.add_argument(
         "--save_predictions",
         action="store_true",
-        help="Also save inputs, labels, preds, logits, and halt logits to the output file.",
+        help="Also save inputs, labels, preds, logits, and halt logits to a sidecar .pt file.",
     )
     parser.add_argument(
         "--hidden_diff_threshold",
@@ -879,6 +1010,8 @@ def main() -> None:
                 for key in ("accuracy", "exact_accuracy", "lm_loss"):
                     if key in metrics:
                         print(f"    {key}: {metrics[key]:.6f}")
+                if "finished_fraction" in metrics:
+                    print(f"    finished_pct: {metrics['finished_fraction'] * 100:.2f}%")
 
     output_path = (
         Path(args.output)
@@ -894,6 +1027,9 @@ def main() -> None:
             args.hidden_diff_threshold,
         )
     )
+    if output_path.suffix.lower() != ".json":
+        print(f"Warning: writing JSON summary to a path without a .json suffix: {output_path}")
+
     payload = {
         "checkpoint": resolved_checkpoint_path,
         "checkpoint_step": step,
@@ -906,17 +1042,22 @@ def main() -> None:
         "hidden_diff_threshold": args.hidden_diff_threshold,
         "max_batches": args.max_batches,
         "max_problems": args.max_problems,
+        "elapsed_time_sec": elapsed_time,
         "processed_batches": processed_batches,
         "processed_problems": processed_problems,
         "metrics": metrics_by_set,
         "power_of_two_loop_metrics": loop_metrics_by_step,
     }
-    if args.save_predictions:
-        payload["outputs"] = saved_outputs
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, output_path)
-    print(f"\nSaved evaluation results to: {output_path}")
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"\nSaved evaluation summary to: {output_path}")
+    if args.save_predictions:
+        predictions_output_path = _sidecar_predictions_output_path(output_path)
+        torch.save(saved_outputs, predictions_output_path)
+        print(f"Saved prediction tensors to: {predictions_output_path}")
 
 
 if __name__ == "__main__":
