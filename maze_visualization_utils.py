@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -96,7 +97,7 @@ def default_paths(repo_root: Path) -> Dict[str, Path]:
     checkpoint_dir = repo_root / "checkpoints" / "URM-maze"
     metrics_path = (
         checkpoint_dir
-        / "step_39060_evaluation_test_max_problems_4096_loops_32_hidden_diff_threshold_0_1.pt"
+        / "step_39060_evaluation_test_max_problems_4096_loops_32_hidden_diff_threshold_0_1.json"
     )
     detailed_path = metrics_path.with_name(f"{metrics_path.stem}_detailed.pt")
     return {
@@ -116,7 +117,20 @@ def set_plot_style() -> None:
 
 
 def load_payload(path: os.PathLike[str] | str) -> Dict[str, Any]:
-    return torch.load(Path(path), map_location="cpu")
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return torch.load(path, map_location="cpu")
+
+
+def _loop_sort_key(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    return value
 
 
 def _to_numpy(value: torch.Tensor | np.ndarray | Sequence[Any]) -> np.ndarray:
@@ -153,7 +167,10 @@ def format_metrics_table(metrics_payload: Mapping[str, Any]) -> str:
 
 def build_loop_summary(metrics_payload: Mapping[str, Any], set_name: str = "overall") -> List[Dict[str, float]]:
     rows: List[Dict[str, float]] = []
-    for loop, per_set in sorted(metrics_payload.get("power_of_two_loop_metrics", {}).items()):
+    for loop, per_set in sorted(
+        metrics_payload.get("power_of_two_loop_metrics", {}).items(),
+        key=lambda item: _loop_sort_key(item[0]),
+    ):
         if set_name not in per_set:
             continue
         row = {"loop": float(loop)}
@@ -764,4 +781,3 @@ def show_examples(
 
     fig.tight_layout()
     plt.show()
-

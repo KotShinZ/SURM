@@ -716,7 +716,7 @@ def _default_output_path(
         if l_cycles is not None:
             stem += f"_L_cycles_{l_cycles}"
         stem += threshold_suffix
-        return Path(f"{stem}.pt")
+        return Path(f"{stem}.json")
     checkpoint_file = Path(resolved_path)
     stem = f"{checkpoint_file.stem}_evaluation_{split}"
     if max_batches is not None:
@@ -730,7 +730,11 @@ def _default_output_path(
     if l_cycles is not None:
         stem += f"_L_cycles_{l_cycles}"
     stem += threshold_suffix
-    return checkpoint_file.parent / f"{stem}.pt"
+    return checkpoint_file.parent / f"{stem}.json"
+
+
+def _sidecar_predictions_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_outputs.pt")
 
 
 def main() -> None:
@@ -750,7 +754,12 @@ def main() -> None:
         default=None,
         help="Evaluate at most this many problems. Stops exactly at the requested number.",
     )
-    parser.add_argument("--output", type=str, default=None, help="Optional .pt file to save metrics and outputs.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional path to save the evaluation summary as JSON.",
+    )
     parser.add_argument("--max_batches", type=int, default=None, help="Stop after this many batches for debugging.")
     parser.add_argument(
         "--loops",
@@ -774,7 +783,7 @@ def main() -> None:
     parser.add_argument(
         "--save_predictions",
         action="store_true",
-        help="Also save inputs, labels, preds, logits, and halt logits to the output file.",
+        help="Also save inputs, labels, preds, logits, and halt logits to a sidecar .pt file.",
     )
     parser.add_argument(
         "--hidden_diff_threshold",
@@ -894,6 +903,9 @@ def main() -> None:
             args.hidden_diff_threshold,
         )
     )
+    if output_path.suffix.lower() != ".json":
+        print(f"Warning: writing JSON summary to a path without a .json suffix: {output_path}")
+
     payload = {
         "checkpoint": resolved_checkpoint_path,
         "checkpoint_step": step,
@@ -906,17 +918,22 @@ def main() -> None:
         "hidden_diff_threshold": args.hidden_diff_threshold,
         "max_batches": args.max_batches,
         "max_problems": args.max_problems,
+        "elapsed_time_sec": elapsed_time,
         "processed_batches": processed_batches,
         "processed_problems": processed_problems,
         "metrics": metrics_by_set,
         "power_of_two_loop_metrics": loop_metrics_by_step,
     }
-    if args.save_predictions:
-        payload["outputs"] = saved_outputs
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, output_path)
-    print(f"\nSaved evaluation results to: {output_path}")
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"\nSaved evaluation summary to: {output_path}")
+    if args.save_predictions:
+        predictions_output_path = _sidecar_predictions_output_path(output_path)
+        torch.save(saved_outputs, predictions_output_path)
+        print(f"Saved prediction tensors to: {predictions_output_path}")
 
 
 if __name__ == "__main__":
