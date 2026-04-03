@@ -51,6 +51,7 @@ class URMConfig(BaseModel):
     norm_diff_max: float = 0.2
     norm_diff_min: float = 0.1
     diff_L_loss_enabled: bool = False
+    halt_norm_in_use_act: bool = False
 
 
 class URMBlock(nn.Module):
@@ -326,7 +327,7 @@ class URM(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
-                if self.config.use_act == False and self.training == True:  
+                if (self.config.use_act == False or self.config.halt_norm_in_use_act == True) and self.training == True:  
                     #print("Hidden diff norm:", hidden_diff_norm)
                     norm_diff_max = self.config.norm_diff_max
                     norm_diff_min = self.config.norm_diff_min
