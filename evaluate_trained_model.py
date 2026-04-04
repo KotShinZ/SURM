@@ -175,6 +175,14 @@ def create_model_for_evaluation(config: PretrainConfig, metadata, device: torch.
     model = model_cls(model_cfg)
     model = loss_head_cls(model, **(config.arch.loss.__pydantic_extra__ or {}))
     model = model.to(device)
+    model_config = getattr(getattr(model, "model", None), "config", None)
+    should_compile = (
+        device.type == "cuda"
+        and "DISABLE_COMPILE" not in os.environ
+        and (model_config is None or not getattr(model_config, "profile", False))
+    )
+    if should_compile:
+        model = torch.compile(model, dynamic=False)  # type: ignore[assignment]
     return model
 
 
