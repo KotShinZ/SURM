@@ -581,6 +581,8 @@ def evaluate_model(
         and hidden_diff_threshold > 0
         and _supports_hidden_pruning(model)
     )
+    print("hidden_pruning_enabled:", hidden_pruning_enabled, ", hidden_diff_threshold:", hidden_diff_threshold)
+    print("ACT early stopping enabled:", act_early_stop_enabled)
     if hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
         print("Hidden-state pruning is not supported by this model; running standard evaluation.")
 
