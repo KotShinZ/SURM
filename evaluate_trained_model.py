@@ -23,6 +23,10 @@ from tqdm import tqdm
 from models.losses import IGNORE_LABEL_ID
 from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
+from evaluators.arc_majority_vote import (
+    default_arc_submission_dir,
+    maybe_create_arc_majority_vote_evaluator,
+)
 
 
 class LossConfig(pydantic.BaseModel):
@@ -579,6 +583,7 @@ def evaluate_model(
     save_predictions: bool,
     hidden_diff_threshold: Optional[float],
     loop_checkpoints: Optional[List[int]] = None,
+    arc_majority_evaluator: Optional[Any] = None,
 ) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
     model.eval()
 
@@ -588,6 +593,8 @@ def evaluate_model(
         return_keys.add("q_halt_logits")
     if save_predictions:
         return_keys.update({"q_halt_logits", "q_continue_logits"})
+    if arc_majority_evaluator is not None:
+        return_keys.update(arc_majority_evaluator.required_outputs)
     metric_return_keys: Set[str] = {"preds", "logits"}
     loop_checkpoints = sorted(set(loop_checkpoints or []))
 
@@ -781,6 +788,14 @@ def evaluate_model(
             processed_problems += int(batch_metric_sums["count"])
             for metric_name, metric_value in batch_metric_sums.items():
                 metric_totals_by_set[set_name][metric_name] += metric_value
+
+            if arc_majority_evaluator is not None:
+                kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+                if kept_indices.numel() > 0:
+                    arc_majority_evaluator.update_batch(
+                        _index_structure(batch, kept_indices),
+                        _index_structure(preds, kept_indices),
+                    )
 
             if save_predictions:
                 for key, value in batch.items():
@@ -1003,6 +1018,13 @@ def main() -> None:
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
+    arc_majority_evaluator = maybe_create_arc_majority_vote_evaluator(
+        data_path=config.data_path,
+        eval_metadata=metadata,
+        split=args.split,
+    )
+    if arc_majority_evaluator is not None:
+        print("Detected ARC dataset; enabling ARC majority-vote evaluation.")
     effective_loops = _get_effective_loop_count(config)
     loop_checkpoints = _power_of_two_loop_checkpoints(effective_loops)
     if loop_checkpoints:
@@ -1028,9 +1050,30 @@ def main() -> None:
         save_predictions=args.save_predictions,
         hidden_diff_threshold=args.hidden_diff_threshold,
         loop_checkpoints=loop_checkpoints,
+        arc_majority_evaluator=arc_majority_evaluator,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
+
+    output_path = (
+        Path(args.output)
+        if args.output is not None
+        else _default_output_path(
+            args.checkpoint,
+            args.split,
+            args.max_batches,
+            args.max_problems,
+            args.loops,
+            args.H_cycles,
+            args.L_cycles,
+            args.hidden_diff_threshold,
+        )
+    )
+    arc_majority_vote_metrics: Optional[Dict[str, float]] = None
+    arc_submission_dir: Optional[Path] = None
+    if arc_majority_evaluator is not None:
+        arc_submission_dir = default_arc_submission_dir(output_path)
+        arc_majority_vote_metrics = arc_majority_evaluator.result(str(arc_submission_dir))
 
     print("")
     print(f"Evaluation completed in {elapsed_time:.2f} seconds.")
@@ -1055,21 +1098,13 @@ def main() -> None:
                         print(f"    {key}: {metrics[key]:.6f}")
                 if "finished_fraction" in metrics:
                     print(f"    finished_pct: {metrics['finished_fraction'] * 100:.2f}%")
-
-    output_path = (
-        Path(args.output)
-        if args.output is not None
-        else _default_output_path(
-            args.checkpoint,
-            args.split,
-            args.max_batches,
-            args.max_problems,
-            args.loops,
-            args.H_cycles,
-            args.L_cycles,
-            args.hidden_diff_threshold,
-        )
-    )
+    if arc_majority_vote_metrics:
+        print("")
+        print("ARC majority-vote metrics:")
+        for key, value in sorted(arc_majority_vote_metrics.items()):
+            print(f"  {key}: {value:.6f}")
+        if arc_submission_dir is not None:
+            print(f"ARC submission saved to: {arc_submission_dir / 'submission.json'}")
     if output_path.suffix.lower() != ".json":
         print(f"Warning: writing JSON summary to a path without a .json suffix: {output_path}")
 
@@ -1090,6 +1125,8 @@ def main() -> None:
         "processed_problems": processed_problems,
         "metrics": metrics_by_set,
         "power_of_two_loop_metrics": loop_metrics_by_step,
+        "arc_majority_vote_metrics": arc_majority_vote_metrics,
+        "arc_majority_vote_submission_dir": None if arc_submission_dir is None else str(arc_submission_dir),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
