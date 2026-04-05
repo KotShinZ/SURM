@@ -78,6 +78,37 @@ class PretrainConfig(pydantic.BaseModel):
     masked_input: Optional[MaskedInputConfig] = None
 
 
+def _ensure_arch_extra(config: PretrainConfig) -> Dict[str, Any]:
+    if config.arch.__pydantic_extra__ is None:
+        config.arch.__pydantic_extra__ = {}
+    return config.arch.__pydantic_extra__
+
+
+def _loop_count_config_key(config: PretrainConfig) -> str:
+    arch_extra = config.arch.__pydantic_extra__ or {}
+    if "halt_max_steps" in arch_extra:
+        return "halt_max_steps"
+    return "loops"
+
+
+def _set_effective_loop_count(config: PretrainConfig, loops: int) -> str:
+    arch_extra = _ensure_arch_extra(config)
+    loop_key = _loop_count_config_key(config)
+    arch_extra[loop_key] = loops
+    return loop_key
+
+
+def _get_effective_loop_count(config: PretrainConfig) -> Optional[int]:
+    arch_extra = config.arch.__pydantic_extra__ or {}
+    loop_key = _loop_count_config_key(config)
+    loop_value = arch_extra.get(loop_key)
+    if loop_value is None and loop_key != "loops":
+        loop_value = arch_extra.get("loops")
+    if loop_value is None and loop_key != "halt_max_steps":
+        loop_value = arch_extra.get("halt_max_steps")
+    return None if loop_value is None else int(loop_value)
+
+
 def _resolve_checkpoint_path(path: str) -> Optional[str]:
     if os.path.isfile(path):
         return path
@@ -318,7 +349,7 @@ def _supports_hidden_pruning(model: nn.Module) -> bool:
 def _act_early_stop_enabled(model: nn.Module) -> bool:
     base_model = _unwrap_eval_model(model)
     config = getattr(base_model, "config", None)
-    return bool(getattr(config, "use_act", False))
+    return bool(getattr(config, "act_inference", False) or getattr(config, "eval_act_early_stop", False))
 
 
 def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
@@ -941,10 +972,9 @@ def main() -> None:
         config.data_path = args.data_path
     if args.batch_size is not None:
         config.global_batch_size = args.batch_size
+    loop_override_key: Optional[str] = None
     if args.loops is not None:
-        if config.arch.__pydantic_extra__ is None:
-            config.arch.__pydantic_extra__ = {}
-        config.arch.__pydantic_extra__["loops"] = args.loops
+        loop_override_key = _set_effective_loop_count(config, args.loops)
     if args.H_cycles is not None:
         if config.arch.__pydantic_extra__ is None:
             config.arch.__pydantic_extra__ = {}
@@ -960,7 +990,10 @@ def main() -> None:
     if args.max_problems is not None:
         print(f"Evaluating at most {args.max_problems} problems")
     if args.loops is not None:
-        print(f"Overriding loops to: {args.loops}")
+        if loop_override_key == "halt_max_steps":
+            print(f"Overriding loops to: {args.loops} (via halt_max_steps)")
+        else:
+            print(f"Overriding loops to: {args.loops}")
     if args.H_cycles is not None:
         print(f"Overriding H_cycles to: {args.H_cycles}")
     if args.L_cycles is not None:
@@ -970,7 +1003,7 @@ def main() -> None:
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
-    effective_loops = (config.arch.__pydantic_extra__ or {}).get("loops")
+    effective_loops = _get_effective_loop_count(config)
     loop_checkpoints = _power_of_two_loop_checkpoints(effective_loops)
     if loop_checkpoints:
         print(f"Reporting intermediate metrics at power-of-two loops: {loop_checkpoints}")
@@ -1046,7 +1079,7 @@ def main() -> None:
         "data_path": config.data_path,
         "split": args.split,
         "batch_size": config.global_batch_size,
-        "loops": (config.arch.__pydantic_extra__ or {}).get("loops"),
+        "loops": effective_loops,
         "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
         "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
         "hidden_diff_threshold": args.hidden_diff_threshold,
