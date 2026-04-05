@@ -23,7 +23,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     num_aug: int = 1000
 
-    test_ratio: float = 0.04
+    test_ratio: float = 0.2
     min_test_per_task: int = 2
 
     @model_validator(mode="after")
