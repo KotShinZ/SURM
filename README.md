@@ -106,6 +106,20 @@ bash scripts/URM_arcagi2.sh
 bash scripts/URM_sudoku.sh
 ```
 
+## eval
+```bash
+python evaluate_trained_model.py \
+  --checkpoint checkpoints/save/Sudoku/URM/all/default \
+  --split test \
+  --device cuda \
+  --batch_size 4096 \
+  --loops 8192 \
+  --hidden_diff_threshold 0.1 \
+  --active_batch_strategy refill
+  # --max_problems 1536 \
+  # --active_batch_strategy  shrink
+```
+
 ### Citation
 ```
 @misc{gao2025universalreasoningmodel,

@@ -5,10 +5,10 @@ import json
 import math
 import os
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set
 import time
 
 import pydantic
@@ -306,13 +306,24 @@ def _concat_saved_outputs(saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]
     concatenated: Dict[str, Dict[str, torch.Tensor]] = {}
     for set_name, per_set_outputs in saved_outputs.items():
         concatenated[set_name] = {}
+        order_tensors = per_set_outputs.get("__order__")
+        sort_indices: Optional[torch.Tensor] = None
+        if order_tensors:
+            concatenated_orders = torch.cat(order_tensors, dim=0)
+            sort_indices = torch.argsort(concatenated_orders)
+
         for key, tensors in per_set_outputs.items():
-            concatenated[set_name][key] = torch.cat(tensors, dim=0) if tensors else torch.empty(0)
+            if key == "__order__":
+                continue
+            concatenated_tensor = torch.cat(tensors, dim=0) if tensors else torch.empty(0)
+            if sort_indices is not None and concatenated_tensor.shape[0] == sort_indices.shape[0]:
+                concatenated_tensor = concatenated_tensor.index_select(0, sort_indices)
+            concatenated[set_name][key] = concatenated_tensor
     return concatenated
 
 
 def _estimate_total_batches(dataloader: DataLoader) -> Optional[int]:
-    dataset = dataloader.dataset
+    dataset = getattr(dataloader, "dataset", None)
     if not isinstance(dataset, PuzzleDataset):
         return None
 
@@ -370,6 +381,50 @@ def _index_structure(obj: Any, indices: torch.Tensor) -> Any:
     if is_dataclass(obj):
         return type(obj)(**{field.name: _index_structure(getattr(obj, field.name), indices) for field in fields(obj)})
     return obj
+
+
+def _concat_structure(*objs: Any) -> Any:
+    non_null_objs = [obj for obj in objs if obj is not None]
+    if not non_null_objs:
+        return None
+
+    first = non_null_objs[0]
+    if torch.is_tensor(first):
+        return torch.cat(non_null_objs, dim=0)
+    if isinstance(first, dict):
+        return {
+            key: _concat_structure(*(obj[key] for obj in non_null_objs))
+            for key in first
+        }
+    if isinstance(first, tuple):
+        concatenated_items = tuple(
+            _concat_structure(*(obj[index] for obj in non_null_objs))
+            for index in range(len(first))
+        )
+        if hasattr(first, "_fields"):
+            return type(first)(*concatenated_items)
+        return concatenated_items
+    if isinstance(first, list):
+        return [
+            _concat_structure(*(obj[index] for obj in non_null_objs))
+            for index in range(len(first))
+        ]
+    if is_dataclass(first):
+        return type(first)(
+            **{
+                field.name: _concat_structure(*(getattr(obj, field.name) for obj in non_null_objs))
+                for field in fields(first)
+            }
+        )
+    return first
+
+
+def _slice_tensor_batch(
+    batch: Dict[str, torch.Tensor],
+    start: int,
+    end: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    return {key: value[start:end] for key, value in batch.items()}
 
 
 def _run_heads_from_hidden(
@@ -526,6 +581,137 @@ def _compute_batch_metric_sums(
     }
 
 
+def _accumulate_metric_sums_by_set_ids(
+    metric_totals_by_set: Dict[str, Dict[str, float]],
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor],
+    final_steps: torch.Tensor,
+    set_ids: torch.Tensor,
+    set_names: List[str],
+) -> None:
+    if set_ids.numel() == 0:
+        return
+
+    unique_set_ids = torch.unique(set_ids.to(torch.int64), sorted=True)
+    for set_id in unique_set_ids.tolist():
+        set_mask = set_ids == set_id
+        metric_sums = _compute_batch_metric_sums(
+            model=model,
+            batch=batch,
+            preds=preds,
+            final_steps=final_steps,
+            keep_mask=set_mask,
+        )
+        for metric_name, metric_value in metric_sums.items():
+            metric_totals_by_set[set_names[set_id]][metric_name] += metric_value
+
+
+def _accumulate_completed_steps_by_set_ids(
+    completed_step_counts_by_set: Dict[str, Dict[int, float]],
+    completed_total_counts_by_set: Dict[str, float],
+    final_steps: torch.Tensor,
+    set_ids: torch.Tensor,
+    set_names: List[str],
+) -> None:
+    if final_steps.numel() == 0:
+        return
+
+    unique_set_ids = torch.unique(set_ids.to(torch.int64), sorted=True)
+    for set_id in unique_set_ids.tolist():
+        set_name = set_names[set_id]
+        set_steps = final_steps[set_ids == set_id]
+        if set_steps.numel() == 0:
+            continue
+
+        unique_steps, counts = torch.unique(set_steps.to(torch.int64), return_counts=True)
+        completed_total_counts_by_set[set_name] += float(set_steps.numel())
+        for step_value, count_value in zip(unique_steps.tolist(), counts.tolist()):
+            completed_step_counts_by_set[set_name][int(step_value)] += float(count_value)
+
+
+def _append_saved_output_records(
+    saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]],
+    batch: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor],
+    set_ids: torch.Tensor,
+    set_names: List[str],
+    orders: torch.Tensor,
+) -> None:
+    if set_ids.numel() == 0:
+        return
+
+    unique_set_ids = torch.unique(set_ids.to(torch.int64), sorted=True)
+    for set_id in unique_set_ids.tolist():
+        set_mask = set_ids == set_id
+        set_name = set_names[set_id]
+        saved_outputs[set_name]["__order__"].append(orders[set_mask].detach().cpu())
+        for key, value in batch.items():
+            if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs"}:
+                saved_outputs[set_name][key].append(value[set_mask].detach().cpu())
+        for key, value in preds.items():
+            saved_outputs[set_name][key].append(value[set_mask].detach().cpu())
+
+
+def _finalize_evaluation_outputs(
+    metric_totals_by_set: Dict[str, Dict[str, float]],
+    loop_metric_totals_by_step: Dict[int, Dict[str, Dict[str, float]]],
+    completed_step_counts_by_set: Dict[str, Dict[int, float]],
+    completed_total_counts_by_set: Dict[str, float],
+    saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]],
+) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]]]:
+    finalized_by_set = {
+        set_name: _finalize_metric_totals(metric_totals)
+        for set_name, metric_totals in metric_totals_by_set.items()
+    }
+
+    overall_totals: Dict[str, float] = defaultdict(float)
+    for metric_totals in metric_totals_by_set.values():
+        for key, value in metric_totals.items():
+            overall_totals[key] += value
+    finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
+
+    finalized_loop_metrics_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
+    loop_steps = sorted(loop_metric_totals_by_step)
+    finished_fraction_by_loop_by_set = {
+        set_name: _finished_fraction_by_loop(completed_step_counts, completed_total_counts_by_set[set_name], loop_steps)
+        for set_name, completed_step_counts in completed_step_counts_by_set.items()
+    }
+    overall_completed_step_counts: Dict[int, float] = defaultdict(float)
+    overall_completed_total_count = 0.0
+    for set_name, completed_step_counts in completed_step_counts_by_set.items():
+        overall_completed_total_count += completed_total_counts_by_set[set_name]
+        for step_value, count_value in completed_step_counts.items():
+            overall_completed_step_counts[step_value] += count_value
+    overall_finished_fraction_by_loop = _finished_fraction_by_loop(
+        dict(overall_completed_step_counts),
+        overall_completed_total_count,
+        loop_steps,
+    )
+
+    for loop_step, metric_totals_by_set_at_step in sorted(loop_metric_totals_by_step.items()):
+        finalized_loop_metrics_by_step[loop_step] = {
+            set_name: _finalize_metric_totals(metric_totals)
+            for set_name, metric_totals in metric_totals_by_set_at_step.items()
+        }
+        for set_name, finished_fraction_by_loop in finished_fraction_by_loop_by_set.items():
+            finalized_loop_metrics_by_step[loop_step].setdefault(set_name, {})
+            finalized_loop_metrics_by_step[loop_step][set_name]["finished_fraction"] = finished_fraction_by_loop[
+                loop_step
+            ]
+
+        overall_loop_totals: Dict[str, float] = defaultdict(float)
+        for metric_totals in metric_totals_by_set_at_step.values():
+            for key, value in metric_totals.items():
+                overall_loop_totals[key] += value
+        finalized_loop_metrics_by_step[loop_step]["overall"] = _finalize_metric_totals(overall_loop_totals)
+        finalized_loop_metrics_by_step[loop_step]["overall"]["finished_fraction"] = overall_finished_fraction_by_loop[
+            loop_step
+        ]
+
+    return finalized_by_set, finalized_loop_metrics_by_step, _concat_saved_outputs(saved_outputs)
+
+
 def _power_of_two_loop_checkpoints(loops: Optional[int]) -> List[int]:
     if loops is None or loops < 1:
         return []
@@ -570,7 +756,7 @@ def _uniform_step_value(steps: torch.Tensor) -> Optional[int]:
     return None
 
 
-def evaluate_model(
+def _evaluate_model_shrink(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
@@ -792,62 +978,483 @@ def evaluate_model(
             if max_problems is not None and processed_problems >= max_problems:
                 break
 
-    finalized_by_set = {
-        set_name: _finalize_metric_totals(metric_totals)
-        for set_name, metric_totals in metric_totals_by_set.items()
-    }
-
-    overall_totals: Dict[str, float] = defaultdict(float)
-    for metric_totals in metric_totals_by_set.values():
-        for key, value in metric_totals.items():
-            overall_totals[key] += value
-    finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
-
-    finalized_loop_metrics_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
-    loop_steps = sorted(loop_metric_totals_by_step)
-    finished_fraction_by_loop_by_set = {
-        set_name: _finished_fraction_by_loop(completed_step_counts, completed_total_counts_by_set[set_name], loop_steps)
-        for set_name, completed_step_counts in completed_step_counts_by_set.items()
-    }
-    overall_completed_step_counts: Dict[int, float] = defaultdict(float)
-    overall_completed_total_count = 0.0
-    for set_name, completed_step_counts in completed_step_counts_by_set.items():
-        overall_completed_total_count += completed_total_counts_by_set[set_name]
-        for step_value, count_value in completed_step_counts.items():
-            overall_completed_step_counts[step_value] += count_value
-    overall_finished_fraction_by_loop = _finished_fraction_by_loop(
-        dict(overall_completed_step_counts),
-        overall_completed_total_count,
-        loop_steps,
+    finalized_by_set, finalized_loop_metrics_by_step, finalized_saved_outputs = _finalize_evaluation_outputs(
+        metric_totals_by_set=metric_totals_by_set,
+        loop_metric_totals_by_step=loop_metric_totals_by_step,
+        completed_step_counts_by_set=completed_step_counts_by_set,
+        completed_total_counts_by_set=completed_total_counts_by_set,
+        saved_outputs=saved_outputs,
     )
-
-    for loop_step, metric_totals_by_set_at_step in sorted(loop_metric_totals_by_step.items()):
-        finalized_loop_metrics_by_step[loop_step] = {
-            set_name: _finalize_metric_totals(metric_totals)
-            for set_name, metric_totals in metric_totals_by_set_at_step.items()
-        }
-        for set_name, finished_fraction_by_loop in finished_fraction_by_loop_by_set.items():
-            finalized_loop_metrics_by_step[loop_step].setdefault(set_name, {})
-            finalized_loop_metrics_by_step[loop_step][set_name]["finished_fraction"] = finished_fraction_by_loop[
-                loop_step
-            ]
-
-        overall_loop_totals: Dict[str, float] = defaultdict(float)
-        for metric_totals in metric_totals_by_set_at_step.values():
-            for key, value in metric_totals.items():
-                overall_loop_totals[key] += value
-        finalized_loop_metrics_by_step[loop_step]["overall"] = _finalize_metric_totals(overall_loop_totals)
-        finalized_loop_metrics_by_step[loop_step]["overall"]["finished_fraction"] = overall_finished_fraction_by_loop[
-            loop_step
-        ]
 
     return (
         finalized_by_set,
         finalized_loop_metrics_by_step,
-        _concat_saved_outputs(saved_outputs),
+        finalized_saved_outputs,
         processed_batches,
         processed_problems,
     )
+
+
+def _evaluate_model_refill(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_problems: Optional[int],
+    max_batches: Optional[int],
+    save_predictions: bool,
+    hidden_diff_threshold: Optional[float],
+    loop_checkpoints: Optional[List[int]] = None,
+) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
+    model.eval()
+
+    return_keys: Set[str] = {"preds", "logits"}
+    act_early_stop_enabled = _act_early_stop_enabled(model)
+    if act_early_stop_enabled:
+        return_keys.add("q_halt_logits")
+    if save_predictions:
+        return_keys.update({"q_halt_logits", "q_continue_logits"})
+    loop_checkpoints = sorted(set(loop_checkpoints or []))
+
+    metric_totals_by_set: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    loop_metric_totals_by_step: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(float))
+    )
+    completed_step_counts_by_set: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    completed_total_counts_by_set: Dict[str, float] = defaultdict(float)
+    saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
+
+    processed_batches = 0
+    processed_problems = 0
+    scheduled_problems = 0
+    progress_total = _estimate_total_batches(dataloader)
+    if progress_total is not None and max_batches is not None:
+        progress_total = min(progress_total, max_batches)
+    dataset_config = getattr(getattr(dataloader, "dataset", None), "config", None)
+    if progress_total is not None and max_problems is not None and dataset_config is not None:
+        progress_total = min(progress_total, math.ceil(max_problems / dataset_config.global_batch_size))
+
+    hidden_pruning_enabled = (
+        hidden_diff_threshold is not None
+        and hidden_diff_threshold > 0
+        and _supports_hidden_pruning(model)
+    )
+    print("hidden_pruning_enabled:", hidden_pruning_enabled, ", hidden_diff_threshold:", hidden_diff_threshold)
+    print("ACT early stopping enabled:", act_early_stop_enabled)
+    if hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
+        print("Hidden-state pruning is not supported by this model; running standard evaluation.")
+
+    set_name_to_id: Dict[str, int] = {}
+    set_names: List[str] = []
+    next_saved_order_by_set_id: Dict[int, int] = defaultdict(int)
+    pending_chunks: Deque[Dict[str, Any]] = deque()
+    dataloader_iter = iter(dataloader)
+    source_exhausted = False
+
+    target_batch_size = None
+    if dataset_config is not None:
+        target_batch_size = int(dataset_config.global_batch_size)
+
+    active_batch: Optional[Dict[str, torch.Tensor]] = None
+    active_set_ids = torch.empty((0,), dtype=torch.int64, device=device)
+    active_orders = torch.empty((0,), dtype=torch.int64, device=device)
+    active_next_checkpoint_indices = torch.empty((0,), dtype=torch.int64, device=device)
+    carry: Any = None
+    checkpoint_steps_tensor = (
+        torch.tensor(loop_checkpoints, dtype=torch.int64, device=device)
+        if loop_checkpoints
+        else None
+    )
+
+    def _get_set_id(set_name: str) -> int:
+        set_id = set_name_to_id.get(set_name)
+        if set_id is not None:
+            return set_id
+
+        set_id = len(set_names)
+        set_name_to_id[set_name] = set_id
+        set_names.append(set_name)
+        return set_id
+
+    def _enqueue_next_source_batch() -> bool:
+        nonlocal processed_batches, scheduled_problems, source_exhausted, target_batch_size
+
+        while True:
+            if source_exhausted:
+                return False
+            if max_batches is not None and processed_batches >= max_batches:
+                source_exhausted = True
+                return False
+            if max_problems is not None and scheduled_problems >= max_problems:
+                source_exhausted = True
+                return False
+
+            try:
+                set_name, batch, _global_batch_size = next(dataloader_iter)
+            except StopIteration:
+                source_exhausted = True
+                return False
+
+            processed_batches += 1
+            progress_bar.update(1)
+
+            current_batch_size = int(batch["inputs"].shape[0])
+            target_batch_size = current_batch_size if target_batch_size is None else max(target_batch_size, current_batch_size)
+
+            valid_example_mask = _valid_example_mask(batch["labels"])
+            keep_mask = valid_example_mask.clone()
+            if max_problems is not None:
+                remaining = max_problems - scheduled_problems
+                if remaining <= 0:
+                    source_exhausted = True
+                    return False
+                valid_indices = torch.nonzero(valid_example_mask, as_tuple=False).squeeze(-1)
+                if valid_indices.numel() > remaining:
+                    keep_mask = torch.zeros_like(valid_example_mask)
+                    keep_mask[valid_indices[:remaining]] = True
+
+            keep_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+            if keep_indices.numel() == 0:
+                continue
+
+            kept_batch = {
+                key: value.index_select(0, keep_indices).to(device, non_blocking=True)
+                for key, value in batch.items()
+            }
+            set_id = _get_set_id(set_name)
+            start_order = next_saved_order_by_set_id[set_id]
+            kept_count = int(keep_indices.numel())
+            orders = torch.arange(start_order, start_order + kept_count, dtype=torch.int64, device=device)
+            next_saved_order_by_set_id[set_id] += kept_count
+
+            pending_chunks.append(
+                {
+                    "set_id": set_id,
+                    "batch": kept_batch,
+                    "orders": orders,
+                }
+            )
+            scheduled_problems += kept_count
+            if max_problems is not None and scheduled_problems >= max_problems:
+                source_exhausted = True
+            return True
+
+    def _top_off_active_batch() -> None:
+        nonlocal active_batch, active_set_ids, active_orders, active_next_checkpoint_indices, carry
+
+        while True:
+            current_active_size = 0 if active_batch is None else int(active_batch["inputs"].shape[0])
+            effective_target_size = target_batch_size or current_active_size
+            if effective_target_size > 0 and current_active_size >= effective_target_size:
+                return
+
+            if not pending_chunks and not _enqueue_next_source_batch():
+                return
+            if not pending_chunks:
+                return
+
+            current_active_size = 0 if active_batch is None else int(active_batch["inputs"].shape[0])
+            effective_target_size = target_batch_size or current_active_size or int(pending_chunks[0]["batch"]["inputs"].shape[0])
+            slots_to_fill = effective_target_size - current_active_size
+            if slots_to_fill <= 0:
+                return
+
+            chunk = pending_chunks[0]
+            chunk_size = int(chunk["batch"]["inputs"].shape[0])
+            take = min(slots_to_fill, chunk_size)
+            taken_batch = _slice_tensor_batch(chunk["batch"], 0, take)
+            taken_orders = chunk["orders"][:take]
+            taken_set_ids = torch.full((take,), chunk["set_id"], dtype=torch.int64, device=device)
+
+            if take == chunk_size:
+                pending_chunks.popleft()
+            else:
+                chunk["batch"] = _slice_tensor_batch(chunk["batch"], take, None)
+                chunk["orders"] = chunk["orders"][take:]
+
+            with torch.device(str(device)):
+                new_carry = model.initial_carry(taken_batch)  # type: ignore[misc]
+
+            new_next_checkpoint_indices = torch.zeros((take,), dtype=torch.int64, device=device)
+            if active_batch is None:
+                active_batch = taken_batch
+                carry = new_carry
+                active_set_ids = taken_set_ids
+                active_orders = taken_orders
+                active_next_checkpoint_indices = new_next_checkpoint_indices
+            else:
+                active_batch = _concat_structure(active_batch, taken_batch)
+                carry = _concat_structure(carry, new_carry)
+                active_set_ids = torch.cat((active_set_ids, taken_set_ids), dim=0)
+                active_orders = torch.cat((active_orders, taken_orders), dim=0)
+                active_next_checkpoint_indices = torch.cat(
+                    (active_next_checkpoint_indices, new_next_checkpoint_indices),
+                    dim=0,
+                )
+
+    def _record_loop_checkpoint_hits(preds: Dict[str, torch.Tensor], current_steps: torch.Tensor) -> None:
+        nonlocal active_next_checkpoint_indices
+
+        if active_batch is None or checkpoint_steps_tensor is None or active_next_checkpoint_indices.numel() == 0:
+            return
+
+        eligible_mask = active_next_checkpoint_indices < checkpoint_steps_tensor.numel()
+        if not torch.any(eligible_mask):
+            return
+
+        expected_steps = checkpoint_steps_tensor.index_select(
+            0,
+            active_next_checkpoint_indices.clamp(max=checkpoint_steps_tensor.numel() - 1),
+        )
+        hit_mask = eligible_mask & (current_steps.to(torch.int64) == expected_steps)
+        if not torch.any(hit_mask):
+            return
+
+        hit_checkpoint_indices = torch.unique(active_next_checkpoint_indices[hit_mask], sorted=True).tolist()
+        for checkpoint_index in hit_checkpoint_indices:
+            checkpoint_mask = hit_mask & (active_next_checkpoint_indices == checkpoint_index)
+            checkpoint_step = loop_checkpoints[checkpoint_index]
+            checkpoint_batch = {
+                key: value[checkpoint_mask]
+                for key, value in active_batch.items()
+            }
+            checkpoint_preds = {
+                key: value[checkpoint_mask]
+                for key, value in preds.items()
+            }
+            checkpoint_steps = current_steps[checkpoint_mask]
+            checkpoint_set_ids = active_set_ids[checkpoint_mask]
+            _accumulate_metric_sums_by_set_ids(
+                metric_totals_by_set=loop_metric_totals_by_step[checkpoint_step],
+                model=model,
+                batch=checkpoint_batch,
+                preds=checkpoint_preds,
+                final_steps=checkpoint_steps,
+                set_ids=checkpoint_set_ids,
+                set_names=set_names,
+            )
+
+        active_next_checkpoint_indices = active_next_checkpoint_indices + hit_mask.to(torch.int64)
+
+    def _finalize_examples(
+        finalize_mask: torch.Tensor,
+        preds: Dict[str, torch.Tensor],
+        final_steps: torch.Tensor,
+    ) -> None:
+        nonlocal processed_problems
+
+        if active_batch is None or not torch.any(finalize_mask):
+            return
+
+        finalized_batch = {
+            key: value[finalize_mask]
+            for key, value in active_batch.items()
+        }
+        finalized_preds = {
+            key: value[finalize_mask]
+            for key, value in preds.items()
+        }
+        finalized_steps = final_steps[finalize_mask]
+        finalized_set_ids = active_set_ids[finalize_mask]
+        finalized_orders = active_orders[finalize_mask]
+        finalized_next_checkpoint_indices = active_next_checkpoint_indices[finalize_mask]
+
+        _accumulate_metric_sums_by_set_ids(
+            metric_totals_by_set=metric_totals_by_set,
+            model=model,
+            batch=finalized_batch,
+            preds=finalized_preds,
+            final_steps=finalized_steps,
+            set_ids=finalized_set_ids,
+            set_names=set_names,
+        )
+        _accumulate_completed_steps_by_set_ids(
+            completed_step_counts_by_set=completed_step_counts_by_set,
+            completed_total_counts_by_set=completed_total_counts_by_set,
+            final_steps=finalized_steps,
+            set_ids=finalized_set_ids,
+            set_names=set_names,
+        )
+        if save_predictions:
+            _append_saved_output_records(
+                saved_outputs=saved_outputs,
+                batch=finalized_batch,
+                preds=finalized_preds,
+                set_ids=finalized_set_ids,
+                set_names=set_names,
+                orders=finalized_orders,
+            )
+
+        for checkpoint_index, checkpoint_step in enumerate(loop_checkpoints):
+            remaining_checkpoint_mask = finalized_next_checkpoint_indices <= checkpoint_index
+            if not torch.any(remaining_checkpoint_mask):
+                continue
+
+            checkpoint_batch = {
+                key: value[remaining_checkpoint_mask]
+                for key, value in finalized_batch.items()
+            }
+            checkpoint_preds = {
+                key: value[remaining_checkpoint_mask]
+                for key, value in finalized_preds.items()
+            }
+            checkpoint_steps = finalized_steps[remaining_checkpoint_mask]
+            checkpoint_set_ids = finalized_set_ids[remaining_checkpoint_mask]
+            _accumulate_metric_sums_by_set_ids(
+                metric_totals_by_set=loop_metric_totals_by_step[checkpoint_step],
+                model=model,
+                batch=checkpoint_batch,
+                preds=checkpoint_preds,
+                final_steps=checkpoint_steps,
+                set_ids=checkpoint_set_ids,
+                set_names=set_names,
+            )
+
+        processed_problems += int(finalized_steps.numel())
+
+    progress_bar = tqdm(total=progress_total, desc="Evaluating")
+    try:
+        with torch.inference_mode():
+            while True:
+                _top_off_active_batch()
+                if active_batch is None:
+                    break
+
+                carry_before_step = None
+                if hidden_pruning_enabled and hasattr(carry, "current_hidden"):
+                    carry_before_step = carry
+
+                carry, _loss, _metrics, preds, all_finish = model(
+                    carry=carry,
+                    batch=active_batch,
+                    return_keys=return_keys,
+                )
+                if preds is None:
+                    raise RuntimeError("Model evaluation did not produce predictions for the active batch.")
+
+                _record_loop_checkpoint_hits(preds=preds, current_steps=carry.steps)
+
+                model_halted_mask: Optional[torch.Tensor] = None
+                if hasattr(carry, "halted") and carry.halted is not None and not all_finish:
+                    model_halted_mask = carry.halted
+
+                act_pruned_mask: Optional[torch.Tensor] = model_halted_mask
+                if act_early_stop_enabled and not all_finish:
+                    q_halt_logits = preds.get("q_halt_logits")
+                    if q_halt_logits is None:
+                        raise RuntimeError("ACT early stopping requires q_halt_logits during evaluation.")
+                    q_halt_pruned_mask = q_halt_logits > 0
+                    act_pruned_mask = (
+                        q_halt_pruned_mask
+                        if act_pruned_mask is None
+                        else (act_pruned_mask | q_halt_pruned_mask)
+                    )
+
+                hidden_pruned_mask: Optional[torch.Tensor] = None
+                if hidden_pruning_enabled and carry_before_step is not None and not all_finish:
+                    hidden_diff_norm = _hidden_diff_norm(
+                        carry.current_hidden.detach(),
+                        carry_before_step.current_hidden.detach(),
+                    )
+                    hidden_pruned_mask = hidden_diff_norm <= hidden_diff_threshold
+
+                prune_mask: Optional[torch.Tensor] = None
+                if act_pruned_mask is not None and hidden_pruned_mask is not None:
+                    prune_mask = act_pruned_mask | hidden_pruned_mask
+                elif act_pruned_mask is not None:
+                    prune_mask = act_pruned_mask
+                else:
+                    prune_mask = hidden_pruned_mask
+
+                if prune_mask is not None and torch.any(prune_mask):
+                    _finalize_examples(
+                        finalize_mask=prune_mask,
+                        preds=preds,
+                        final_steps=carry.steps,
+                    )
+
+                    keep_indices = torch.nonzero(~prune_mask, as_tuple=False).squeeze(-1)
+                    if keep_indices.numel() == 0:
+                        active_batch = None
+                        active_set_ids = active_set_ids[:0]
+                        active_orders = active_orders[:0]
+                        active_next_checkpoint_indices = active_next_checkpoint_indices[:0]
+                        carry = None
+                    else:
+                        active_batch = {
+                            key: value.index_select(0, keep_indices)
+                            for key, value in active_batch.items()
+                        }
+                        carry = _index_structure(carry, keep_indices)
+                        active_set_ids = active_set_ids.index_select(0, keep_indices)
+                        active_orders = active_orders.index_select(0, keep_indices)
+                        active_next_checkpoint_indices = active_next_checkpoint_indices.index_select(0, keep_indices)
+                    continue
+
+                if all_finish:
+                    _finalize_examples(
+                        finalize_mask=torch.ones_like(carry.steps, dtype=torch.bool),
+                        preds=preds,
+                        final_steps=carry.steps,
+                    )
+                    active_batch = None
+                    active_set_ids = active_set_ids[:0]
+                    active_orders = active_orders[:0]
+                    active_next_checkpoint_indices = active_next_checkpoint_indices[:0]
+                    carry = None
+    finally:
+        progress_bar.close()
+
+    finalized_by_set, finalized_loop_metrics_by_step, finalized_saved_outputs = _finalize_evaluation_outputs(
+        metric_totals_by_set=metric_totals_by_set,
+        loop_metric_totals_by_step=loop_metric_totals_by_step,
+        completed_step_counts_by_set=completed_step_counts_by_set,
+        completed_total_counts_by_set=completed_total_counts_by_set,
+        saved_outputs=saved_outputs,
+    )
+
+    return (
+        finalized_by_set,
+        finalized_loop_metrics_by_step,
+        finalized_saved_outputs,
+        processed_batches,
+        processed_problems,
+    )
+
+
+def evaluate_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_problems: Optional[int],
+    max_batches: Optional[int],
+    save_predictions: bool,
+    hidden_diff_threshold: Optional[float],
+    loop_checkpoints: Optional[List[int]] = None,
+    active_batch_strategy: str = "refill",
+) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
+    if active_batch_strategy == "refill":
+        return _evaluate_model_refill(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            max_problems=max_problems,
+            max_batches=max_batches,
+            save_predictions=save_predictions,
+            hidden_diff_threshold=hidden_diff_threshold,
+            loop_checkpoints=loop_checkpoints,
+        )
+    if active_batch_strategy == "shrink":
+        return _evaluate_model_shrink(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            max_problems=max_problems,
+            max_batches=max_batches,
+            save_predictions=save_predictions,
+            hidden_diff_threshold=hidden_diff_threshold,
+            loop_checkpoints=loop_checkpoints,
+        )
+    raise ValueError(f"Unknown active batch strategy: {active_batch_strategy}")
 
 
 def _default_output_path(
@@ -859,11 +1466,13 @@ def _default_output_path(
     h_cycles: Optional[int],
     l_cycles: Optional[int],
     hidden_diff_threshold: Optional[float],
+    active_batch_strategy: str,
 ) -> Path:
     threshold_suffix = ""
     if hidden_diff_threshold is not None and hidden_diff_threshold > 0:
         threshold_value = f"{hidden_diff_threshold:g}".replace("-", "m").replace(".", "_")
         threshold_suffix = f"_hidden_diff_threshold_{threshold_value}"
+    strategy_suffix = f"_active_batch_strategy_{active_batch_strategy}"
 
     resolved_path = _resolve_checkpoint_path(checkpoint_path)
     if resolved_path is None:
@@ -879,6 +1488,7 @@ def _default_output_path(
         if l_cycles is not None:
             stem += f"_L_cycles_{l_cycles}"
         stem += threshold_suffix
+        stem += strategy_suffix
         return Path(f"{stem}.json")
     checkpoint_file = Path(resolved_path)
     stem = f"{checkpoint_file.stem}_evaluation_{split}"
@@ -893,6 +1503,7 @@ def _default_output_path(
     if l_cycles is not None:
         stem += f"_L_cycles_{l_cycles}"
     stem += threshold_suffix
+    stem += strategy_suffix
     return checkpoint_file.parent / f"{stem}.json"
 
 
@@ -955,6 +1566,13 @@ def main() -> None:
         help="Prune examples from the carry during evaluation when the relative hidden-state change is at or below this threshold.",
     )
     parser.add_argument(
+        "--active_batch_strategy",
+        type=str,
+        default="refill",
+        choices=("refill", "shrink"),
+        help="How to manage active evaluation slots: keep refilling finished slots, or preserve the legacy shrinking batch.",
+    )
+    parser.add_argument(
         "--no_strict_load",
         action="store_true",
         help="Allow missing or unexpected keys when loading the checkpoint.",
@@ -1000,6 +1618,7 @@ def main() -> None:
         print(f"Overriding L_cycles to: {args.L_cycles}")
     if args.hidden_diff_threshold is not None and args.hidden_diff_threshold > 0:
         print(f"Using hidden diff pruning threshold: {args.hidden_diff_threshold}")
+    print(f"Using active batch strategy: {args.active_batch_strategy}")
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
@@ -1028,6 +1647,7 @@ def main() -> None:
         save_predictions=args.save_predictions,
         hidden_diff_threshold=args.hidden_diff_threshold,
         loop_checkpoints=loop_checkpoints,
+        active_batch_strategy=args.active_batch_strategy,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -1068,6 +1688,7 @@ def main() -> None:
             args.H_cycles,
             args.L_cycles,
             args.hidden_diff_threshold,
+            args.active_batch_strategy,
         )
     )
     if output_path.suffix.lower() != ".json":
@@ -1083,6 +1704,7 @@ def main() -> None:
         "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
         "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
         "hidden_diff_threshold": args.hidden_diff_threshold,
+        "active_batch_strategy": args.active_batch_strategy,
         "max_batches": args.max_batches,
         "max_problems": args.max_problems,
         "elapsed_time_sec": elapsed_time,
