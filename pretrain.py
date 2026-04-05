@@ -2,6 +2,7 @@ from typing import Optional, Any, Sequence, List, Tuple
 from dataclasses import dataclass
 import os
 import math
+import json
 import yaml
 import shutil
 import re
@@ -333,7 +334,7 @@ def _resolve_checkpoint_path(path: str) -> Optional[str]:
         return path
 
     if os.path.isdir(path):
-        pattern = re.compile(r"step_(\\d+)(?:\\.pt)?$")
+        pattern = re.compile(r"step_(\d+)(?:\.pt)?$")
         candidates: List[Tuple[int, str]] = []
         for file_name in os.listdir(path):
             match = pattern.match(file_name)
@@ -359,6 +360,16 @@ def load_config_from_checkpoint_path(path: str) -> Optional[PretrainConfig]:
         if not candidate.exists():
             return None
 
+        if candidate.suffix.lower() == ".json":
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    config_dict = json.load(f)
+                if isinstance(config_dict, dict):
+                    return PretrainConfig(**config_dict)
+            except Exception:
+                pass
+            return None
+
         # Prefer OmegaConf so we can parse Hydra-specific tags written during training.
         try:
             conf = OmegaConf.load(candidate)
@@ -380,7 +391,12 @@ def load_config_from_checkpoint_path(path: str) -> Optional[PretrainConfig]:
 
         return None
 
-    for candidate in [checkpoint_dir / "all_config.yaml", checkpoint_dir / ".hydra" / "config.yaml"]:
+    for candidate in [
+        checkpoint_dir / "config.yaml",
+        checkpoint_dir / "config.json",
+        checkpoint_dir / "all_config.yaml",
+        checkpoint_dir / ".hydra" / "config.yaml",
+    ]:
         loaded = _load_candidate(candidate)
         if loaded is not None:
             return loaded
@@ -454,9 +470,9 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
 
     _resize_puzzle_embedding_if_needed(train_state.model, state_dict)
     try:
-        load_result = train_state.model.load_state_dict(
-            state_dict, strict=config.load_strict, assign=True
-        )
+        # Keep parameter objects stable so pre-created optimizers still point at
+        # the live model parameters after a training resume.
+        load_result = train_state.model.load_state_dict(state_dict, strict=config.load_strict)
     except RuntimeError:
         # Re-raise with clearer guidance if strict loading was requested.
         raise
@@ -831,13 +847,50 @@ def _prefix_metrics(metrics: Any, prefix: str):
     return prefixed
 
 
+def _build_pretrain_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
+    config_dict = OmegaConf.to_container(hydra_config, resolve=True)
+    if not isinstance(config_dict, dict):
+        raise ValueError("Expected Hydra config to resolve to a dictionary.")
+
+    resume_from_checkpoint_dir = config_dict.pop("resume_from_checkpoint_dir", None)
+    if resume_from_checkpoint_dir is not None:
+        if rank == 0:
+            print(f"Loading config from checkpoint directory: {resume_from_checkpoint_dir}")
+
+        resume_config = load_config_from_checkpoint_path(str(resume_from_checkpoint_dir))
+        if resume_config is None:
+            raise FileNotFoundError(
+                f"Could not load a saved config from checkpoint directory '{resume_from_checkpoint_dir}'"
+            )
+
+        merged_config = resume_config.model_dump()
+        # Only allow runtime-oriented overrides here. The saved training config remains the source
+        # of truth for architecture and dataset settings so resume stays faithful to the checkpoint.
+        for key in (
+            "project_name",
+            "run_name",
+            "checkpoint_path",
+            "load_checkpoint",
+            "load_strict",
+            "load_optimizer_state",
+            "seed",
+        ):
+            if key in config_dict:
+                merged_config[key] = config_dict[key]
+
+        config_dict = merged_config
+
+    config = PretrainConfig(**config_dict)
+    if config.project_name is None:
+        config.project_name = "arcagi"
+
+    return config
+
+
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
     objects = [None]
     if rank == 0:
-        config_dict = OmegaConf.to_container(hydra_config, resolve=True)
-        config = PretrainConfig(**config_dict)
-        config.project_name = "arcagi"
-
+        config = _build_pretrain_config(hydra_config, rank=rank)
         objects = [config]
 
     if world_size > 1:
