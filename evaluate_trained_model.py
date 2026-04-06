@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import time
 
+import numpy as np
 import pydantic
 import torch
 import torch.nn.functional as F
@@ -80,6 +81,39 @@ class PretrainConfig(pydantic.BaseModel):
     use_muon: bool = False
     data_fraction: float = 1.0
     masked_input: Optional[MaskedInputConfig] = None
+
+
+class ShuffledTestPuzzleDataset(PuzzleDataset):
+    def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
+        for set_name, dataset in self._data.items():  # type: ignore
+            total_examples = len(dataset["inputs"])
+            shuffled_indices = rng.permutation(total_examples)
+
+            start_index = 0
+            while start_index < total_examples:
+                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                global_indices = shuffled_indices[start_index:end_index]
+
+                local_start = self.config.rank * self.local_batch_size
+                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
+                local_indices = global_indices[local_start:local_end]
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
+
+                batch = self._collate_batch(
+                    {
+                        "inputs": dataset["inputs"][local_indices],
+                        "labels": dataset["labels"][local_indices],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
+                    },
+                    rng,
+                    make_masked_inputs=False,
+                )
+
+                yield set_name, batch, end_index - start_index
+
+                start_index += self.config.global_batch_size
 
 
 def _ensure_arch_extra(config: PretrainConfig) -> Dict[str, Any]:
@@ -169,7 +203,7 @@ def load_config_from_checkpoint_path(path: str) -> PretrainConfig:
 
 
 def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size: int) -> DataLoader:
-    dataset = PuzzleDataset(
+    dataset = ShuffledTestPuzzleDataset(
         PuzzleDatasetConfig(
             seed=config.seed,
             dataset_path=config.data_path,
@@ -183,6 +217,7 @@ def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size
         split=split,
     )
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
+    print(f"Shuffling evaluation problems with seed {config.seed}.")
     return DataLoader(
         dataset,
         batch_size=None,
