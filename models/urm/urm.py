@@ -52,6 +52,10 @@ class URMConfig(BaseModel):
     norm_diff_min: float = 0.1
     diff_L_loss_enabled: bool = False
     halt_norm_in_use_act: bool = False
+    patch_io_enabled: bool = False
+    patch_height: int = 2
+    patch_width: int = 2
+    patch_pre_embedding_size: int = 3
 
 
 class URMBlock(nn.Module):
@@ -96,14 +100,50 @@ class URM_Inner(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
+        self.patch_area = self.config.patch_height * self.config.patch_width
+        self.inner_seq_len = self.config.seq_len
+        self.inner_grid_height = self.config.grid_height
+        self.inner_grid_width = self.config.grid_width
+        self.padded_grid_height = self.config.grid_height
+        self.padded_grid_width = self.config.grid_width
+        self.padded_seq_len = self.config.seq_len
 
-        self.embed_tokens = CastedEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            init_std=embed_init_std,
-            cast_to=self.forward_dtype,
+        if self.config.patch_io_enabled:
+            if self.config.grid_height > 0 or self.config.grid_width > 0:
+                self.inner_grid_height = -(self.config.grid_height // -self.config.patch_height)
+                self.inner_grid_width = -(self.config.grid_width // -self.config.patch_width)
+                self.inner_seq_len = self.inner_grid_height * self.inner_grid_width
+                self.padded_grid_height = self.inner_grid_height * self.config.patch_height
+                self.padded_grid_width = self.inner_grid_width * self.config.patch_width
+            else:
+                self.inner_seq_len = -(self.config.seq_len // -self.patch_area)
+                self.padded_seq_len = self.inner_seq_len * self.patch_area
+
+        config_updates = dict(
+            seq_len=self.inner_seq_len,
+            grid_height=self.inner_grid_height,
+            grid_width=self.inner_grid_width,
         )
-        self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.inner_config = (
+            self.config.model_copy(update=config_updates)
+            if hasattr(self.config, "model_copy")
+            else self.config.copy(update=config_updates)
+        )
+
+        if self.config.patch_io_enabled:
+            patch_dim = self.patch_area * self.config.patch_pre_embedding_size
+            self.pre_embedding = CastedLinear(self.config.vocab_size, self.config.patch_pre_embedding_size, bias=False)
+            self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
+            self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
+            self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
+        else:
+            self.embed_tokens = CastedEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                init_std=embed_init_std,
+                cast_to=self.forward_dtype,
+            )
+            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
 
@@ -116,22 +156,22 @@ class URM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        if self.config.grid_height > 0 and self.config.grid_width > 0:
+        if self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
             self.rotary_emb = RotaryEmbedding2D(
-                dim=self.config.hidden_size // self.config.num_heads,
-                grid_height=self.config.grid_height,
-                grid_width=self.config.grid_width,
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
                 puzzle_emb_len=self.puzzle_emb_len,
-                base=self.config.rope_theta,
+                base=self.inner_config.rope_theta,
             )
         else:
             self.rotary_emb = RotaryEmbedding(
-                dim=self.config.hidden_size // self.config.num_heads,
-                max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
-                base=self.config.rope_theta,
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                max_position_embeddings=self.inner_seq_len + self.puzzle_emb_len,
+                base=self.inner_config.rope_theta,
             )
 
-        self.layers = nn.ModuleList([URMBlock(self.config) for _ in range(self.config.num_layers)])
+        self.layers = nn.ModuleList([URMBlock(self.inner_config) for _ in range(self.config.num_layers)])
 
         self.init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
@@ -144,8 +184,84 @@ class URM_Inner(nn.Module):
             
         self.generator = torch.Generator(device="cuda").manual_seed(self.config.noise_seed)
 
+    def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim == 3:
+            if input.shape[-1] != self.config.vocab_size:
+                raise ValueError("one-hot inputs must have vocab_size as the last dimension")
+            return input.to(self.forward_dtype)
+        return F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
+
+    def _patchify(self, pixels: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, channels = pixels.shape
+        if seq_len != self.config.seq_len:
+            raise ValueError("patch IO input sequence length must match config.seq_len")
+
+        if self.config.grid_height > 0 and self.config.grid_width > 0:
+            pixels = pixels.view(batch_size, self.config.grid_height, self.config.grid_width, channels)
+            if self.padded_grid_height != self.config.grid_height or self.padded_grid_width != self.config.grid_width:
+                pixels = F.pad(
+                    pixels,(0,0,0,self.padded_grid_width - self.config.grid_width,
+                        0,self.padded_grid_height - self.config.grid_height,),
+                )
+            patches = pixels.reshape(
+                batch_size,
+                self.inner_grid_height,
+                self.config.patch_height,
+                self.inner_grid_width,
+                self.config.patch_width,
+                channels,
+            )
+            return patches.permute(0, 1, 3, 2, 4, 5).reshape(
+                batch_size,
+                self.inner_seq_len,
+                self.patch_area * channels,
+            )
+
+        if self.padded_seq_len != self.config.seq_len:
+            pixels = F.pad(pixels, (0, 0, 0, self.padded_seq_len - self.config.seq_len))
+        return pixels.reshape(batch_size, self.inner_seq_len, self.patch_area * channels)
+
+    def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, patch_dim = patches.shape
+        channels = self.config.patch_pre_embedding_size
+        if seq_len != self.inner_seq_len or patch_dim != self.patch_area * channels:
+            raise ValueError("patch IO head output has an unexpected shape")
+
+        if self.config.grid_height > 0 and self.config.grid_width > 0:
+            pixels = patches.reshape(
+                batch_size,
+                self.inner_grid_height,
+                self.inner_grid_width,
+                self.config.patch_height,
+                self.config.patch_width,
+                channels,
+            )
+            pixels = pixels.permute(0, 1, 3, 2, 4, 5).reshape(
+                batch_size,
+                self.padded_grid_height,
+                self.padded_grid_width,
+                channels,
+            )
+            return pixels[:, : self.config.grid_height, : self.config.grid_width].reshape(
+                batch_size,
+                self.config.seq_len,
+                channels,
+            )
+
+        return patches.reshape(batch_size, self.padded_seq_len, channels)[:, : self.config.seq_len]
+
+    def _output_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
+        if self.config.patch_io_enabled:
+            output = self.post_head(self._unpatchify(output))
+        return output
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        embedding = self.embed_tokens(input.to(torch.int32))
+        if self.config.patch_io_enabled:
+            pixels = self.pre_embedding(self._one_hot_inputs(input))
+            embedding = self.embed_tokens(self._patchify(pixels))
+        else:
+            embedding = self.embed_tokens(input.to(torch.int32))
 
         if self.config.puzzle_emb_ndim > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
@@ -174,7 +290,7 @@ class URM_Inner(nn.Module):
         return URMCarry(
             current_hidden=torch.empty(
                 batch_size,
-                self.config.seq_len + self.puzzle_emb_len,
+                self.inner_seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
             ),
@@ -250,7 +366,7 @@ class URM_Inner(nn.Module):
                     _unrolled_idx += 1
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
+        output = self._output_logits(hidden_states)
         q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
