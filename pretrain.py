@@ -8,6 +8,7 @@ import re
 import copy
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -159,12 +160,46 @@ class TrainState:
     accum_step: int = 0
 
 
+class ShuffledTestPuzzleDataset(PuzzleDataset):
+    def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
+        for set_name, dataset in self._data.items():  # type: ignore
+            total_examples = len(dataset["inputs"])
+            shuffled_indices = rng.permutation(total_examples)
+
+            start_index = 0
+            while start_index < total_examples:
+                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                global_indices = shuffled_indices[start_index:end_index]
+
+                local_start = self.config.rank * self.local_batch_size
+                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
+                local_indices = global_indices[local_start:local_end]
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
+
+                batch = self._collate_batch(
+                    {
+                        "inputs": dataset["inputs"][local_indices],
+                        "labels": dataset["labels"][local_indices],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
+                    },
+                    rng,
+                    make_masked_inputs=False,
+                )
+
+                yield set_name, batch, end_index - start_index
+
+                start_index += self.config.global_batch_size
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_test = kwargs.get("test_set_mode", False)
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
-    dataset = PuzzleDataset(
+    dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
+    dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
             data_fraction=data_fraction, online_aug=online_aug, masked_input=config.masked_input, **kwargs
@@ -172,6 +207,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         split=split,
     )
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
+    if is_test:
+        print(f"Shuffling evaluation problems with seed {config.seed}.")
     dataloader = DataLoader(
         dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True
     )
