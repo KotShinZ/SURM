@@ -605,6 +605,7 @@ def evaluate_model(
     completed_step_counts_by_set: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
     completed_total_counts_by_set: Dict[str, float] = defaultdict(float)
     saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
+    progress_metric_totals: Dict[str, float] = defaultdict(float)
 
     processed_batches = 0
     processed_problems = 0
@@ -625,9 +626,8 @@ def evaluate_model(
         print("Hidden-state pruning is not supported by this model; running standard evaluation.")
 
     with torch.inference_mode():
-        for batch_index, (set_name, batch, _global_batch_size) in enumerate(
-            tqdm(dataloader, desc="Evaluating", total=progress_total)
-        ):
+        progress_bar = tqdm(dataloader, desc="Evaluating", total=progress_total)
+        for batch_index, (set_name, batch, _global_batch_size) in enumerate(progress_bar):
             if max_batches is not None and batch_index >= max_batches:
                 break
             if max_problems is not None and processed_problems >= max_problems:
@@ -788,6 +788,16 @@ def evaluate_model(
             processed_problems += int(batch_metric_sums["count"])
             for metric_name, metric_value in batch_metric_sums.items():
                 metric_totals_by_set[set_name][metric_name] += metric_value
+                progress_metric_totals[metric_name] += metric_value
+
+            progress_count = progress_metric_totals["count"]
+            if progress_count > 0:
+                progress_bar.set_postfix(
+                    {
+                        "exact_accuracy": f"{progress_metric_totals['exact_accuracy'] / progress_count:.4f}",
+                        "accuracy": f"{progress_metric_totals['accuracy'] / progress_count:.4f}",
+                    }
+                )
 
             if arc_majority_evaluator is not None:
                 kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
