@@ -353,7 +353,7 @@ def _supports_hidden_pruning(model: nn.Module) -> bool:
 def _act_early_stop_enabled(model: nn.Module) -> bool:
     base_model = _unwrap_eval_model(model)
     config = getattr(base_model, "config", None)
-    return bool(getattr(config, "act_inference", False) or getattr(config, "eval_act_early_stop", False))
+    return bool(getattr(config, "act_inference", False) or getattr(config, "eval_act_early_stop", False)) or getattr(config, "use_act", False) or getattr(config, "no_ACT_continue", True) == False
 
 
 def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
