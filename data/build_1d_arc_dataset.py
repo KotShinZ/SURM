@@ -223,7 +223,7 @@ def load_puzzles_1d_arc(config: DataProcessConfig):
             max_grid_width = max(max_grid_width, _puzzle_max_width(puzzle))
 
             split_name = "test" if file_idx in test_indices else "train"
-            aug_count = config.num_aug if split_name == "train" else 0
+            aug_count = config.num_aug
 
             convert_single_1d_arc_puzzle(
                 results=results,
@@ -244,7 +244,7 @@ def load_puzzles_1d_arc(config: DataProcessConfig):
         total_test_puzzles += task_test
         print(
             f"[{task_name}] train puzzles: {task_train}, test puzzles: {task_test}, "
-            f"num_aug(train only): {config.num_aug}"
+            f"num_aug: {config.num_aug}"
         )
 
     print(f"Total task types: {len(task_names)}")
