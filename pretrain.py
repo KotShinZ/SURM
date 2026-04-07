@@ -370,7 +370,7 @@ def _resolve_checkpoint_path(path: str) -> Optional[str]:
         return path
 
     if os.path.isdir(path):
-        pattern = re.compile(r"step_(\\d+)(?:\\.pt)?$")
+        pattern = re.compile(r"step_(\d+)(?:\.pt)?$")
         candidates: List[Tuple[int, str]] = []
         for file_name in os.listdir(path):
             match = pattern.match(file_name)
