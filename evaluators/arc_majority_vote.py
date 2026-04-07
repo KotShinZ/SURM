@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from data.build_arc_dataset import arc_grid_to_np, grid_hash
+from data.build_arc_dataset import ARCMaxGridSize, arc_grid_to_np, grid_hash
 from evaluators.arc import ARC
 
 
@@ -137,6 +137,8 @@ def maybe_create_arc_majority_vote_evaluator(
         dataset_root / "test_puzzles.json",
     )
     if split != "test" or not all(path.is_file() for path in required_files):
+        return None
+    if eval_metadata.seq_len != ARCMaxGridSize * ARCMaxGridSize:
         return None
 
     return StandaloneARCMajorityVoteEvaluator(

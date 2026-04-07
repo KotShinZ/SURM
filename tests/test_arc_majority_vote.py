@@ -56,6 +56,20 @@ def _metadata() -> PuzzleDatasetMetadata:
     )
 
 
+def _metadata_1d_arc() -> PuzzleDatasetMetadata:
+    return PuzzleDatasetMetadata(
+        pad_id=0,
+        ignore_label_id=0,
+        blank_identifier_id=0,
+        vocab_size=12,
+        seq_len=94,
+        num_puzzle_identifiers=19,
+        total_groups=180,
+        mean_puzzle_examples=4.0,
+        sets=["all"],
+    )
+
+
 def _encoded_grid(value: int) -> torch.Tensor:
     grid = torch.zeros((1, 900), dtype=torch.int64)
     grid[0, 0] = value
@@ -114,6 +128,19 @@ class ArcMajorityVoteTests(unittest.TestCase):
                     data_path=str(dataset_root),
                     eval_metadata=_metadata(),
                     split="validation",
+                )
+            )
+
+    def test_detection_skips_non_2d_arc_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_root = Path(tmp_dir)
+            _write_arc_metadata_files(dataset_root)
+
+            self.assertIsNone(
+                maybe_create_arc_majority_vote_evaluator(
+                    data_path=str(dataset_root),
+                    eval_metadata=_metadata_1d_arc(),
+                    split="test",
                 )
             )
 
