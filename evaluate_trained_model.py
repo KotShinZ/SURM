@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import time
 
+import numpy as np
 import pydantic
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,10 @@ from tqdm import tqdm
 from models.losses import IGNORE_LABEL_ID
 from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
+from evaluators.arc_majority_vote import (
+    default_arc_submission_dir,
+    maybe_create_arc_majority_vote_evaluator,
+)
 
 
 class LossConfig(pydantic.BaseModel):
@@ -76,6 +81,70 @@ class PretrainConfig(pydantic.BaseModel):
     use_muon: bool = False
     data_fraction: float = 1.0
     masked_input: Optional[MaskedInputConfig] = None
+
+
+class ShuffledTestPuzzleDataset(PuzzleDataset):
+    def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
+        for set_name, dataset in self._data.items():  # type: ignore
+            total_examples = len(dataset["inputs"])
+            shuffled_indices = rng.permutation(total_examples)
+
+            start_index = 0
+            while start_index < total_examples:
+                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                global_indices = shuffled_indices[start_index:end_index]
+
+                local_start = self.config.rank * self.local_batch_size
+                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
+                local_indices = global_indices[local_start:local_end]
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
+
+                batch = self._collate_batch(
+                    {
+                        "inputs": dataset["inputs"][local_indices],
+                        "labels": dataset["labels"][local_indices],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
+                    },
+                    rng,
+                    make_masked_inputs=False,
+                )
+
+                yield set_name, batch, end_index - start_index
+
+                start_index += self.config.global_batch_size
+
+
+def _ensure_arch_extra(config: PretrainConfig) -> Dict[str, Any]:
+    if config.arch.__pydantic_extra__ is None:
+        config.arch.__pydantic_extra__ = {}
+    return config.arch.__pydantic_extra__
+
+
+def _loop_count_config_key(config: PretrainConfig) -> str:
+    arch_extra = config.arch.__pydantic_extra__ or {}
+    if "halt_max_steps" in arch_extra:
+        return "halt_max_steps"
+    return "loops"
+
+
+def _set_effective_loop_count(config: PretrainConfig, loops: int) -> str:
+    arch_extra = _ensure_arch_extra(config)
+    loop_key = _loop_count_config_key(config)
+    arch_extra[loop_key] = loops
+    return loop_key
+
+
+def _get_effective_loop_count(config: PretrainConfig) -> Optional[int]:
+    arch_extra = config.arch.__pydantic_extra__ or {}
+    loop_key = _loop_count_config_key(config)
+    loop_value = arch_extra.get(loop_key)
+    if loop_value is None and loop_key != "loops":
+        loop_value = arch_extra.get("loops")
+    if loop_value is None and loop_key != "halt_max_steps":
+        loop_value = arch_extra.get("halt_max_steps")
+    return None if loop_value is None else int(loop_value)
 
 
 def _resolve_checkpoint_path(path: str) -> Optional[str]:
@@ -134,7 +203,7 @@ def load_config_from_checkpoint_path(path: str) -> PretrainConfig:
 
 
 def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size: int) -> DataLoader:
-    dataset = PuzzleDataset(
+    dataset = ShuffledTestPuzzleDataset(
         PuzzleDatasetConfig(
             seed=config.seed,
             dataset_path=config.data_path,
@@ -148,6 +217,7 @@ def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size
         split=split,
     )
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
+    print(f"Shuffling evaluation problems with seed {config.seed}.")
     return DataLoader(
         dataset,
         batch_size=None,
@@ -318,7 +388,7 @@ def _supports_hidden_pruning(model: nn.Module) -> bool:
 def _act_early_stop_enabled(model: nn.Module) -> bool:
     base_model = _unwrap_eval_model(model)
     config = getattr(base_model, "config", None)
-    return bool(getattr(config, "use_act", False))
+    return bool(getattr(config, "act_inference", False) or getattr(config, "eval_act_early_stop", False)) or getattr(config, "use_act", False) or getattr(config, "no_ACT_continue", True) == False
 
 
 def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
@@ -548,6 +618,7 @@ def evaluate_model(
     save_predictions: bool,
     hidden_diff_threshold: Optional[float],
     loop_checkpoints: Optional[List[int]] = None,
+    arc_majority_evaluator: Optional[Any] = None,
 ) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
     model.eval()
 
@@ -557,6 +628,8 @@ def evaluate_model(
         return_keys.add("q_halt_logits")
     if save_predictions:
         return_keys.update({"q_halt_logits", "q_continue_logits"})
+    if arc_majority_evaluator is not None:
+        return_keys.update(arc_majority_evaluator.required_outputs)
     metric_return_keys: Set[str] = {"preds", "logits"}
     loop_checkpoints = sorted(set(loop_checkpoints or []))
 
@@ -567,6 +640,7 @@ def evaluate_model(
     completed_step_counts_by_set: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
     completed_total_counts_by_set: Dict[str, float] = defaultdict(float)
     saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
+    progress_metric_totals: Dict[str, float] = defaultdict(float)
 
     processed_batches = 0
     processed_problems = 0
@@ -587,9 +661,8 @@ def evaluate_model(
         print("Hidden-state pruning is not supported by this model; running standard evaluation.")
 
     with torch.inference_mode():
-        for batch_index, (set_name, batch, _global_batch_size) in enumerate(
-            tqdm(dataloader, desc="Evaluating", total=progress_total)
-        ):
+        progress_bar = tqdm(dataloader, desc="Evaluating", total=progress_total)
+        for batch_index, (set_name, batch, _global_batch_size) in enumerate(progress_bar):
             if max_batches is not None and batch_index >= max_batches:
                 break
             if max_problems is not None and processed_problems >= max_problems:
@@ -750,6 +823,24 @@ def evaluate_model(
             processed_problems += int(batch_metric_sums["count"])
             for metric_name, metric_value in batch_metric_sums.items():
                 metric_totals_by_set[set_name][metric_name] += metric_value
+                progress_metric_totals[metric_name] += metric_value
+
+            progress_count = progress_metric_totals["count"]
+            if progress_count > 0:
+                progress_bar.set_postfix(
+                    {
+                        "exact_accuracy": f"{progress_metric_totals['exact_accuracy'] / progress_count:.4f}",
+                        "accuracy": f"{progress_metric_totals['accuracy'] / progress_count:.4f}",
+                    }
+                )
+
+            if arc_majority_evaluator is not None:
+                kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+                if kept_indices.numel() > 0:
+                    arc_majority_evaluator.update_batch(
+                        _index_structure(batch, kept_indices),
+                        _index_structure(preds, kept_indices),
+                    )
 
             if save_predictions:
                 for key, value in batch.items():
@@ -941,10 +1032,9 @@ def main() -> None:
         config.data_path = args.data_path
     if args.batch_size is not None:
         config.global_batch_size = args.batch_size
+    loop_override_key: Optional[str] = None
     if args.loops is not None:
-        if config.arch.__pydantic_extra__ is None:
-            config.arch.__pydantic_extra__ = {}
-        config.arch.__pydantic_extra__["loops"] = args.loops
+        loop_override_key = _set_effective_loop_count(config, args.loops)
     if args.H_cycles is not None:
         if config.arch.__pydantic_extra__ is None:
             config.arch.__pydantic_extra__ = {}
@@ -960,7 +1050,10 @@ def main() -> None:
     if args.max_problems is not None:
         print(f"Evaluating at most {args.max_problems} problems")
     if args.loops is not None:
-        print(f"Overriding loops to: {args.loops}")
+        if loop_override_key == "halt_max_steps":
+            print(f"Overriding loops to: {args.loops} (via halt_max_steps)")
+        else:
+            print(f"Overriding loops to: {args.loops}")
     if args.H_cycles is not None:
         print(f"Overriding H_cycles to: {args.H_cycles}")
     if args.L_cycles is not None:
@@ -970,7 +1063,14 @@ def main() -> None:
 
     dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
     metadata = dataloader.dataset.metadata
-    effective_loops = (config.arch.__pydantic_extra__ or {}).get("loops")
+    arc_majority_evaluator = maybe_create_arc_majority_vote_evaluator(
+        data_path=config.data_path,
+        eval_metadata=metadata,
+        split=args.split,
+    )
+    if arc_majority_evaluator is not None:
+        print("Detected ARC dataset; enabling ARC majority-vote evaluation.")
+    effective_loops = _get_effective_loop_count(config)
     loop_checkpoints = _power_of_two_loop_checkpoints(effective_loops)
     if loop_checkpoints:
         print(f"Reporting intermediate metrics at power-of-two loops: {loop_checkpoints}")
@@ -995,9 +1095,30 @@ def main() -> None:
         save_predictions=args.save_predictions,
         hidden_diff_threshold=args.hidden_diff_threshold,
         loop_checkpoints=loop_checkpoints,
+        arc_majority_evaluator=arc_majority_evaluator,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
+
+    output_path = (
+        Path(args.output)
+        if args.output is not None
+        else _default_output_path(
+            args.checkpoint,
+            args.split,
+            args.max_batches,
+            args.max_problems,
+            args.loops,
+            args.H_cycles,
+            args.L_cycles,
+            args.hidden_diff_threshold,
+        )
+    )
+    arc_majority_vote_metrics: Optional[Dict[str, float]] = None
+    arc_submission_dir: Optional[Path] = None
+    if arc_majority_evaluator is not None:
+        arc_submission_dir = default_arc_submission_dir(output_path)
+        arc_majority_vote_metrics = arc_majority_evaluator.result(str(arc_submission_dir))
 
     print("")
     print(f"Evaluation completed in {elapsed_time:.2f} seconds.")
@@ -1022,21 +1143,13 @@ def main() -> None:
                         print(f"    {key}: {metrics[key]:.6f}")
                 if "finished_fraction" in metrics:
                     print(f"    finished_pct: {metrics['finished_fraction'] * 100:.2f}%")
-
-    output_path = (
-        Path(args.output)
-        if args.output is not None
-        else _default_output_path(
-            args.checkpoint,
-            args.split,
-            args.max_batches,
-            args.max_problems,
-            args.loops,
-            args.H_cycles,
-            args.L_cycles,
-            args.hidden_diff_threshold,
-        )
-    )
+    if arc_majority_vote_metrics:
+        print("")
+        print("ARC majority-vote metrics:")
+        for key, value in sorted(arc_majority_vote_metrics.items()):
+            print(f"  {key}: {value:.6f}")
+        if arc_submission_dir is not None:
+            print(f"ARC submission saved to: {arc_submission_dir / 'submission.json'}")
     if output_path.suffix.lower() != ".json":
         print(f"Warning: writing JSON summary to a path without a .json suffix: {output_path}")
 
@@ -1046,7 +1159,7 @@ def main() -> None:
         "data_path": config.data_path,
         "split": args.split,
         "batch_size": config.global_batch_size,
-        "loops": (config.arch.__pydantic_extra__ or {}).get("loops"),
+        "loops": effective_loops,
         "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
         "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
         "hidden_diff_threshold": args.hidden_diff_threshold,
@@ -1057,6 +1170,8 @@ def main() -> None:
         "processed_problems": processed_problems,
         "metrics": metrics_by_set,
         "power_of_two_loop_metrics": loop_metrics_by_step,
+        "arc_majority_vote_metrics": arc_majority_vote_metrics,
+        "arc_majority_vote_submission_dir": None if arc_submission_dir is None else str(arc_submission_dir),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

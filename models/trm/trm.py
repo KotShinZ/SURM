@@ -50,10 +50,15 @@ class TRMConfig(BaseModel):
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
+    attn_dropout: float = 0.0
     
     # Halting Q-learning config
     halt_max_steps: int
     halt_exploration_prob: float
+    use_act: bool = True
+    norm_diff_max: float = 0.2
+    norm_diff_min: float = 0.1
+    halt_norm_in_use_act: bool = False
 
     forward_dtype: str = "bfloat16"
 
@@ -79,7 +84,8 @@ class TRMBlock(nn.Module):
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
-                causal=False
+                causal=False,
+                attn_dropout=config.attn_dropout,
             )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
@@ -250,18 +256,27 @@ class TRM(nn.Module):
             
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
+
+    def norm_func(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        return torch.norm(x1 - x2, dim=(1, 2)) / (1e-7 + torch.norm(x1 + x2, dim=(1, 2)) / 2)
+
+    def carry_diff_norm(self, x1: TRMInnerCarry, x2: TRMInnerCarry) -> torch.Tensor:
+        z_h_diff = self.norm_func(x1.z_H.detach(), x2.z_H.detach())
+        z_l_diff = self.norm_func(x1.z_L.detach(), x2.z_L.detach())
+        return torch.maximum(z_h_diff, z_l_diff)
         
     def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor], compute_target_q=False) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
 
         # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        reset_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(reset_inner_carry, new_current_data)
+        hidden_diff_norm = self.carry_diff_norm(new_inner_carry, reset_inner_carry)
 
         outputs = {
             "logits": logits,
@@ -290,6 +305,16 @@ class TRM(nn.Module):
                 # Exploration
                 min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
                 halted = halted & (new_steps >= min_halt_steps)
+
+                if (self.config.use_act == False or self.config.halt_norm_in_use_act == True) and self.training == True:
+                    norm_diff_max = self.config.norm_diff_max
+                    norm_diff_min = self.config.norm_diff_min
+
+                    if norm_diff_max != norm_diff_min:
+                        norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
+                    else:
+                        norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
+                    halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
 
                 if not self.config.no_ACT_continue:
                     # Compute target Q

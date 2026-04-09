@@ -5,6 +5,10 @@ loss:
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
+use_act: True
+halt_norm_in_use_act: False
+norm_diff_max: 0.1
+norm_diff_min: 0.001
 
 H_cycles: 3
 L_cycles: 4
@@ -15,6 +19,7 @@ L_layers: 2
 hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
 expansion: 4
+attn_dropout: 0.0
 
 puzzle_emb_ndim: ${.hidden_size}
 
