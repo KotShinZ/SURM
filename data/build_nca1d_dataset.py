@@ -37,7 +37,7 @@ class NCA1DDataConfig(BaseModel):
     test_size: int = 256
     seed: int = 0
 
-    state_height: int = 16
+    state_height: int = 9
     state_height_min: Optional[int] = None
     state_height_max: Optional[int] = None
     state_width: int = 1
@@ -51,11 +51,14 @@ class NCA1DDataConfig(BaseModel):
     # Use patch_size=1 so 1-column NCA states remain tokenizable for gzip filtering.
     patch_size: int = 1
 
-    rollout_steps: int = 64
+    rollout_steps: int = 9
     rollout_steps_min: Optional[int] = None
     rollout_steps_max: Optional[int] = None
     time_subsample: int = 1
     start_step: int = 0
+    # When both are set, these directly specify the raw trajectory window [time_start, time_end].
+    time_start: Optional[int] = 30
+    time_end: Optional[int] = 38
 
     gzip_threshold_low: Optional[float] = None
     gzip_threshold_high: Optional[float] = None
@@ -77,11 +80,33 @@ class NCA1DDataConfig(BaseModel):
 
     @property
     def sampled_rollout_steps_min(self) -> int:
+        if self.uses_explicit_time_range:
+            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_min is None else self.rollout_steps_min
 
     @property
     def sampled_rollout_steps_max(self) -> int:
+        if self.uses_explicit_time_range:
+            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_max is None else self.rollout_steps_max
+
+    @property
+    def uses_explicit_time_range(self) -> bool:
+        return self.time_start is not None or self.time_end is not None
+
+    @property
+    def resolved_start_step(self) -> int:
+        return self.start_step if self.time_start is None else self.time_start
+
+    @property
+    def selected_time_span(self) -> int:
+        if self.time_start is None or self.time_end is None:
+            raise ValueError("time_start and time_end must both be set to use an explicit time range.")
+        return self.time_end - self.time_start + 1
+
+    @property
+    def resolved_time_end(self) -> int:
+        return self.resolved_start_step + self.sampled_rollout_steps_max - 1
 
     @property
     def valid_state_heights(self) -> list[int]:
@@ -127,7 +152,7 @@ class NCA1DDataConfig(BaseModel):
                 f"got range=({self.sampled_state_height_min}, {self.sampled_state_height_max}) "
                 f"and patch_size={self.patch_size}"
             )
-        if self.rollout_steps <= 0:
+        if not self.uses_explicit_time_range and self.rollout_steps <= 0:
             raise ValueError(f"rollout_steps must be > 0, got {self.rollout_steps}")
         if self.sampled_rollout_steps_min <= 0:
             raise ValueError(
@@ -143,6 +168,15 @@ class NCA1DDataConfig(BaseModel):
             raise ValueError(f"time_subsample must be > 0, got {self.time_subsample}")
         if self.start_step < 0:
             raise ValueError(f"start_step must be >= 0, got {self.start_step}")
+        if self.uses_explicit_time_range:
+            if self.time_start is None or self.time_end is None:
+                raise ValueError("time_start and time_end must both be set when using an explicit time range.")
+            if self.time_start < 0:
+                raise ValueError(f"time_start must be >= 0, got {self.time_start}")
+            if self.time_end < self.time_start:
+                raise ValueError(
+                    f"time_end must be >= time_start, got time_start={self.time_start}, time_end={self.time_end}"
+                )
         if self.batch_candidate_size <= 0:
             raise ValueError(f"batch_candidate_size must be > 0, got {self.batch_candidate_size}")
         if self.max_sampling_rounds <= 0:
@@ -201,9 +235,9 @@ def make_nca_config(config: NCA1DDataConfig) -> NCAConfig:
         hidden_dim=config.hidden_dim,
         patch_size=config.patch_size,
         seq_len=config.seq_len,
-        rollout_steps=config.rollout_steps,
+        rollout_steps=config.sampled_rollout_steps_max,
         time_subsample=config.time_subsample,
-        start_step=config.start_step,
+        start_step=config.resolved_start_step,
         gzip_threshold_low=config.gzip_threshold_low or 0.0,
         gzip_threshold_high=config.gzip_threshold_high,
         batch_candidate_size=config.batch_candidate_size,
@@ -232,7 +266,7 @@ def make_nca_config_for_sample(
         seq_len=config.seq_len,
         rollout_steps=rollout_steps,
         time_subsample=config.time_subsample,
-        start_step=config.start_step,
+        start_step=config.resolved_start_step,
         gzip_threshold_low=config.gzip_threshold_low or 0.0,
         gzip_threshold_high=config.gzip_threshold_high,
         batch_candidate_size=config.batch_candidate_size,
@@ -461,8 +495,11 @@ def save_dataset_config(config: NCA1DDataConfig) -> None:
                 **config.model_dump(),
                 "resolved_state_height_min": config.sampled_state_height_min,
                 "resolved_state_height_max": config.sampled_state_height_max,
+                "resolved_start_step": config.resolved_start_step,
                 "resolved_rollout_steps_min": config.sampled_rollout_steps_min,
                 "resolved_rollout_steps_max": config.sampled_rollout_steps_max,
+                "resolved_time_start": config.resolved_start_step,
+                "resolved_time_end": config.resolved_time_end,
                 "num_frames": config.max_num_frames,
                 "max_num_frames": config.max_num_frames,
                 "seq_len": config.seq_len,
