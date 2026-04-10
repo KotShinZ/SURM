@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from argdantic import ArgParser
 from pydantic import BaseModel, model_validator
 from tqdm import tqdm
@@ -19,9 +21,7 @@ from data.common import PuzzleDatasetMetadata
 from NCA_datas.NCA_data import (
     NCAConfig,
     NCATokenizer,
-    RandomDiscreteNCA,
     get_device,
-    rollout_trajectory,
     score_trajectory_gzip,
     seed_everything,
 )
@@ -63,6 +63,7 @@ class NCA1DDataConfig(BaseModel):
     gzip_threshold_low: Optional[float] = None
     gzip_threshold_high: Optional[float] = None
 
+    # Number of candidate trajectories to generate in parallel per sampling round.
     batch_candidate_size: int = 64
     max_sampling_rounds: int = 200
 
@@ -278,6 +279,111 @@ def make_nca_config_for_sample(
     )
 
 
+def num_frames_for_rollout_steps(rollout_steps: int, time_subsample: int) -> int:
+    return math.ceil(rollout_steps / time_subsample)
+
+
+def _sample_batched_rule_parameters(
+    cfg: NCAConfig,
+    batch_size: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    return {
+        "conv3_weight": torch.randn(
+            batch_size,
+            cfg.conv_channels,
+            cfg.num_colors,
+            3,
+            3,
+            device=device,
+        ),
+        "conv3_bias": torch.randn(batch_size, cfg.conv_channels, device=device),
+        "fc1_weight": torch.randn(
+            batch_size,
+            cfg.hidden_dim,
+            cfg.conv_channels,
+            1,
+            1,
+            device=device,
+        ),
+        "fc1_bias": torch.randn(batch_size, cfg.hidden_dim, device=device),
+        "fc2_weight": torch.randn(
+            batch_size,
+            cfg.num_colors,
+            cfg.hidden_dim,
+            1,
+            1,
+            device=device,
+        ),
+        "fc2_bias": torch.randn(batch_size, cfg.num_colors, device=device),
+    }
+
+
+def _batched_step(
+    state: torch.Tensor,
+    rule_parameters: Dict[str, torch.Tensor],
+    cfg: NCAConfig,
+) -> torch.Tensor:
+    batch_size, height, width = state.shape
+    num_colors = cfg.num_colors
+
+    x = F.one_hot(state.long(), num_classes=num_colors).float().permute(0, 3, 1, 2).contiguous()
+    x = F.pad(x, (1, 1, 1, 1), mode="circular")
+    x = F.conv2d(
+        x.reshape(1, batch_size * num_colors, height + 2, width + 2),
+        rule_parameters["conv3_weight"].reshape(batch_size * cfg.conv_channels, num_colors, 3, 3),
+        bias=rule_parameters["conv3_bias"].reshape(batch_size * cfg.conv_channels),
+        groups=batch_size,
+    )
+    x = x.reshape(batch_size, cfg.conv_channels, height, width)
+    x = F.conv2d(
+        x.reshape(1, batch_size * cfg.conv_channels, height, width),
+        rule_parameters["fc1_weight"].reshape(batch_size * cfg.hidden_dim, cfg.conv_channels, 1, 1),
+        bias=rule_parameters["fc1_bias"].reshape(batch_size * cfg.hidden_dim),
+        groups=batch_size,
+    )
+    x = F.relu(x.reshape(batch_size, cfg.hidden_dim, height, width))
+    x = F.conv2d(
+        x.reshape(1, batch_size * cfg.hidden_dim, height, width),
+        rule_parameters["fc2_weight"].reshape(batch_size * num_colors, cfg.hidden_dim, 1, 1),
+        bias=rule_parameters["fc2_bias"].reshape(batch_size * num_colors),
+        groups=batch_size,
+    )
+    logits = x.reshape(batch_size, num_colors, height, width).permute(0, 2, 3, 1).contiguous()
+    one_hot_state = F.one_hot(state.long(), num_classes=num_colors).float()
+    logits = logits + cfg.identity_bias * one_hot_state
+    logits = logits / max(cfg.temperature, 1e-8)
+    probs = torch.softmax(logits, dim=-1)
+    next_state = torch.multinomial(probs.reshape(-1, num_colors), num_samples=1)
+    return next_state.reshape(batch_size, height, width)
+
+
+@torch.no_grad()
+def rollout_trajectories_batched(
+    cfg: NCAConfig,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    state = torch.randint(
+        low=0,
+        high=cfg.num_colors,
+        size=(batch_size, cfg.grid_height, cfg.grid_width),
+        device=device,
+        dtype=torch.long,
+    )
+    rule_parameters = _sample_batched_rule_parameters(cfg, batch_size=batch_size, device=device)
+    frames: list[torch.Tensor] = []
+    total_steps = cfg.start_step + cfg.rollout_steps
+
+    for t in range(total_steps):
+        if t >= cfg.start_step and ((t - cfg.start_step) % cfg.time_subsample == 0):
+            frames.append(state)
+        state = _batched_step(state, rule_parameters, cfg)
+
+    trajectories = torch.stack(frames, dim=1)
+    return trajectories.detach().cpu().numpy().astype(np.int16, copy=False)
+
+
 def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
     if trajectory.ndim != 3:
         raise ValueError(f"trajectory must have shape [T, H, W], got ndim={trajectory.ndim}")
@@ -372,25 +478,57 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     num_frames: list[int] = []
     rollout_steps: list[int] = []
 
-    total_candidates = config.batch_candidate_size * config.max_sampling_rounds
+    min_rounds_for_size = math.ceil(size / config.batch_candidate_size)
+    effective_max_sampling_rounds = max(config.max_sampling_rounds, min_rounds_for_size)
+    total_candidates = config.batch_candidate_size * effective_max_sampling_rounds
     progress = tqdm(total=size, desc=f"Generating {split_name}", leave=False)
 
     rounds = 0
-    while len(flat_images) < size and rounds < config.max_sampling_rounds:
+    while len(flat_images) < size and rounds < effective_max_sampling_rounds:
         rounds += 1
-        for _candidate_idx in range(config.batch_candidate_size):
-            sampled_state_height = int(rng.choice(config.valid_state_heights))
-            sampled_rollout_steps = int(
-                rng.integers(config.sampled_rollout_steps_min, config.sampled_rollout_steps_max + 1)
-            )
+        sampled_state_heights = rng.choice(config.valid_state_heights, size=config.batch_candidate_size)
+        sampled_rollout_steps = rng.integers(
+            config.sampled_rollout_steps_min,
+            config.sampled_rollout_steps_max + 1,
+            size=config.batch_candidate_size,
+        )
+
+        candidate_trajectories: list[Optional[np.ndarray]] = [None] * config.batch_candidate_size
+        candidate_tokenizers: list[Optional[NCATokenizer]] = [None] * config.batch_candidate_size
+
+        for sampled_state_height in np.unique(sampled_state_heights):
+            group_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
+            max_rollout_steps = int(sampled_rollout_steps[group_indices].max())
             nca_config = make_nca_config_for_sample(
                 config,
-                state_height=sampled_state_height,
-                rollout_steps=sampled_rollout_steps,
+                state_height=int(sampled_state_height),
+                rollout_steps=max_rollout_steps,
             )
             tokenizer = NCATokenizer(nca_config)
-            rule = RandomDiscreteNCA(nca_config).to(device)
-            trajectory = rollout_trajectory(rule, nca_config, device=device)
+            trajectories = rollout_trajectories_batched(
+                nca_config,
+                batch_size=int(group_indices.size),
+                device=device,
+            )
+
+            for local_idx, candidate_idx in enumerate(group_indices):
+                candidate_trajectories[int(candidate_idx)] = trajectories[local_idx]
+                candidate_tokenizers[int(candidate_idx)] = tokenizer
+
+        for candidate_idx in range(config.batch_candidate_size):
+            sampled_state_height = int(sampled_state_heights[candidate_idx])
+            sampled_rollout_step_count = int(sampled_rollout_steps[candidate_idx])
+            sampled_num_frames = num_frames_for_rollout_steps(
+                sampled_rollout_step_count,
+                config.time_subsample,
+            )
+            trajectory = candidate_trajectories[candidate_idx]
+            tokenizer = candidate_tokenizers[candidate_idx]
+
+            if trajectory is None or tokenizer is None:
+                raise RuntimeError("Batched candidate generation failed to produce a trajectory.")
+
+            trajectory = trajectory[:sampled_num_frames]
             gzip_score = score_trajectory_gzip(trajectory, tokenizer)
 
             if not _passes_gzip_filter(gzip_score, config):
@@ -408,7 +546,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
             gzip_scores.append(gzip_score)
             state_heights.append(sampled_state_height)
             num_frames.append(int(time_image.shape[1]))
-            rollout_steps.append(sampled_rollout_steps)
+            rollout_steps.append(sampled_rollout_step_count)
             progress.update(1)
 
             if len(flat_images) >= size:
@@ -419,7 +557,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     if len(flat_images) < size:
         raise RuntimeError(
             f"Could not collect enough {split_name} examples. "
-            f"Collected {len(flat_images)} / {size} after {total_candidates} candidates. "
+            f"Collected {len(flat_images)} / {size} after {rounds} rounds ({total_candidates} candidates budget). "
             "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
         )
 
