@@ -1,5 +1,5 @@
 from typing import Tuple, List, Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import torch
 import copy
@@ -66,14 +66,16 @@ class TRMConfig(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    variable_seq_lengths: bool = False
+    profile: bool = False
 
 class TRMBlock(nn.Module):
     def __init__(self, config: TRMConfig) -> None:
         super().__init__()
 
         self.config = config
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
         if self.config.mlp_t:
-            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
             self.mlp_t = SwiGLU(
                 hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
                 expansion=config.expansion,
@@ -86,6 +88,7 @@ class TRMBlock(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False,
                 attn_dropout=config.attn_dropout,
+                prefix_seq_len=self.puzzle_emb_len,
             )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
@@ -94,7 +97,13 @@ class TRMBlock(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
         
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, compute_target_q=False) -> torch.Tensor:
+    def forward(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        sequence_lengths: Optional[torch.Tensor] = None,
+        compute_target_q=False,
+    ) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.config.mlp_t:
@@ -104,7 +113,15 @@ class TRMBlock(nn.Module):
             hidden_states = hidden_states.transpose(1,2)
         else:
             # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+            hidden_states = rms_norm(
+                hidden_states
+                + self.self_attn(
+                    cos_sin=cos_sin,
+                    hidden_states=hidden_states,
+                    sequence_lengths=sequence_lengths,
+                ),
+                variance_epsilon=self.norm_eps,
+            )
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -183,15 +200,18 @@ class TRM_Inner(nn.Module):
         # Position embeddings
         if self.config.pos_encodings == "learned":
             # scale by 1/sqrt(2) to maintain forward variance
-            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+            embedding = 0.707106781 * (
+                embedding + self.embed_pos.embedding_weight[: embedding.shape[1]].to(self.forward_dtype)
+            )
 
         # Scale
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int):
+    def empty_carry(self, batch_size: int, seq_len: Optional[int] = None):
+        carry_seq_len = self.config.seq_len if seq_len is None else seq_len
         return TRMInnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, carry_seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, carry_seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TRMInnerCarry):
@@ -199,6 +219,11 @@ class TRM_Inner(nn.Module):
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
+
+    def _sequence_lengths(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self.config.variable_seq_lengths or "seq_lengths" not in batch:
+            return None
+        return batch["seq_lengths"].to(torch.int32) + self.puzzle_emb_len
 
     def forward(
         self,
@@ -208,6 +233,7 @@ class TRM_Inner(nn.Module):
     ) -> Tuple[ TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor] ]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+            sequence_lengths=self._sequence_lengths(batch),
         )
 
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -247,9 +273,10 @@ class TRM(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        seq_len = batch["inputs"].shape[1] if self.config.variable_seq_lengths else None
 
         return TRMCarry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
@@ -257,15 +284,74 @@ class TRM(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
 
-    def norm_func(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    def _pad_to_seq_len(self, key: str, value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+        if value.ndim < 2 or value.shape[1] == target_seq_len:
+            return value
+        if value.shape[1] > target_seq_len:
+            return value[:, :target_seq_len]
+
+        pad_shape = list(value.shape)
+        pad_shape[1] = target_seq_len - value.shape[1]
+        pad_value = -100 if key == "labels" else 0
+        return torch.cat(
+            [value, torch.full(pad_shape, pad_value, dtype=value.dtype, device=value.device)],
+            dim=1,
+        )
+
+    def _pad_hidden(self, value: torch.Tensor, target_hidden_len: int) -> torch.Tensor:
+        if value.shape[1] == target_hidden_len:
+            return value
+        if value.shape[1] > target_hidden_len:
+            return value[:, :target_hidden_len]
+
+        pad_shape = list(value.shape)
+        pad_shape[1] = target_hidden_len - value.shape[1]
+        return torch.cat(
+            [value, torch.zeros(pad_shape, dtype=value.dtype, device=value.device)],
+            dim=1,
+        )
+
+    def _align_variable_batch(self, carry: TRMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+        if not self.config.variable_seq_lengths:
+            return carry, batch
+
+        if bool(carry.halted.all().item()):
+            target_seq_len = batch["inputs"].shape[1]
+        else:
+            target_seq_len = max(carry.current_data["inputs"].shape[1], batch["inputs"].shape[1])
+        target_hidden_len = target_seq_len + self.inner.puzzle_emb_len
+        aligned_batch = {k: self._pad_to_seq_len(k, v, target_seq_len) for k, v in batch.items()}
+        aligned_current_data = {k: self._pad_to_seq_len(k, v, target_seq_len) for k, v in carry.current_data.items()}
+        aligned_inner = TRMInnerCarry(
+            z_H=self._pad_hidden(carry.inner_carry.z_H, target_hidden_len),
+            z_L=self._pad_hidden(carry.inner_carry.z_L, target_hidden_len),
+        )
+
+        return replace(carry, inner_carry=aligned_inner, current_data=aligned_current_data), aligned_batch
+
+    def norm_func(self, x1: torch.Tensor, x2: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if seq_lengths is not None:
+            lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
+            mask = torch.arange(x1.shape[1], device=x1.device).unsqueeze(0) < lengths.unsqueeze(1)
+            mask = mask.unsqueeze(-1)
+            diff_norm = torch.norm(torch.where(mask, x1 - x2, torch.zeros_like(x1)), dim=(1, 2))
+            sum_norm = torch.norm(torch.where(mask, x1 + x2, torch.zeros_like(x1)), dim=(1, 2))
+            return diff_norm / (1e-7 + sum_norm / 2)
         return torch.norm(x1 - x2, dim=(1, 2)) / (1e-7 + torch.norm(x1 + x2, dim=(1, 2)) / 2)
 
-    def carry_diff_norm(self, x1: TRMInnerCarry, x2: TRMInnerCarry) -> torch.Tensor:
-        z_h_diff = self.norm_func(x1.z_H.detach(), x2.z_H.detach())
-        z_l_diff = self.norm_func(x1.z_L.detach(), x2.z_L.detach())
+    def carry_diff_norm(
+        self,
+        x1: TRMInnerCarry,
+        x2: TRMInnerCarry,
+        seq_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        z_h_diff = self.norm_func(x1.z_H.detach(), x2.z_H.detach(), seq_lengths)
+        z_l_diff = self.norm_func(x1.z_L.detach(), x2.z_L.detach(), seq_lengths)
         return torch.maximum(z_h_diff, z_l_diff)
         
     def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor], compute_target_q=False) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+
+        carry, batch = self._align_variable_batch(carry, batch)
 
         # Update data, carry (removing halted sequences)
         reset_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -276,7 +362,11 @@ class TRM(nn.Module):
 
         # Forward inner model
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(reset_inner_carry, new_current_data)
-        hidden_diff_norm = self.carry_diff_norm(new_inner_carry, reset_inner_carry)
+        hidden_diff_norm = self.carry_diff_norm(
+            new_inner_carry,
+            reset_inner_carry,
+            new_current_data.get("seq_lengths") if self.config.variable_seq_lengths else None,
+        )
 
         outputs = {
             "logits": logits,

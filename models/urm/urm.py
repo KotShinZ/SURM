@@ -56,6 +56,8 @@ class URMConfig(BaseModel):
     patch_height: int = 2
     patch_width: int = 2
     patch_pre_embedding_size: int = 3
+    variable_seq_lengths: bool = False
+    profile: bool = False
 
 
 class URMBlock(nn.Module):
@@ -85,8 +87,18 @@ class URMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, window_size=-1)
+    def forward(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        sequence_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        attn_output = self.self_attn(
+            cos_sin=cos_sin,
+            hidden_states=hidden_states,
+            window_size=-1,
+            sequence_lengths=sequence_lengths,
+        )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
@@ -107,6 +119,9 @@ class URM_Inner(nn.Module):
         self.padded_grid_height = self.config.grid_height
         self.padded_grid_width = self.config.grid_width
         self.padded_seq_len = self.config.seq_len
+
+        if self.config.variable_seq_lengths and self.config.patch_io_enabled:
+            raise ValueError("variable_seq_lengths is not supported with patch_io_enabled")
 
         if self.config.patch_io_enabled:
             if self.config.grid_height > 0 or self.config.grid_width > 0:
@@ -286,11 +301,12 @@ class URM_Inner(nn.Module):
 
         return embedding
 
-    def empty_carry(self, batch_size: int) -> URMCarry:
+    def empty_carry(self, batch_size: int, seq_len: Optional[int] = None) -> URMCarry:
+        carry_seq_len = self.inner_seq_len if seq_len is None else seq_len
         return URMCarry(
             current_hidden=torch.empty(
                 batch_size,
-                self.inner_seq_len + self.puzzle_emb_len,
+                carry_seq_len + self.puzzle_emb_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
             ),
@@ -304,12 +320,25 @@ class URM_Inner(nn.Module):
         )
         return replace(carry, current_hidden=new_hidden)
 
+    def _rotary_cos_sin(self, batch: Dict[str, torch.Tensor]):
+        if "position_ids" in batch and isinstance(self.rotary_emb, RotaryEmbedding2D):
+            return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.puzzle_emb_len)
+        return self.rotary_emb()
+
+    def _sequence_lengths(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self.config.variable_seq_lengths or "seq_lengths" not in batch:
+            return None
+        return batch["seq_lengths"].to(torch.int32) + self.puzzle_emb_len
+
     def forward(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        seq_info = dict(cos_sin=self.rotary_emb())
+        seq_info = dict(
+            cos_sin=self._rotary_cos_sin(batch),
+            sequence_lengths=self._sequence_lengths(batch),
+        )
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         hidden_states = carry.current_hidden
@@ -383,7 +412,8 @@ class URM(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> URMCarry:
         batch_size = batch["inputs"].shape[0]
-        base = self.inner.empty_carry(batch_size)
+        seq_len = batch["inputs"].shape[1] if self.config.variable_seq_lengths else None
+        base = self.inner.empty_carry(batch_size, seq_len=seq_len)
         return URMCarry(
             current_hidden=base.current_hidden,
             steps=torch.zeros((batch_size,), dtype=torch.int32),
@@ -391,8 +421,64 @@ class URM(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
         
-    def norm_func(self, x1, x2):
+    def _pad_to_seq_len(self, key: str, value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+        if value.ndim < 2 or value.shape[1] == target_seq_len:
+            return value
+        if value.shape[1] > target_seq_len:
+            return value[:, :target_seq_len]
+
+        pad_shape = list(value.shape)
+        pad_shape[1] = target_seq_len - value.shape[1]
+        pad_value = -100 if key == "labels" else 0
+        return torch.cat(
+            [value, torch.full(pad_shape, pad_value, dtype=value.dtype, device=value.device)],
+            dim=1,
+        )
+
+    def _align_variable_batch(self, carry: URMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        if not self.config.variable_seq_lengths or carry.current_data is None:
+            return carry, batch
+
+        if bool(carry.halted.all().item()):
+            target_seq_len = batch["inputs"].shape[1]
+        else:
+            target_seq_len = max(carry.current_data["inputs"].shape[1], batch["inputs"].shape[1])
+        target_hidden_len = target_seq_len + self.inner.puzzle_emb_len
+
+        aligned_batch = {
+            k: self._pad_to_seq_len(k, v, target_seq_len)
+            for k, v in batch.items()
+        }
+        aligned_current_data = {
+            k: self._pad_to_seq_len(k, v, target_seq_len)
+            for k, v in carry.current_data.items()
+        }
+        aligned_hidden = carry.current_hidden
+        if aligned_hidden.shape[1] != target_hidden_len:
+            if aligned_hidden.shape[1] > target_hidden_len:
+                aligned_hidden = aligned_hidden[:, :target_hidden_len]
+            else:
+                pad_shape = list(aligned_hidden.shape)
+                pad_shape[1] = target_hidden_len - aligned_hidden.shape[1]
+                aligned_hidden = torch.cat(
+                    [
+                        aligned_hidden,
+                        torch.zeros(pad_shape, dtype=aligned_hidden.dtype, device=aligned_hidden.device),
+                    ],
+                    dim=1,
+                )
+
+        return replace(carry, current_hidden=aligned_hidden, current_data=aligned_current_data), aligned_batch
+
+    def norm_func(self, x1, x2, seq_lengths: Optional[torch.Tensor] = None):
         #return torch.norm(x1 - x2, dim=(1,2))
+        if seq_lengths is not None:
+            lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
+            mask = torch.arange(x1.shape[1], device=x1.device).unsqueeze(0) < lengths.unsqueeze(1)
+            mask = mask.unsqueeze(-1)
+            diff_norm = torch.norm(torch.where(mask, x1 - x2, torch.zeros_like(x1)), dim=(1, 2))
+            sum_norm = torch.norm(torch.where(mask, x1 + x2, torch.zeros_like(x1)), dim=(1, 2))
+            return diff_norm / (1e-7 + sum_norm / 2)
         return torch.norm(x1 - x2, dim=(1,2)) / (1e-7 + torch.norm(x1 + x2, dim=(1,2)) / 2)
 
     def forward(
@@ -402,6 +488,7 @@ class URM(nn.Module):
         compute_target_q=False
     ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
 
+        carry, batch = self._align_variable_batch(carry, batch)
         new_carry = self.inner.reset_carry(carry.halted, carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         new_current_data = {
@@ -415,7 +502,11 @@ class URM(nn.Module):
 
         new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
         
-        hidden_diff_norm = self.norm_func(new_carry2.current_hidden.detach(), new_carry.current_hidden.detach())
+        hidden_diff_norm = self.norm_func(
+            new_carry2.current_hidden.detach(),
+            new_carry.current_hidden.detach(),
+            new_current_data.get("seq_lengths") if self.config.variable_seq_lengths else None,
+        )
         sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
         steps_count = torch.bincount(new_carry2.steps.cpu(), minlength=self.config.loops + 1) # (loops + 1,)
         mean_norm_with_steps = sum_norm_with_steps / steps_count.clamp_min(1)

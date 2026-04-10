@@ -7,6 +7,8 @@ import yaml
 import shutil
 import re
 import copy
+import time
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -147,6 +149,10 @@ class PretrainConfig(pydantic.BaseModel):
     # Replace model inputs with a randomly masked version of the labels.
     masked_input: Optional[MaskedInputConfig] = None
 
+    # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
+    benchmark_steps: int = 0
+    benchmark_warmup_steps: int = 1
+
 
 
 @dataclass
@@ -166,7 +172,11 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
         rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
 
         for set_name, dataset in self._data.items():  # type: ignore
-            total_examples = len(dataset["inputs"])
+            total_examples = (
+                dataset["seq_offsets"].size - 1
+                if self.metadata.variable_seq_lengths
+                else len(dataset["inputs"])
+            )
             shuffled_indices = rng.permutation(total_examples)
 
             start_index = 0
@@ -179,15 +189,9 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
                 local_indices = global_indices[local_start:local_end]
                 puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
 
-                batch = self._collate_batch(
-                    {
-                        "inputs": dataset["inputs"][local_indices],
-                        "labels": dataset["labels"][local_indices],
-                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
-                    },
-                    rng,
-                    make_masked_inputs=False,
-                )
+                batch_fields = self._select_examples(dataset, local_indices)
+                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][puzzle_indices]
+                batch = self._collate_batch(batch_fields, rng, make_masked_inputs=False)
 
                 yield set_name, batch, end_index - start_index
 
@@ -224,6 +228,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        variable_seq_lengths=train_metadata.variable_seq_lengths,
         causal=False,  # Non-autoregressive
     )
 
@@ -688,6 +693,95 @@ def train_batch(
             return reduced_metrics
 
 
+def benchmark_training_steps(
+    config: PretrainConfig,
+    train_state: TrainState,
+    train_loader: torch.utils.data.DataLoader,
+    rank: int,
+    world_size: int,
+):
+    warmup_steps = max(0, config.benchmark_warmup_steps)
+    measure_steps = max(1, config.benchmark_steps)
+    target_completed = warmup_steps + measure_steps
+    step_times_ms: List[float] = []
+    step_wall_times_s: List[float] = []
+    completed_optimizer_steps = 0
+    active_start_event: Optional[torch.cuda.Event] = None
+    active_start_wall: Optional[float] = None
+
+    if rank == 0:
+        print(
+            "Starting benchmark: "
+            f"warmup_steps={warmup_steps}, measure_steps={measure_steps}, "
+            f"grad_accum_steps={config.grad_accum_steps}"
+        )
+
+    train_state.model.train()
+    torch.cuda.synchronize()
+
+    while completed_optimizer_steps < target_completed:
+        progressed = False
+        for _set_name, batch, global_batch_size in train_loader:
+            progressed = True
+            if train_state.accum_step == 0:
+                active_start_event = torch.cuda.Event(enable_timing=True)
+                active_start_event.record()
+                active_start_wall = time.perf_counter()
+
+            before_step = train_state.step
+            train_batch(
+                config,
+                train_state,
+                batch,
+                global_batch_size,
+                rank=rank,
+                world_size=world_size,
+            )
+
+            if train_state.step > before_step:
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record()
+                torch.cuda.synchronize()
+
+                completed_optimizer_steps += 1
+                if completed_optimizer_steps > warmup_steps and active_start_event is not None:
+                    step_times_ms.append(active_start_event.elapsed_time(end_event))
+                    if active_start_wall is not None:
+                        step_wall_times_s.append(time.perf_counter() - active_start_wall)
+
+                    if rank == 0:
+                        print(
+                            f"Benchmark step {len(step_times_ms)}/{measure_steps}: "
+                            f"{step_times_ms[-1] / 1000.0:.4f}s"
+                        )
+
+                active_start_event = None
+                active_start_wall = None
+
+                if completed_optimizer_steps >= target_completed:
+                    break
+
+        if not progressed:
+            raise RuntimeError("Benchmark dataloader produced no batches.")
+
+    if rank != 0:
+        return
+
+    mean_ms = statistics.fmean(step_times_ms)
+    median_ms = statistics.median(step_times_ms)
+    result = {
+        "optimizer_steps": len(step_times_ms),
+        "warmup_optimizer_steps": warmup_steps,
+        "grad_accum_steps": config.grad_accum_steps,
+        "mean_step_s": mean_ms / 1000.0,
+        "median_step_s": median_ms / 1000.0,
+        "mean_microbatch_s": mean_ms / 1000.0 / max(1, config.grad_accum_steps),
+        "median_microbatch_s": median_ms / 1000.0 / max(1, config.grad_accum_steps),
+        "mean_wall_step_s": statistics.fmean(step_wall_times_s) if step_wall_times_s else None,
+    }
+    print("BENCHMARK_RESULTS " + json.dumps(result, sort_keys=True))
+
+
 def evaluate(
     config: PretrainConfig,
     train_state: TrainState,
@@ -988,29 +1082,39 @@ def launch(hydra_config: DictConfig):
     )
     
     # Eval loader
-    try:
-        eval_loader, eval_metadata = create_dataloader(
-            config,
-            "test",
-            test_set_mode=True,
-            epochs_per_iter=1,
-            global_batch_size=config.global_batch_size,
-            rank=RANK,
-            world_size=WORLD_SIZE,
-        )
-        print("len(eval_loader) =", len(eval_loader))
-        print("eval_problem_counts =", len(eval_loader) * config.global_batch_size)
-        print("eval_metadata =", eval_metadata)
-        # Evaluators
-        evaluators = create_evaluators(config, eval_metadata)
-    except FileNotFoundError as e:
-        print(f"eval metadata FileNotFoundError")
-        print(e)
+    if config.benchmark_steps > 0:
         eval_loader = eval_metadata = None
         evaluators = []
+    else:
+        try:
+            eval_loader, eval_metadata = create_dataloader(
+                config,
+                "test",
+                test_set_mode=True,
+                epochs_per_iter=1,
+                global_batch_size=config.global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
+            print("len(eval_loader) =", len(eval_loader))
+            print("eval_problem_counts =", len(eval_loader) * config.global_batch_size)
+            print("eval_metadata =", eval_metadata)
+            # Evaluators
+            evaluators = create_evaluators(config, eval_metadata)
+        except FileNotFoundError as e:
+            print(f"eval metadata FileNotFoundError")
+            print(e)
+            eval_loader = eval_metadata = None
+            evaluators = []
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+
+    if config.benchmark_steps > 0:
+        benchmark_training_steps(config, train_state, train_loader, rank=RANK, world_size=WORLD_SIZE)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
 
     ema_helper = None
     if config.ema:

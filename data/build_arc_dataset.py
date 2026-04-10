@@ -23,6 +23,7 @@ class DataProcessConfig(BaseModel):
 
     seed: int = 42
     num_aug: int = 1000
+    no_padding: bool = False
     
     
 ARCMaxGridSize = 30
@@ -49,7 +50,7 @@ def arc_grid_to_np(grid: List[List[int]]):
     return arr.astype(np.uint8)
 
 
-def np_grid_to_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_translation: bool):
+def np_grid_to_fixed_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_translation: bool):
     # PAD: 0, <eos>: 1, digits: 2 ... 11
     # Compute random top-left pad
     if do_translation:
@@ -74,6 +75,35 @@ def np_grid_to_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_tr
         result.append(grid.flatten())
 
     return result
+
+
+def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
+    # PAD: 0, <eos>: 1, digits: 2 ... 11
+    #
+    # The model still needs input and label sequences to have the same length.
+    # Use the smallest shared canvas that can contain both grids plus the EOS
+    # border when the ARC 30x30 limit leaves room for it.
+    canvas_h = max(inp.shape[0], out.shape[0])
+    canvas_w = max(inp.shape[1], out.shape[1])
+    if canvas_h < ARCMaxGridSize:
+        canvas_h += 1
+    if canvas_w < ARCMaxGridSize:
+        canvas_w += 1
+
+    result = []
+    for grid in [inp, out]:
+        nrow, ncol = grid.shape
+        canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+        canvas[:nrow, :ncol] = grid + 2
+
+        if nrow < canvas_h:
+            canvas[nrow, :ncol] = 1
+        if ncol < canvas_w:
+            canvas[:nrow, ncol] = 1
+
+        result.append(canvas.flatten())
+
+    return result, (canvas_h, canvas_w)
 
 
 def grid_hash(grid: np.ndarray):
@@ -281,7 +311,15 @@ def convert_dataset(config: DataProcessConfig):
                     # Push puzzle
                     no_aug_id = np.random.randint(0, len(puzzle.examples))
                     for _idx_ex, (inp, out) in enumerate(puzzle.examples):
-                        inp, out = np_grid_to_seq_translational_augment(inp, out, do_translation=enable_translational_augment and _idx_ex != no_aug_id)
+                        if config.no_padding:
+                            (inp, out), seq_shape = np_grids_to_unpadded_seq(inp, out)
+                            results.setdefault("seq_shapes", []).append(seq_shape)
+                        else:
+                            inp, out = np_grid_to_fixed_seq_translational_augment(
+                                inp,
+                                out,
+                                do_translation=enable_translational_augment and _idx_ex != no_aug_id,
+                            )
                             
                         results["inputs"].append(inp)
                         results["labels"].append(out)
@@ -301,12 +339,30 @@ def convert_dataset(config: DataProcessConfig):
                 total_groups += 1
             
             for k, v in results.items():
-                if k in {"inputs", "labels"}:
-                    v = np.stack(v, 0)
+                if config.no_padding and k in {"inputs", "labels"}:
+                    seq_lengths = np.array([seq.shape[0] for seq in v], dtype=np.int64)
+                    seq_offsets = np.concatenate(
+                        [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
+                    )
+                    flat_tokens = np.concatenate(v).astype(np.uint8, copy=False)
+                    np.save(os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"), flat_tokens)
+                    if k == "inputs":
+                        np.save(
+                            os.path.join(config.output_dir, split_name, f"{subset_name}__seq_offsets.npy"),
+                            seq_offsets,
+                        )
+                elif k in {"inputs", "labels"}:
+                    np.save(os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"), np.stack(v, 0))
+                elif k == "seq_shapes":
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
+                        np.array(v, dtype=np.int32),
+                    )
                 else:
-                    v = np.array(v, dtype=np.int32)
-                
-                np.save(os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"), v)
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
+                        np.array(v, dtype=np.int32),
+                    )
         
         # Metadata
         metadata = PuzzleDatasetMetadata(
@@ -321,7 +377,8 @@ def convert_dataset(config: DataProcessConfig):
             
             total_groups=total_groups,
             mean_puzzle_examples=total_examples / total_puzzles,
-            sets=list(split.keys())
+            sets=list(split.keys()),
+            variable_seq_lengths=config.no_padding,
         )
         print(f"  Total puzzles: {total_puzzles}")
         print(f"  Total examples: {total_examples}")

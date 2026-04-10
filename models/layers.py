@@ -6,9 +6,9 @@ import torch.nn.functional as F
 import math
 
 try:
-    from flash_attn_interface import flash_attn_func
+    from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 except ImportError:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 try:
     from torch.nn.attention.flex_attention import flex_attention
@@ -142,6 +142,7 @@ class RotaryEmbedding2D(nn.Module):
     def __init__(self, dim: int, grid_height: int, grid_width: int,
                  puzzle_emb_len: int, base: float, device=None):
         super().__init__()
+        self.grid_width = grid_width
 
         half_dim = dim // 2  # each spatial axis gets half the head dimensions
 
@@ -171,8 +172,30 @@ class RotaryEmbedding2D(nn.Module):
         self.cos_col = nn.Buffer(col_emb.cos(), persistent=False)
         self.sin_col = nn.Buffer(col_emb.sin(), persistent=False)
 
-    def forward(self):
-        return self.cos_row, self.sin_row, self.cos_col, self.sin_col
+    def forward(self, position_ids: Optional[torch.Tensor] = None, prefix_seq_len: Optional[int] = None):
+        if position_ids is None:
+            return self.cos_row, self.sin_row, self.cos_col, self.sin_col
+
+        prefix_len = 0 if prefix_seq_len is None else prefix_seq_len
+        flat_ids = prefix_len + position_ids[..., 0].to(torch.long) * self.grid_width + position_ids[..., 1].to(torch.long)
+
+        cos_row = self.cos_row[flat_ids]
+        sin_row = self.sin_row[flat_ids]
+        cos_col = self.cos_col[flat_ids]
+        sin_col = self.sin_col[flat_ids]
+        if prefix_len > 0:
+            prefix_ids = torch.arange(prefix_len, device=position_ids.device)
+            prefix_shape = (position_ids.shape[0], prefix_len, self.cos_row.shape[-1])
+            prefix_cos_row = self.cos_row[prefix_ids].unsqueeze(0).expand(prefix_shape)
+            prefix_sin_row = self.sin_row[prefix_ids].unsqueeze(0).expand(prefix_shape)
+            prefix_cos_col = self.cos_col[prefix_ids].unsqueeze(0).expand(prefix_shape)
+            prefix_sin_col = self.sin_col[prefix_ids].unsqueeze(0).expand(prefix_shape)
+            cos_row = torch.cat([prefix_cos_row, cos_row], dim=1)
+            sin_row = torch.cat([prefix_sin_row, sin_row], dim=1)
+            cos_col = torch.cat([prefix_cos_col, cos_col], dim=1)
+            sin_col = torch.cat([prefix_sin_col, sin_col], dim=1)
+
+        return cos_row, sin_row, cos_col, sin_col
 
 class Attention(nn.Module):
     def __init__(
@@ -320,7 +343,67 @@ class Attention(nn.Module):
             return self._masked_score(score, keep_mask[batch, head, q_idx, kv_idx])
         return score_mod
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, window_size=-1) -> torch.Tensor:
+    def _slice_cos_sin(self, cos_sin: Optional[CosSin], seq_len: int) -> Optional[CosSin]:
+        if cos_sin is None:
+            return None
+        return tuple(x[..., :seq_len, :] if x.shape[-2] != seq_len else x for x in cos_sin)
+
+    def _flash_attn_varlen_output(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        *,
+        window_size: Tuple[int, int],
+        dropout_p: float,
+    ) -> torch.Tensor:
+        batch_size, seq_len = query.shape[:2]
+        lengths = sequence_lengths.to(device=query.device, dtype=torch.int32).clamp(min=0, max=seq_len)
+
+        cu_seqlens = F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
+        max_seqlen = int(lengths.max().item())
+        if max_seqlen == 0:
+            return torch.zeros_like(query)
+
+        token_mask = torch.arange(seq_len, device=query.device).unsqueeze(0) < lengths.unsqueeze(1)
+        query_unpad = query[token_mask].contiguous()
+        key_unpad = key[token_mask].contiguous()
+        value_unpad = value[token_mask].contiguous()
+
+        attn_output = flash_attn_varlen_func(
+            q=query_unpad,
+            k=key_unpad,
+            v=value_unpad,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=self.causal,
+            window_size=window_size,
+            dropout_p=dropout_p,
+        )
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+
+        padded_output = torch.zeros(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+            device=query.device,
+            dtype=attn_output.dtype,
+        )
+        padded_output[token_mask] = attn_output
+        return padded_output
+
+    def forward(
+        self,
+        cos_sin: Optional[CosSin],
+        hidden_states: torch.Tensor,
+        window_size=-1,
+        sequence_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         # hidden_states: [bs, seq_len, num_heads, head_dim]
@@ -333,6 +416,7 @@ class Attention(nn.Module):
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
 
         # RoPE (1D or 2D)
+        cos_sin = self._slice_cos_sin(cos_sin, seq_len)
         if cos_sin is not None:
             if len(cos_sin) == 4:
                 # 2D RoPE: (cos_row, sin_row, cos_col, sin_col)
@@ -346,23 +430,43 @@ class Attention(nn.Module):
         effective_window_size = self.attention_window_size if window_size == -1 else window_size
 
         if self.attention_type == "full":
-            attn_output = flash_attn_func(
-                q=query,
-                k=key,
-                v=value,
-                causal=self.causal,
-                window_size=(-1, -1),
-                dropout_p=dropout_p,
-            )
+            if sequence_lengths is None:
+                attn_output = flash_attn_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    causal=self.causal,
+                    window_size=(-1, -1),
+                    dropout_p=dropout_p,
+                )
+            else:
+                attn_output = self._flash_attn_varlen_output(
+                    query,
+                    key,
+                    value,
+                    sequence_lengths,
+                    window_size=(-1, -1),
+                    dropout_p=dropout_p,
+                )
         elif self.attention_type == "swa":
-            attn_output = flash_attn_func(
-                q=query,
-                k=key,
-                v=value,
-                causal=self.causal,
-                window_size=(effective_window_size, effective_window_size),
-                dropout_p=dropout_p,
-            )
+            if sequence_lengths is None:
+                attn_output = flash_attn_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    causal=self.causal,
+                    window_size=(effective_window_size, effective_window_size),
+                    dropout_p=dropout_p,
+                )
+            else:
+                attn_output = self._flash_attn_varlen_output(
+                    query,
+                    key,
+                    value,
+                    sequence_lengths,
+                    window_size=(effective_window_size, effective_window_size),
+                    dropout_p=dropout_p,
+                )
         elif self.attention_type == "lsa":
             if seq_len <= 1:
                 attn_output = flash_attn_func(

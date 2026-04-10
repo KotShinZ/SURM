@@ -19,6 +19,7 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     total_groups: int
     mean_puzzle_examples: float
     sets: List[str]
+    variable_seq_lengths: bool = False
     # total_puzzles=876404
 
 
