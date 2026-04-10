@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from argdantic import ArgParser
 from pydantic import BaseModel, model_validator
 from tqdm import tqdm
@@ -19,9 +21,7 @@ from data.common import PuzzleDatasetMetadata
 from NCA_datas.NCA_data import (
     NCAConfig,
     NCATokenizer,
-    RandomDiscreteNCA,
     get_device,
-    rollout_trajectory,
     score_trajectory_gzip,
     seed_everything,
 )
@@ -37,7 +37,7 @@ class NCA1DDataConfig(BaseModel):
     test_size: int = 256
     seed: int = 0
 
-    state_height: int = 16
+    state_height: int = 9
     state_height_min: Optional[int] = None
     state_height_max: Optional[int] = None
     state_width: int = 1
@@ -51,15 +51,19 @@ class NCA1DDataConfig(BaseModel):
     # Use patch_size=1 so 1-column NCA states remain tokenizable for gzip filtering.
     patch_size: int = 1
 
-    rollout_steps: int = 64
+    rollout_steps: int = 9
     rollout_steps_min: Optional[int] = None
     rollout_steps_max: Optional[int] = None
     time_subsample: int = 1
     start_step: int = 0
+    # When both are set, these directly specify the raw trajectory window [time_start, time_end].
+    time_start: Optional[int] = 30
+    time_end: Optional[int] = 38
 
     gzip_threshold_low: Optional[float] = None
     gzip_threshold_high: Optional[float] = None
 
+    # Number of candidate trajectories to generate in parallel per sampling round.
     batch_candidate_size: int = 64
     max_sampling_rounds: int = 200
 
@@ -77,11 +81,33 @@ class NCA1DDataConfig(BaseModel):
 
     @property
     def sampled_rollout_steps_min(self) -> int:
+        if self.uses_explicit_time_range:
+            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_min is None else self.rollout_steps_min
 
     @property
     def sampled_rollout_steps_max(self) -> int:
+        if self.uses_explicit_time_range:
+            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_max is None else self.rollout_steps_max
+
+    @property
+    def uses_explicit_time_range(self) -> bool:
+        return self.time_start is not None or self.time_end is not None
+
+    @property
+    def resolved_start_step(self) -> int:
+        return self.start_step if self.time_start is None else self.time_start
+
+    @property
+    def selected_time_span(self) -> int:
+        if self.time_start is None or self.time_end is None:
+            raise ValueError("time_start and time_end must both be set to use an explicit time range.")
+        return self.time_end - self.time_start + 1
+
+    @property
+    def resolved_time_end(self) -> int:
+        return self.resolved_start_step + self.sampled_rollout_steps_max - 1
 
     @property
     def valid_state_heights(self) -> list[int]:
@@ -127,7 +153,7 @@ class NCA1DDataConfig(BaseModel):
                 f"got range=({self.sampled_state_height_min}, {self.sampled_state_height_max}) "
                 f"and patch_size={self.patch_size}"
             )
-        if self.rollout_steps <= 0:
+        if not self.uses_explicit_time_range and self.rollout_steps <= 0:
             raise ValueError(f"rollout_steps must be > 0, got {self.rollout_steps}")
         if self.sampled_rollout_steps_min <= 0:
             raise ValueError(
@@ -143,6 +169,15 @@ class NCA1DDataConfig(BaseModel):
             raise ValueError(f"time_subsample must be > 0, got {self.time_subsample}")
         if self.start_step < 0:
             raise ValueError(f"start_step must be >= 0, got {self.start_step}")
+        if self.uses_explicit_time_range:
+            if self.time_start is None or self.time_end is None:
+                raise ValueError("time_start and time_end must both be set when using an explicit time range.")
+            if self.time_start < 0:
+                raise ValueError(f"time_start must be >= 0, got {self.time_start}")
+            if self.time_end < self.time_start:
+                raise ValueError(
+                    f"time_end must be >= time_start, got time_start={self.time_start}, time_end={self.time_end}"
+                )
         if self.batch_candidate_size <= 0:
             raise ValueError(f"batch_candidate_size must be > 0, got {self.batch_candidate_size}")
         if self.max_sampling_rounds <= 0:
@@ -201,9 +236,9 @@ def make_nca_config(config: NCA1DDataConfig) -> NCAConfig:
         hidden_dim=config.hidden_dim,
         patch_size=config.patch_size,
         seq_len=config.seq_len,
-        rollout_steps=config.rollout_steps,
+        rollout_steps=config.sampled_rollout_steps_max,
         time_subsample=config.time_subsample,
-        start_step=config.start_step,
+        start_step=config.resolved_start_step,
         gzip_threshold_low=config.gzip_threshold_low or 0.0,
         gzip_threshold_high=config.gzip_threshold_high,
         batch_candidate_size=config.batch_candidate_size,
@@ -232,7 +267,7 @@ def make_nca_config_for_sample(
         seq_len=config.seq_len,
         rollout_steps=rollout_steps,
         time_subsample=config.time_subsample,
-        start_step=config.start_step,
+        start_step=config.resolved_start_step,
         gzip_threshold_low=config.gzip_threshold_low or 0.0,
         gzip_threshold_high=config.gzip_threshold_high,
         batch_candidate_size=config.batch_candidate_size,
@@ -242,6 +277,111 @@ def make_nca_config_for_sample(
         out_dir=config.output_dir,
         save_dtype=config.save_dtype,
     )
+
+
+def num_frames_for_rollout_steps(rollout_steps: int, time_subsample: int) -> int:
+    return math.ceil(rollout_steps / time_subsample)
+
+
+def _sample_batched_rule_parameters(
+    cfg: NCAConfig,
+    batch_size: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    return {
+        "conv3_weight": torch.randn(
+            batch_size,
+            cfg.conv_channels,
+            cfg.num_colors,
+            3,
+            3,
+            device=device,
+        ),
+        "conv3_bias": torch.randn(batch_size, cfg.conv_channels, device=device),
+        "fc1_weight": torch.randn(
+            batch_size,
+            cfg.hidden_dim,
+            cfg.conv_channels,
+            1,
+            1,
+            device=device,
+        ),
+        "fc1_bias": torch.randn(batch_size, cfg.hidden_dim, device=device),
+        "fc2_weight": torch.randn(
+            batch_size,
+            cfg.num_colors,
+            cfg.hidden_dim,
+            1,
+            1,
+            device=device,
+        ),
+        "fc2_bias": torch.randn(batch_size, cfg.num_colors, device=device),
+    }
+
+
+def _batched_step(
+    state: torch.Tensor,
+    rule_parameters: Dict[str, torch.Tensor],
+    cfg: NCAConfig,
+) -> torch.Tensor:
+    batch_size, height, width = state.shape
+    num_colors = cfg.num_colors
+
+    x = F.one_hot(state.long(), num_classes=num_colors).float().permute(0, 3, 1, 2).contiguous()
+    x = F.pad(x, (1, 1, 1, 1), mode="circular")
+    x = F.conv2d(
+        x.reshape(1, batch_size * num_colors, height + 2, width + 2),
+        rule_parameters["conv3_weight"].reshape(batch_size * cfg.conv_channels, num_colors, 3, 3),
+        bias=rule_parameters["conv3_bias"].reshape(batch_size * cfg.conv_channels),
+        groups=batch_size,
+    )
+    x = x.reshape(batch_size, cfg.conv_channels, height, width)
+    x = F.conv2d(
+        x.reshape(1, batch_size * cfg.conv_channels, height, width),
+        rule_parameters["fc1_weight"].reshape(batch_size * cfg.hidden_dim, cfg.conv_channels, 1, 1),
+        bias=rule_parameters["fc1_bias"].reshape(batch_size * cfg.hidden_dim),
+        groups=batch_size,
+    )
+    x = F.relu(x.reshape(batch_size, cfg.hidden_dim, height, width))
+    x = F.conv2d(
+        x.reshape(1, batch_size * cfg.hidden_dim, height, width),
+        rule_parameters["fc2_weight"].reshape(batch_size * num_colors, cfg.hidden_dim, 1, 1),
+        bias=rule_parameters["fc2_bias"].reshape(batch_size * num_colors),
+        groups=batch_size,
+    )
+    logits = x.reshape(batch_size, num_colors, height, width).permute(0, 2, 3, 1).contiguous()
+    one_hot_state = F.one_hot(state.long(), num_classes=num_colors).float()
+    logits = logits + cfg.identity_bias * one_hot_state
+    logits = logits / max(cfg.temperature, 1e-8)
+    probs = torch.softmax(logits, dim=-1)
+    next_state = torch.multinomial(probs.reshape(-1, num_colors), num_samples=1)
+    return next_state.reshape(batch_size, height, width)
+
+
+@torch.no_grad()
+def rollout_trajectories_batched(
+    cfg: NCAConfig,
+    batch_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    state = torch.randint(
+        low=0,
+        high=cfg.num_colors,
+        size=(batch_size, cfg.grid_height, cfg.grid_width),
+        device=device,
+        dtype=torch.long,
+    )
+    rule_parameters = _sample_batched_rule_parameters(cfg, batch_size=batch_size, device=device)
+    frames: list[torch.Tensor] = []
+    total_steps = cfg.start_step + cfg.rollout_steps
+
+    for t in range(total_steps):
+        if t >= cfg.start_step and ((t - cfg.start_step) % cfg.time_subsample == 0):
+            frames.append(state)
+        state = _batched_step(state, rule_parameters, cfg)
+
+    trajectories = torch.stack(frames, dim=1)
+    return trajectories.detach().cpu().numpy().astype(np.int16, copy=False)
 
 
 def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
@@ -338,25 +478,57 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     num_frames: list[int] = []
     rollout_steps: list[int] = []
 
-    total_candidates = config.batch_candidate_size * config.max_sampling_rounds
+    min_rounds_for_size = math.ceil(size / config.batch_candidate_size)
+    effective_max_sampling_rounds = max(config.max_sampling_rounds, min_rounds_for_size)
+    total_candidates = config.batch_candidate_size * effective_max_sampling_rounds
     progress = tqdm(total=size, desc=f"Generating {split_name}", leave=False)
 
     rounds = 0
-    while len(flat_images) < size and rounds < config.max_sampling_rounds:
+    while len(flat_images) < size and rounds < effective_max_sampling_rounds:
         rounds += 1
-        for _candidate_idx in range(config.batch_candidate_size):
-            sampled_state_height = int(rng.choice(config.valid_state_heights))
-            sampled_rollout_steps = int(
-                rng.integers(config.sampled_rollout_steps_min, config.sampled_rollout_steps_max + 1)
-            )
+        sampled_state_heights = rng.choice(config.valid_state_heights, size=config.batch_candidate_size)
+        sampled_rollout_steps = rng.integers(
+            config.sampled_rollout_steps_min,
+            config.sampled_rollout_steps_max + 1,
+            size=config.batch_candidate_size,
+        )
+
+        candidate_trajectories: list[Optional[np.ndarray]] = [None] * config.batch_candidate_size
+        candidate_tokenizers: list[Optional[NCATokenizer]] = [None] * config.batch_candidate_size
+
+        for sampled_state_height in np.unique(sampled_state_heights):
+            group_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
+            max_rollout_steps = int(sampled_rollout_steps[group_indices].max())
             nca_config = make_nca_config_for_sample(
                 config,
-                state_height=sampled_state_height,
-                rollout_steps=sampled_rollout_steps,
+                state_height=int(sampled_state_height),
+                rollout_steps=max_rollout_steps,
             )
             tokenizer = NCATokenizer(nca_config)
-            rule = RandomDiscreteNCA(nca_config).to(device)
-            trajectory = rollout_trajectory(rule, nca_config, device=device)
+            trajectories = rollout_trajectories_batched(
+                nca_config,
+                batch_size=int(group_indices.size),
+                device=device,
+            )
+
+            for local_idx, candidate_idx in enumerate(group_indices):
+                candidate_trajectories[int(candidate_idx)] = trajectories[local_idx]
+                candidate_tokenizers[int(candidate_idx)] = tokenizer
+
+        for candidate_idx in range(config.batch_candidate_size):
+            sampled_state_height = int(sampled_state_heights[candidate_idx])
+            sampled_rollout_step_count = int(sampled_rollout_steps[candidate_idx])
+            sampled_num_frames = num_frames_for_rollout_steps(
+                sampled_rollout_step_count,
+                config.time_subsample,
+            )
+            trajectory = candidate_trajectories[candidate_idx]
+            tokenizer = candidate_tokenizers[candidate_idx]
+
+            if trajectory is None or tokenizer is None:
+                raise RuntimeError("Batched candidate generation failed to produce a trajectory.")
+
+            trajectory = trajectory[:sampled_num_frames]
             gzip_score = score_trajectory_gzip(trajectory, tokenizer)
 
             if not _passes_gzip_filter(gzip_score, config):
@@ -374,7 +546,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
             gzip_scores.append(gzip_score)
             state_heights.append(sampled_state_height)
             num_frames.append(int(time_image.shape[1]))
-            rollout_steps.append(sampled_rollout_steps)
+            rollout_steps.append(sampled_rollout_step_count)
             progress.update(1)
 
             if len(flat_images) >= size:
@@ -385,7 +557,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     if len(flat_images) < size:
         raise RuntimeError(
             f"Could not collect enough {split_name} examples. "
-            f"Collected {len(flat_images)} / {size} after {total_candidates} candidates. "
+            f"Collected {len(flat_images)} / {size} after {rounds} rounds ({total_candidates} candidates budget). "
             "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
         )
 
@@ -461,8 +633,11 @@ def save_dataset_config(config: NCA1DDataConfig) -> None:
                 **config.model_dump(),
                 "resolved_state_height_min": config.sampled_state_height_min,
                 "resolved_state_height_max": config.sampled_state_height_max,
+                "resolved_start_step": config.resolved_start_step,
                 "resolved_rollout_steps_min": config.sampled_rollout_steps_min,
                 "resolved_rollout_steps_max": config.sampled_rollout_steps_max,
+                "resolved_time_start": config.resolved_start_step,
+                "resolved_time_end": config.resolved_time_end,
                 "num_frames": config.max_num_frames,
                 "max_num_frames": config.max_num_frames,
                 "seq_len": config.seq_len,
