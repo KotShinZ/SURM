@@ -124,6 +124,9 @@ class PuzzleDataset(IterableDataset):
             "puzzle_indices": None,
             "group_indices": None
         }
+        if self.metadata.variable_seq_lengths:
+            field_mmap_modes["seq_offsets"] = None
+            field_mmap_modes["seq_shapes"] = None
 
         # Load data
         self._data = {}
@@ -133,6 +136,34 @@ class PuzzleDataset(IterableDataset):
                 field_name: np.load(os.path.join(self.config.dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
                 for field_name, mmap_mode in field_mmap_modes.items()
             }
+
+    def _select_examples(self, dataset: dict, indices: np.ndarray) -> dict:
+        if not self.metadata.variable_seq_lengths:
+            return {
+                "inputs": dataset["inputs"][indices],
+                "labels": dataset["labels"][indices],
+            }
+
+        offsets = dataset["seq_offsets"]
+        shapes = dataset["seq_shapes"][indices]
+        lengths = (offsets[indices + 1] - offsets[indices]).astype(np.int32, copy=False)
+        batch_size = int(indices.size)
+        max_len = int(lengths.max()) if batch_size else 0
+
+        inputs = np.full((batch_size, max_len), self.metadata.pad_id, dtype=np.uint8)
+        labels = np.full((batch_size, max_len), self.metadata.pad_id, dtype=np.uint8)
+        for row, example_idx in enumerate(indices):
+            start = int(offsets[example_idx])
+            end = int(offsets[example_idx + 1])
+            inputs[row, : end - start] = dataset["inputs"][start:end]
+            labels[row, : end - start] = dataset["labels"][start:end]
+
+        return {
+            "inputs": inputs,
+            "labels": labels,
+            "seq_lengths": lengths,
+            "seq_shapes": shapes,
+        }
 
     def _make_masked_inputs(
         self,
@@ -201,7 +232,27 @@ class PuzzleDataset(IterableDataset):
             }
             if "source_inputs" in batch:
                 pad_values["source_inputs"] = self.metadata.pad_id
+            if "seq_lengths" in batch:
+                pad_values["seq_lengths"] = 0
+            if "seq_shapes" in batch:
+                pad_values["seq_shapes"] = 1
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+
+        if "seq_lengths" in batch and "seq_shapes" in batch:
+            seq_lengths = batch["seq_lengths"]
+            seq_widths = np.maximum(batch["seq_shapes"][:, 1], 1)
+            positions = np.arange(batch["inputs"].shape[1], dtype=np.int32)
+            row_ids = positions[None, :] // seq_widths[:, None]
+            col_ids = positions[None, :] % seq_widths[:, None]
+            valid_positions = positions[None, :] < seq_lengths[:, None]
+            batch["position_ids"] = np.stack(
+                [
+                    np.where(valid_positions, row_ids, 0),
+                    np.where(valid_positions, col_ids, 0),
+                ],
+                axis=-1,
+            ).astype(np.int32, copy=False)
+            del batch["seq_shapes"]
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
@@ -209,7 +260,11 @@ class PuzzleDataset(IterableDataset):
     def _iter_test(self):
         rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
         for set_name, dataset in self._data.items():  # type: ignore
-            total_examples = len(dataset["inputs"])
+            total_examples = (
+                dataset["seq_offsets"].size - 1
+                if self.metadata.variable_seq_lengths
+                else len(dataset["inputs"])
+            )
 
             # Load examples one by one
             start_index = 0
@@ -229,11 +284,10 @@ class PuzzleDataset(IterableDataset):
 
                     puzzle_indices.append(puzzle_index)
                 
-                batch = self._collate_batch({
-                    "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                }, rng, make_masked_inputs=False)
+                local_indices = np.arange(local_start, local_end, dtype=np.int64)
+                batch_fields = self._select_examples(dataset, local_indices)
+                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][puzzle_indices]
+                batch = self._collate_batch(batch_fields, rng, make_masked_inputs=False)
 
                 yield set_name, batch, end_index - start_index
                 
@@ -272,13 +326,13 @@ class PuzzleDataset(IterableDataset):
 
                 batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
                 batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch = self._collate_batch({
-                    "inputs": dataset["inputs"][batch_indices],
-                    "labels": dataset["labels"][batch_indices],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                }, rng)
+                batch_fields = self._select_examples(dataset, batch_indices)
+                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][batch_puzzle_indices]
+                batch = self._collate_batch(batch_fields, rng)
 
                 if self.config.online_aug is not None and self.config.online_aug.enabled:
+                    if self.metadata.variable_seq_lengths:
+                        raise ValueError("online_aug is not supported for variable-length datasets.")
                     batch = apply_online_aug(batch, self.metadata.seq_len, self.config.online_aug)
 
                 yield set_name, batch, global_effective_batch_size
@@ -299,4 +353,6 @@ class PuzzleDataset(IterableDataset):
         # データがロードされていなければロードする
         self._lazy_load_dataset()
         # 全セットの合計サイズを返す
+        if self.metadata.variable_seq_lengths:
+            return sum(d["seq_offsets"].size - 1 for d in self._data.values())
         return sum(len(d["inputs"]) for d in self._data.values())
