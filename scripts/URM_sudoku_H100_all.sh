@@ -1,4 +1,4 @@
-run_name="URM-sudoku-base"
+run_name="URM-sudoku-CH-all"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
