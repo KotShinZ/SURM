@@ -71,6 +71,15 @@ python -m data.build_maze_dataset \
   --num-aug 1000 \
   --rebuild
 
+# NCA-1D
+python data/build_nca1d_dataset.py \
+  --output-dir data/nca1d-9x9 \
+  --train-size 100000 \
+  --test-size 2000 \
+  --state-height 9 \
+  --time-start 30 \
+  --time-end 38
+
 # upload ARC-AGI-1
 export HF_TOKEN=YOUR_HF_TOKEN
 python -m data.upload_arc_dataset \
