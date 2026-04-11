@@ -147,21 +147,29 @@ class PuzzleDataset(IterableDataset):
         offsets = dataset["seq_offsets"]
         shapes = dataset["seq_shapes"][indices]
         lengths = (offsets[indices + 1] - offsets[indices]).astype(np.int32, copy=False)
-        batch_size = int(indices.size)
-        max_len = int(lengths.max()) if batch_size else 0
 
-        inputs = np.full((batch_size, max_len), self.metadata.pad_id, dtype=np.uint8)
-        labels = np.full((batch_size, max_len), self.metadata.pad_id, dtype=np.uint8)
-        for row, example_idx in enumerate(indices):
+        input_chunks = []
+        label_chunks = []
+        for example_idx in indices:
             start = int(offsets[example_idx])
             end = int(offsets[example_idx + 1])
-            inputs[row, : end - start] = dataset["inputs"][start:end]
-            labels[row, : end - start] = dataset["labels"][start:end]
+            input_chunks.append(dataset["inputs"][start:end])
+            label_chunks.append(dataset["labels"][start:end])
+
+        if input_chunks:
+            inputs = np.concatenate(input_chunks).astype(np.uint8, copy=False)
+            labels = np.concatenate(label_chunks).astype(np.uint8, copy=False)
+        else:
+            inputs = np.empty((0,), dtype=np.uint8)
+            labels = np.empty((0,), dtype=np.uint8)
 
         return {
             "inputs": inputs,
             "labels": labels,
             "seq_lengths": lengths,
+            "seq_offsets": np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)]
+            ),
             "seq_shapes": shapes,
         }
 
@@ -217,12 +225,14 @@ class PuzzleDataset(IterableDataset):
 
         masked_input_cfg = self.config.masked_input
         if masked_input_cfg is not None and masked_input_cfg.enabled and make_masked_inputs:
+            if self.metadata.variable_seq_lengths:
+                raise ValueError("masked_input is not supported for packed variable-length datasets.")
             if masked_input_cfg.preserve_source_inputs:
                 batch["source_inputs"] = batch["inputs"].copy()
             batch["inputs"] = self._make_masked_inputs(batch["inputs"], batch["labels"], rng)
 
         # Pad
-        if batch["puzzle_identifiers"].size < self.local_batch_size:
+        if not self.metadata.variable_seq_lengths and batch["puzzle_identifiers"].size < self.local_batch_size:
             pad_size = self.local_batch_size - batch["puzzle_identifiers"].size
 
             pad_values = {
@@ -241,17 +251,28 @@ class PuzzleDataset(IterableDataset):
         if "seq_lengths" in batch and "seq_shapes" in batch:
             seq_lengths = batch["seq_lengths"]
             seq_widths = np.maximum(batch["seq_shapes"][:, 1], 1)
-            positions = np.arange(batch["inputs"].shape[1], dtype=np.int32)
-            row_ids = positions[None, :] // seq_widths[:, None]
-            col_ids = positions[None, :] % seq_widths[:, None]
-            valid_positions = positions[None, :] < seq_lengths[:, None]
-            batch["position_ids"] = np.stack(
-                [
-                    np.where(valid_positions, row_ids, 0),
-                    np.where(valid_positions, col_ids, 0),
-                ],
-                axis=-1,
-            ).astype(np.int32, copy=False)
+            if self.metadata.variable_seq_lengths:
+                position_chunks = []
+                for length, width in zip(seq_lengths, seq_widths):
+                    positions = np.arange(int(length), dtype=np.int32)
+                    position_chunks.append(np.stack([positions // int(width), positions % int(width)], axis=-1))
+                batch["position_ids"] = (
+                    np.concatenate(position_chunks, axis=0).astype(np.int32, copy=False)
+                    if position_chunks
+                    else np.empty((0, 2), dtype=np.int32)
+                )
+            else:
+                positions = np.arange(batch["inputs"].shape[1], dtype=np.int32)
+                row_ids = positions[None, :] // seq_widths[:, None]
+                col_ids = positions[None, :] % seq_widths[:, None]
+                valid_positions = positions[None, :] < seq_lengths[:, None]
+                batch["position_ids"] = np.stack(
+                    [
+                        np.where(valid_positions, row_ids, 0),
+                        np.where(valid_positions, col_ids, 0),
+                    ],
+                    axis=-1,
+                ).astype(np.int32, copy=False)
             del batch["seq_shapes"]
 
         # To tensor

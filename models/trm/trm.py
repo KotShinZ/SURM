@@ -127,6 +127,31 @@ class TRMBlock(nn.Module):
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
+    def forward_packed(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        compute_target_q=False,
+    ) -> torch.Tensor:
+        if self.config.mlp_t:
+            raise ValueError("Packed variable-length TRM does not support mlp_t=True")
+
+        hidden_states = rms_norm(
+            hidden_states
+            + self.self_attn.forward_packed(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            ),
+            variance_epsilon=self.norm_eps,
+        )
+        out = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        return hidden_states
+
 class TRMReasoningModule(nn.Module):
     def __init__(self, layers: List[TRMBlock]):
         super().__init__()
@@ -136,6 +161,12 @@ class TRMReasoningModule(nn.Module):
         hidden_states = hidden_states + input_injection
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
+
+    def forward_packed(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, compute_target_q=False, **kwargs) -> torch.Tensor:
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer.forward_packed(hidden_states=hidden_states, **kwargs)
         return hidden_states
 
 
@@ -207,6 +238,88 @@ class TRM_Inner(nn.Module):
         # Scale
         return self.embed_scale * embedding
 
+    def _packed_lengths(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return batch["seq_lengths"].to(device=batch["inputs"].device, dtype=torch.long)
+
+    @torch.compiler.disable
+    def _packed_cu_seqlens(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, int]:
+        lengths = self._packed_lengths(batch) + self.puzzle_emb_len
+        cu_seqlens = F.pad(torch.cumsum(lengths, dim=0), (1, 0)).to(torch.int32)
+        max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+        return cu_seqlens, max_seqlen
+
+    def _packed_data_token_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        num_tokens = batch["inputs"].shape[0]
+        if self.puzzle_emb_len == 0:
+            return torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
+
+        lengths = self._packed_lengths(batch)
+        seq_ids = torch.repeat_interleave(
+            torch.arange(lengths.shape[0], device=batch["inputs"].device, dtype=torch.long),
+            lengths,
+        )
+        token_positions = torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
+        return token_positions + seq_ids * self.puzzle_emb_len + self.puzzle_emb_len
+
+    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size = batch["puzzle_identifiers"].shape[0]
+        if self.puzzle_emb_len == 0 or batch_size == 0:
+            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
+
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.puzzle_emb_len
+        prefix_offsets = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+        return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
+
+    def _packed_flat_position_ids(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> torch.Tensor:
+        lengths = self._packed_lengths(batch)
+        seq_ids = torch.repeat_interleave(
+            torch.arange(lengths.shape[0], device=batch["inputs"].device, dtype=torch.long),
+            lengths,
+        )
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        token_positions = torch.arange(batch["inputs"].shape[0], device=batch["inputs"].device, dtype=torch.long)
+        data_pos_ids = self.puzzle_emb_len + token_positions - data_offsets[seq_ids]
+        if self.puzzle_emb_len == 0:
+            return data_pos_ids
+
+        flat_ids = data_pos_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len,))
+        flat_ids[token_indices] = data_pos_ids
+        prefix_ids = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+        flat_ids[self._packed_prefix_indices(batch)] = prefix_ids.repeat(batch["puzzle_identifiers"].shape[0])
+        return flat_ids
+
+    def _input_embeddings_packed(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        token_embedding = self.embed_tokens(batch["inputs"].to(torch.int32))
+        token_indices = self._packed_data_token_indices(batch)
+
+        if self.puzzle_emb_len > 0:
+            puzzle_embedding = self.puzzle_emb(batch["puzzle_identifiers"])
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            puzzle_embedding = puzzle_embedding.view(-1, self.config.hidden_size)
+
+            total_len = token_embedding.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len
+            embedding = token_embedding.new_empty((total_len, self.config.hidden_size))
+            embedding[token_indices] = token_embedding
+            embedding[self._packed_prefix_indices(batch)] = puzzle_embedding
+        else:
+            embedding = token_embedding
+
+        if self.config.pos_encodings == "learned":
+            flat_ids = self._packed_flat_position_ids(batch, token_indices)
+            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight[flat_ids].to(self.forward_dtype))
+
+        return self.embed_scale * embedding, token_indices
+
+    def _rotary_cos_sin_packed(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> Optional[CosSin]:
+        if not hasattr(self, "rotary_emb"):
+            return None
+        flat_ids = self._packed_flat_position_ids(batch, token_indices)
+        cos, sin = self.rotary_emb()
+        return cos[flat_ids], sin[flat_ids]
+
     def empty_carry(self, batch_size: int, seq_len: Optional[int] = None):
         carry_seq_len = self.config.seq_len if seq_len is None else seq_len
         return TRMInnerCarry(
@@ -231,6 +344,9 @@ class TRM_Inner(nn.Module):
         batch: Dict[str, torch.Tensor],
         compute_target_q: bool = False,
     ) -> Tuple[ TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor] ]:
+        if self.config.variable_seq_lengths:
+            return self.forward_packed(carry, batch, compute_target_q=compute_target_q)
+
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
             sequence_lengths=self._sequence_lengths(batch),
@@ -258,6 +374,41 @@ class TRM_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
+    def forward_packed(
+        self,
+        carry: TRMInnerCarry,
+        batch: Dict[str, torch.Tensor],
+        compute_target_q: bool = False,
+    ) -> Tuple[ TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor] ]:
+        input_embeddings, token_indices = self._input_embeddings_packed(batch)
+        cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
+        seq_info = dict(
+            cos_sin=self._rotary_cos_sin_packed(batch, token_indices),
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+        z_H, z_L = carry.z_H, carry.z_L
+        if z_H.shape[0] != input_embeddings.shape[0] or z_L.shape[0] != input_embeddings.shape[0]:
+            raise RuntimeError(
+                f"Packed carry/input length mismatch: z_H={z_H.shape[0]} z_L={z_L.shape[0]} input={input_embeddings.shape[0]}"
+            )
+
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles-1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level.forward_packed(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level.forward_packed(z_H, z_L, **seq_info)
+
+        for _L_step in range(self.config.L_cycles):
+            z_L = self.L_level.forward_packed(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.L_level.forward_packed(z_H, z_L, **seq_info)
+
+        new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        output = self.lm_head(z_H[token_indices])
+        q_logits = self.q_head(z_H[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
 
 class TRM(nn.Module):
     """ACT wrapper."""
@@ -272,7 +423,21 @@ class TRM(nn.Module):
         return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size = batch["inputs"].shape[0]
+        batch_size = batch["puzzle_identifiers"].shape[0] if self.config.variable_seq_lengths else batch["inputs"].shape[0]
+        if self.config.variable_seq_lengths:
+            empty_hidden = torch.empty(
+                0,
+                self.config.hidden_size,
+                dtype=self.inner.forward_dtype,
+                device=batch["inputs"].device,
+            )
+            return TRMCarry(
+                inner_carry=TRMInnerCarry(z_H=empty_hidden, z_L=empty_hidden),
+                steps=torch.zeros((batch_size, ), dtype=torch.int32, device=batch["inputs"].device),
+                halted=torch.ones((batch_size, ), dtype=torch.bool, device=batch["inputs"].device),
+                current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            )
+
         seq_len = batch["inputs"].shape[1] if self.config.variable_seq_lengths else None
 
         return TRMCarry(
@@ -283,6 +448,80 @@ class TRM(nn.Module):
             
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
+
+    @torch.compiler.disable
+    def _merge_packed_current_data(self, carry: TRMCarry, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        halted = carry.halted.detach().cpu().tolist()
+        batch_offsets = batch["seq_offsets"].detach().cpu().tolist()
+        current_offsets = carry.current_data["seq_offsets"].detach().cpu().tolist()
+        batch_size = len(halted)
+
+        token_keys = [
+            key for key in ("inputs", "labels", "position_ids", "source_inputs")
+            if key in batch and key in carry.current_data
+        ]
+        token_chunks = {key: [] for key in token_keys}
+        lengths = []
+        puzzle_identifiers = []
+
+        for idx in range(batch_size):
+            use_batch = bool(halted[idx])
+            source = batch if use_batch else carry.current_data
+            offsets = batch_offsets if use_batch else current_offsets
+            start, end = int(offsets[idx]), int(offsets[idx + 1])
+
+            for key in token_keys:
+                token_chunks[key].append(source[key][start:end])
+            lengths.append(source["seq_lengths"][idx])
+            puzzle_identifiers.append(source["puzzle_identifiers"][idx])
+
+        merged: Dict[str, torch.Tensor] = {}
+        for key, chunks in token_chunks.items():
+            merged[key] = torch.cat(chunks, dim=0) if chunks else batch[key].new_empty((0,) + batch[key].shape[1:])
+
+        if lengths:
+            merged["seq_lengths"] = torch.stack(lengths).to(device=batch["inputs"].device, dtype=torch.int32)
+            merged["puzzle_identifiers"] = torch.stack(puzzle_identifiers).to(
+                device=batch["inputs"].device,
+                dtype=batch["puzzle_identifiers"].dtype,
+            )
+        else:
+            merged["seq_lengths"] = batch["seq_lengths"].new_empty((0,))
+            merged["puzzle_identifiers"] = batch["puzzle_identifiers"].new_empty((0,))
+
+        merged["seq_offsets"] = F.pad(torch.cumsum(merged["seq_lengths"].to(torch.int32), dim=0), (1, 0))
+        return merged
+
+    @torch.compiler.disable
+    def _reset_packed_carry(self, reset_flag: torch.Tensor, carry: TRMCarry, current_data: Dict[str, torch.Tensor]) -> TRMInnerCarry:
+        reset = reset_flag.detach().cpu().tolist()
+        current_lengths = current_data["seq_lengths"].detach().cpu().tolist()
+        old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.puzzle_emb_len).detach().cpu().tolist()
+        old_hidden_offsets = [0]
+        for length in old_hidden_lengths:
+            old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
+
+        z_h_chunks = []
+        z_l_chunks = []
+        for idx, should_reset in enumerate(reset):
+            new_len = int(current_lengths[idx]) + self.inner.puzzle_emb_len
+            if should_reset:
+                z_h_chunks.append(self.inner.H_init.expand(new_len, -1))
+                z_l_chunks.append(self.inner.L_init.expand(new_len, -1))
+            else:
+                z_h_chunks.append(carry.inner_carry.z_H[old_hidden_offsets[idx]:old_hidden_offsets[idx + 1]])
+                z_l_chunks.append(carry.inner_carry.z_L[old_hidden_offsets[idx]:old_hidden_offsets[idx + 1]])
+
+        if z_h_chunks:
+            return TRMInnerCarry(z_H=torch.cat(z_h_chunks, dim=0), z_L=torch.cat(z_l_chunks, dim=0))
+
+        empty_hidden = torch.empty(
+            0,
+            self.config.hidden_size,
+            dtype=self.inner.forward_dtype,
+            device=current_data["inputs"].device,
+        )
+        return TRMInnerCarry(z_H=empty_hidden, z_L=empty_hidden)
 
     def _pad_to_seq_len(self, key: str, value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
         if value.ndim < 2 or value.shape[1] == target_seq_len:
@@ -330,6 +569,20 @@ class TRM(nn.Module):
         return replace(carry, inner_carry=aligned_inner, current_data=aligned_current_data), aligned_batch
 
     def norm_func(self, x1: torch.Tensor, x2: torch.Tensor, seq_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if seq_lengths is not None and x1.ndim == 2:
+            lengths = (seq_lengths + self.inner.puzzle_emb_len).detach().cpu().tolist()
+            values = []
+            offset = 0
+            for length in lengths:
+                next_offset = offset + int(length)
+                left = x1[offset:next_offset]
+                right = x2[offset:next_offset]
+                values.append(torch.norm(left - right) / (1e-7 + torch.norm(left + right) / 2))
+                offset = next_offset
+            if values:
+                return torch.stack(values)
+            return torch.empty((0,), device=x1.device, dtype=torch.float32)
+
         if seq_lengths is not None:
             lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
             mask = torch.arange(x1.shape[1], device=x1.device).unsqueeze(0) < lengths.unsqueeze(1)
@@ -350,6 +603,8 @@ class TRM(nn.Module):
         return torch.maximum(z_h_diff, z_l_diff)
         
     def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor], compute_target_q=False) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+        if self.config.variable_seq_lengths:
+            return self._forward_packed(carry, batch, compute_target_q=compute_target_q)
 
         carry, batch = self._align_variable_batch(carry, batch)
 
@@ -413,6 +668,56 @@ class TRM(nn.Module):
                     # As batch_size is large, there're many parallel envs.
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        return TRMCarry(new_inner_carry, new_steps, halted, new_current_data), outputs
+
+    def _forward_packed(self, carry: TRMCarry, batch: Dict[str, torch.Tensor], compute_target_q=False) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+        new_current_data = self._merge_packed_current_data(carry, batch)
+        reset_inner_carry = self._reset_packed_carry(carry.halted, carry, new_current_data)
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(reset_inner_carry, new_current_data)
+        hidden_diff_norm = self.carry_diff_norm(
+            new_inner_carry,
+            reset_inner_carry,
+            new_current_data.get("seq_lengths"),
+        )
+
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits
+        }
+
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+            halted = is_last_step
+
+            if self.training and (self.config.halt_max_steps > 1):
+                if self.config.use_act:
+                    if self.config.no_ACT_continue:
+                        halted = halted | (q_halt_logits > 0)
+                    else:
+                        halted = halted | (q_halt_logits > q_continue_logits)
+
+                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (new_steps >= min_halt_steps)
+
+                if (self.config.use_act == False or self.config.halt_norm_in_use_act == True) and self.training == True:
+                    norm_diff_max = self.config.norm_diff_max
+                    norm_diff_min = self.config.norm_diff_min
+
+                    if norm_diff_max != norm_diff_min:
+                        norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
+                    else:
+                        norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
+                    halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
+
+                if not self.config.no_ACT_continue:
+                    next_inner_carry, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+                    del next_inner_carry
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
         return TRMCarry(new_inner_carry, new_steps, halted, new_current_data), outputs

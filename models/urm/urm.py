@@ -104,6 +104,25 @@ class URMBlock(nn.Module):
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
+    def forward_packed(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        attn_output = self.self_attn.forward_packed(
+            cos_sin=cos_sin,
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            window_size=-1,
+        )
+        hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
+        mlp_output = self.mlp.forward_packed(hidden_states, cu_seqlens)
+        hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
+        return hidden_states
+
 
 class URM_Inner(nn.Module):
     def __init__(self, config: URMConfig) -> None:
@@ -301,6 +320,112 @@ class URM_Inner(nn.Module):
 
         return embedding
 
+    def _packed_lengths(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return batch["seq_lengths"].to(device=batch["inputs"].device, dtype=torch.long)
+
+    @torch.compiler.disable
+    def _packed_cu_seqlens(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, int]:
+        lengths = self._packed_lengths(batch) + self.puzzle_emb_len
+        cu_seqlens = F.pad(torch.cumsum(lengths, dim=0), (1, 0)).to(torch.int32)
+        max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+        return cu_seqlens, max_seqlen
+
+    def _packed_data_token_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        num_tokens = batch["inputs"].shape[0]
+        if self.puzzle_emb_len == 0:
+            return torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
+
+        lengths = self._packed_lengths(batch)
+        seq_ids = torch.repeat_interleave(
+            torch.arange(lengths.shape[0], device=batch["inputs"].device, dtype=torch.long),
+            lengths,
+        )
+        token_positions = torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
+        return token_positions + seq_ids * self.puzzle_emb_len + self.puzzle_emb_len
+
+    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size = batch["puzzle_identifiers"].shape[0]
+        if self.puzzle_emb_len == 0 or batch_size == 0:
+            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
+
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.puzzle_emb_len
+        prefix_offsets = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+        return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
+
+    def _input_embeddings_packed(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.config.patch_io_enabled:
+            raise ValueError("Packed variable-length data is not supported with patch_io_enabled")
+
+        token_embedding = self.embed_tokens(batch["inputs"].to(torch.int32))
+        token_indices = self._packed_data_token_indices(batch)
+
+        if self.puzzle_emb_len > 0:
+            puzzle_embedding = self.puzzle_emb(batch["puzzle_identifiers"])
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            puzzle_embedding = puzzle_embedding.view(-1, self.config.hidden_size)
+
+            total_len = token_embedding.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len
+            embedding = token_embedding.new_empty((total_len, self.config.hidden_size))
+            embedding[token_indices] = token_embedding
+            embedding[self._packed_prefix_indices(batch)] = puzzle_embedding
+        else:
+            embedding = token_embedding
+
+        embedding = self.embed_scale * embedding
+
+        if self.config.input_embedding_noise_size > 0:
+            noise = torch.randn(
+                embedding.shape,
+                generator=self.generator,
+                dtype=embedding.dtype,
+                device=embedding.device,
+                layout=embedding.layout,
+            )
+            embedding = embedding + noise * self.config.input_embedding_noise_size
+
+        return embedding, token_indices
+
+    def _rotary_cos_sin_packed(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> CosSin:
+        if isinstance(self.rotary_emb, RotaryEmbedding2D):
+            position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
+            data_flat_ids = self.puzzle_emb_len + position_ids[:, 0] * self.rotary_emb.grid_width + position_ids[:, 1]
+            if self.puzzle_emb_len > 0:
+                flat_ids = data_flat_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len,))
+                flat_ids[token_indices] = data_flat_ids
+                prefix_ids = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+                flat_ids[self._packed_prefix_indices(batch)] = prefix_ids.repeat(batch["puzzle_identifiers"].shape[0])
+            else:
+                flat_ids = data_flat_ids
+
+            return (
+                self.rotary_emb.cos_row[flat_ids],
+                self.rotary_emb.sin_row[flat_ids],
+                self.rotary_emb.cos_col[flat_ids],
+                self.rotary_emb.sin_col[flat_ids],
+            )
+
+        lengths = self._packed_lengths(batch)
+        seq_ids = torch.repeat_interleave(
+            torch.arange(lengths.shape[0], device=batch["inputs"].device, dtype=torch.long),
+            lengths,
+        )
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        token_positions = torch.arange(batch["inputs"].shape[0], device=batch["inputs"].device, dtype=torch.long)
+        data_pos_ids = self.puzzle_emb_len + token_positions - data_offsets[seq_ids]
+        if self.puzzle_emb_len > 0:
+            flat_ids = data_pos_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len,))
+            flat_ids[token_indices] = data_pos_ids
+            prefix_ids = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+            flat_ids[self._packed_prefix_indices(batch)] = prefix_ids.repeat(batch["puzzle_identifiers"].shape[0])
+        else:
+            flat_ids = data_pos_ids
+
+        cos, sin = self.rotary_emb()
+        return cos[flat_ids], sin[flat_ids]
+
     def empty_carry(self, batch_size: int, seq_len: Optional[int] = None) -> URMCarry:
         carry_seq_len = self.inner_seq_len if seq_len is None else seq_len
         return URMCarry(
@@ -335,6 +460,9 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+        if self.config.variable_seq_lengths:
+            return self.forward_packed(carry, batch)
+
         seq_info = dict(
             cos_sin=self._rotary_cos_sin(batch),
             sequence_lengths=self._sequence_lengths(batch),
@@ -399,6 +527,87 @@ class URM_Inner(nn.Module):
         q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
+    def forward_packed(
+        self,
+        carry: URMCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+        input_embeddings, token_indices = self._input_embeddings_packed(batch)
+        cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
+        cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+
+        hidden_states = carry.current_hidden
+        if hidden_states.shape[0] != input_embeddings.shape[0]:
+            raise RuntimeError(
+                f"Packed carry/input length mismatch: carry={hidden_states.shape[0]} input={input_embeddings.shape[0]}"
+            )
+
+        if self.config.H_cycles > 1:
+            with torch.no_grad():
+                for _ in range(self.config.H_cycles - 1):
+                    for _ in range(self.config.L_cycles):
+                        hidden_states = hidden_states + input_embeddings
+                        for layer in self.layers:
+                            hidden_states = layer.forward_packed(
+                                cos_sin=cos_sin,
+                                hidden_states=hidden_states,
+                                cu_seqlens=cu_seqlens,
+                                max_seqlen=max_seqlen,
+                            )
+                        if self.config.noise_size > 0:
+                            noise = torch.randn(
+                                hidden_states.shape,
+                                generator=self.generator,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                                layout=hidden_states.layout
+                            )
+                            hidden_states = hidden_states + noise * self.config.noise_size
+
+        _log_grads = global_logger.is_log and self.training
+        if _log_grads:
+            _grad_norms = {}
+            _total_unrolled = self.config.L_cycles * len(self.layers)
+            def _make_grad_hook(idx, container, total):
+                def hook(grad):
+                    container[idx] = grad.detach().norm().item()
+                    if len(container) == total:
+                        norm_tensor = torch.tensor([container[i] for i in range(total)])
+                        global_logger.store("grad_norm_per_layer", norm_tensor)
+                return hook
+
+        _unrolled_idx = 0
+        diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
+        for _ in range(self.config.L_cycles):
+            hidden_states = hidden_states + input_embeddings
+            for layer in self.layers:
+                pre_hidden_states = hidden_states
+                hidden_states = layer.forward_packed(
+                    cos_sin=cos_sin,
+                    hidden_states=pre_hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                if diff_L is not None:
+                    diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
+                if self.config.noise_size > 0:
+                    noise = torch.randn(
+                        hidden_states.shape,
+                        generator=self.generator,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                        layout=hidden_states.layout
+                    )
+                    hidden_states = hidden_states + noise * self.config.noise_size
+                if _log_grads:
+                    hidden_states.register_hook(_make_grad_hook(_unrolled_idx, _grad_norms, _total_unrolled))
+                    _unrolled_idx += 1
+
+        new_carry = replace(carry, current_hidden=hidden_states.detach())
+        output = self.lm_head(hidden_states[token_indices])
+        q_logits = self.q_head(hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
+
 
 class URM(nn.Module):
     def __init__(self, config_dict: dict):
@@ -411,7 +620,20 @@ class URM(nn.Module):
         return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> URMCarry:
-        batch_size = batch["inputs"].shape[0]
+        batch_size = batch["puzzle_identifiers"].shape[0] if self.config.variable_seq_lengths else batch["inputs"].shape[0]
+        if self.config.variable_seq_lengths:
+            return URMCarry(
+                current_hidden=torch.empty(
+                    0,
+                    self.config.hidden_size,
+                    dtype=self.inner.forward_dtype,
+                    device=batch["inputs"].device,
+                ),
+                steps=torch.zeros((batch_size,), dtype=torch.int32, device=batch["inputs"].device),
+                halted=torch.ones((batch_size,), dtype=torch.bool, device=batch["inputs"].device),
+                current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            )
+
         seq_len = batch["inputs"].shape[1] if self.config.variable_seq_lengths else None
         base = self.inner.empty_carry(batch_size, seq_len=seq_len)
         return URMCarry(
@@ -420,6 +642,80 @@ class URM(nn.Module):
             halted=torch.ones((batch_size,), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
+
+    @torch.compiler.disable
+    def _merge_packed_current_data(self, carry: URMCarry, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert carry.current_data is not None
+
+        halted = carry.halted.detach().cpu().tolist()
+        batch_offsets = batch["seq_offsets"].detach().cpu().tolist()
+        current_offsets = carry.current_data["seq_offsets"].detach().cpu().tolist()
+        batch_size = len(halted)
+
+        token_keys = [
+            key for key in ("inputs", "labels", "position_ids", "source_inputs")
+            if key in batch and key in carry.current_data
+        ]
+        token_chunks = {key: [] for key in token_keys}
+        lengths = []
+        puzzle_identifiers = []
+
+        for idx in range(batch_size):
+            use_batch = bool(halted[idx])
+            source = batch if use_batch else carry.current_data
+            offsets = batch_offsets if use_batch else current_offsets
+            start, end = int(offsets[idx]), int(offsets[idx + 1])
+
+            for key in token_keys:
+                token_chunks[key].append(source[key][start:end])
+            lengths.append(source["seq_lengths"][idx])
+            puzzle_identifiers.append(source["puzzle_identifiers"][idx])
+
+        device = batch["inputs"].device
+        merged: Dict[str, torch.Tensor] = {}
+        for key, chunks in token_chunks.items():
+            merged[key] = torch.cat(chunks, dim=0) if chunks else batch[key].new_empty((0,) + batch[key].shape[1:])
+
+        if lengths:
+            merged["seq_lengths"] = torch.stack(lengths).to(device=device, dtype=torch.int32)
+            merged["puzzle_identifiers"] = torch.stack(puzzle_identifiers).to(device=device, dtype=batch["puzzle_identifiers"].dtype)
+        else:
+            merged["seq_lengths"] = batch["seq_lengths"].new_empty((0,))
+            merged["puzzle_identifiers"] = batch["puzzle_identifiers"].new_empty((0,))
+
+        merged["seq_offsets"] = F.pad(torch.cumsum(merged["seq_lengths"].to(torch.int32), dim=0), (1, 0))
+        return merged
+
+    @torch.compiler.disable
+    def _reset_packed_carry(self, reset_flag: torch.Tensor, carry: URMCarry, current_data: Dict[str, torch.Tensor]) -> URMCarry:
+        assert carry.current_data is not None
+
+        reset = reset_flag.detach().cpu().tolist()
+        current_lengths = current_data["seq_lengths"].detach().cpu().tolist()
+        old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.puzzle_emb_len).detach().cpu().tolist()
+        old_hidden_offsets = [0]
+        for length in old_hidden_lengths:
+            old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
+
+        hidden_chunks = []
+        for idx, should_reset in enumerate(reset):
+            new_len = int(current_lengths[idx]) + self.inner.puzzle_emb_len
+            if should_reset:
+                hidden_chunks.append(self.inner.init_hidden.expand(new_len, -1))
+            else:
+                hidden_chunks.append(carry.current_hidden[old_hidden_offsets[idx]:old_hidden_offsets[idx + 1]])
+
+        if hidden_chunks:
+            current_hidden = torch.cat(hidden_chunks, dim=0)
+        else:
+            current_hidden = torch.empty(
+                0,
+                self.config.hidden_size,
+                dtype=self.inner.forward_dtype,
+                device=current_data["inputs"].device,
+            )
+
+        return replace(carry, current_hidden=current_hidden, current_data=current_data)
         
     def _pad_to_seq_len(self, key: str, value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
         if value.ndim < 2 or value.shape[1] == target_seq_len:
@@ -472,6 +768,20 @@ class URM(nn.Module):
 
     def norm_func(self, x1, x2, seq_lengths: Optional[torch.Tensor] = None):
         #return torch.norm(x1 - x2, dim=(1,2))
+        if seq_lengths is not None and x1.ndim == 2:
+            lengths = (seq_lengths + self.inner.puzzle_emb_len).detach().cpu().tolist()
+            values = []
+            offset = 0
+            for length in lengths:
+                next_offset = offset + int(length)
+                left = x1[offset:next_offset]
+                right = x2[offset:next_offset]
+                values.append(torch.norm(left - right) / (1e-7 + torch.norm(left + right) / 2))
+                offset = next_offset
+            if values:
+                return torch.stack(values)
+            return torch.empty((0,), device=x1.device, dtype=torch.float32)
+
         if seq_lengths is not None:
             lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
             mask = torch.arange(x1.shape[1], device=x1.device).unsqueeze(0) < lengths.unsqueeze(1)
@@ -487,6 +797,8 @@ class URM(nn.Module):
         batch: Dict[str, torch.Tensor],
         compute_target_q=False
     ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        if self.config.variable_seq_lengths:
+            return self._forward_packed(carry, batch, compute_target_q=compute_target_q)
 
         carry, batch = self._align_variable_batch(carry, batch)
         new_carry = self.inner.reset_carry(carry.halted, carry)
@@ -547,6 +859,68 @@ class URM(nn.Module):
                     # print("Norm diff threshold:", norm_diff_threshold+ self.config.attn_dropout)
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
                 # halted = torch.ones_like(halted)
+
+        return (
+            URMCarry(
+                current_hidden=new_carry2.current_hidden,
+                steps=new_steps,
+                halted=halted,
+                current_data=new_current_data,
+            ),
+            outputs,
+        )
+
+    def _forward_packed(
+        self,
+        carry: URMCarry,
+        batch: Dict[str, torch.Tensor],
+        compute_target_q=False,
+    ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        new_current_data = self._merge_packed_current_data(carry, batch)
+        new_carry = self._reset_packed_carry(carry.halted, carry, new_current_data)
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
+
+        hidden_diff_norm = self.norm_func(
+            new_carry2.current_hidden.detach(),
+            new_carry.current_hidden.detach(),
+            new_current_data.get("seq_lengths"),
+        )
+        sum_norm_with_steps = torch.bincount(new_carry2.steps.cpu(), weights=hidden_diff_norm.cpu(), minlength=self.config.loops + 1)
+        steps_count = torch.bincount(new_carry2.steps.cpu(), minlength=self.config.loops + 1)
+        mean_norm_with_steps = sum_norm_with_steps / steps_count.clamp_min(1)
+        if global_logger.is_log:
+            global_logger.store("mean_norm_with_steps", mean_norm_with_steps)
+
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+        }
+        if diff_L is not None:
+            outputs["diff_L"] = diff_L
+
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            halted = (new_steps >= self.config.loops)
+
+            if self.training and (self.config.loops > 1):
+                halted = halted | (q_halt_logits > 0)
+
+                halt_exploration_prob = 0.1
+                min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
+                halted = halted & (new_steps >= min_halt_steps)
+
+                if (self.config.use_act == False or self.config.halt_norm_in_use_act == True) and self.training == True:
+                    norm_diff_max = self.config.norm_diff_max
+                    norm_diff_min = self.config.norm_diff_min
+
+                    if norm_diff_max != norm_diff_min:
+                        norm_diff_threshold = torch.rand_like(hidden_diff_norm) * (norm_diff_max - norm_diff_min) + norm_diff_min
+                    else:
+                        norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
+                    halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
 
         return (
             URMCarry(

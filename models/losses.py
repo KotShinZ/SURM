@@ -176,35 +176,75 @@ class ACTLossHead(nn.Module):
         labels = new_carry.current_data["labels"]
 
         # Correctness
-        with torch.no_grad():
-            # Preds
-            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+        use_act = getattr(getattr(self.model, "config", None), "use_act", True)
+        if labels.ndim == 1:
+            with torch.no_grad():
+                outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+                mask = labels != IGNORE_LABEL_ID
+                is_correct = mask & (outputs["preds"] == labels)
 
-            # Correctness
-            mask = labels != IGNORE_LABEL_ID
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
+                lengths = new_carry.current_data["seq_lengths"].to(device=labels.device, dtype=torch.long)
+                loss_counts_list = []
+                correct_counts_list = []
+                offset = 0
+                for length in lengths.detach().cpu().tolist():
+                    next_offset = offset + int(length)
+                    loss_counts_list.append(mask[offset:next_offset].sum())
+                    correct_counts_list.append(is_correct[offset:next_offset].sum())
+                    offset = next_offset
 
-            is_correct = mask & (outputs["preds"] == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
+                if loss_counts_list:
+                    loss_counts = torch.stack(loss_counts_list)
+                    correct_counts = torch.stack(correct_counts_list)
+                else:
+                    loss_counts = torch.empty((0,), device=labels.device, dtype=torch.long)
+                    correct_counts = torch.empty((0,), device=labels.device, dtype=torch.long)
 
-            # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
-            use_act = getattr(getattr(self.model, "config", None), "use_act", True)
-            metrics = {
-                "count": valid_metrics.sum(),
+                seq_is_correct = correct_counts == loss_counts
+                loss_divisor = loss_counts.clamp_min(1)
 
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
-                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                valid_metrics = new_carry.halted & (loss_counts > 0)
+                metrics = {
+                    "count": valid_metrics.sum(),
+                    "accuracy": torch.where(valid_metrics, correct_counts.to(torch.float32) / loss_divisor, 0).sum(),
+                    "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                    "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                }
+                if use_act:
+                    metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
 
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
-            }
-            if use_act:
-                metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
+            loss_values = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID)
+            token_divisor = torch.repeat_interleave(loss_divisor.to(loss_values.dtype), lengths)
+            lm_loss = (loss_values / token_divisor).sum()
+        else:
+            with torch.no_grad():
+                # Preds
+                outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
-        # Losses
-        # FIXME: Assuming the batch is always full
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
+                # Correctness
+                mask = labels != IGNORE_LABEL_ID
+                loss_counts = mask.sum(-1)
+                loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
+
+                is_correct = mask & (outputs["preds"] == labels)
+                seq_is_correct = is_correct.sum(-1) == loss_counts
+
+                # Metrics (halted)
+                valid_metrics = new_carry.halted & (loss_counts > 0)
+                metrics = {
+                    "count": valid_metrics.sum(),
+
+                    "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                    "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+
+                    "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                }
+                if use_act:
+                    metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
+
+            # Losses
+            # FIXME: Assuming the batch is always full
+            lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
         metrics["lm_loss"] = lm_loss.detach()
 
         q_halt_loss = 0

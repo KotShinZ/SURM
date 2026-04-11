@@ -359,9 +359,9 @@ class Attention(nn.Module):
         dropout_p: float,
     ) -> torch.Tensor:
         batch_size, seq_len = query.shape[:2]
-        lengths = sequence_lengths.to(device=query.device, dtype=torch.int32).clamp(min=0, max=seq_len)
+        lengths = sequence_lengths.to(device=query.device, dtype=torch.int64).clamp(min=0, max=seq_len)
 
-        cu_seqlens = F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
+        cu_seqlens = F.pad(torch.cumsum(lengths, dim=0), (1, 0)).to(torch.int32)
         max_seqlen = int(lengths.max().item())
         if max_seqlen == 0:
             return torch.zeros_like(query)
@@ -498,6 +498,52 @@ class Attention(nn.Module):
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
+    def forward_packed(
+        self,
+        cos_sin: Optional[CosSin],
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        window_size=-1,
+    ) -> torch.Tensor:
+        if self.attention_type not in {"full", "swa"}:
+            raise ValueError(f"Packed variable-length attention does not support attention_type='{self.attention_type}'")
+
+        num_tokens = hidden_states.shape[0]
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        query = qkv[:, :self.num_heads]
+        key = qkv[:, self.num_heads: self.num_heads + self.num_key_value_heads]
+        value = qkv[:, self.num_heads + self.num_key_value_heads:]
+
+        if cos_sin is not None:
+            if len(cos_sin) == 4:
+                query, key = apply_rotary_pos_emb_2d(query, key, *cos_sin)
+            else:
+                cos, sin = cos_sin
+                query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        effective_window_size = self.attention_window_size if window_size == -1 else window_size
+        if self.attention_type == "full":
+            effective_window_size = -1
+
+        attn_output = flash_attn_varlen_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=cu_seqlens.to(torch.int32),
+            cu_seqlens_k=cu_seqlens.to(torch.int32),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=self.causal,
+            window_size=(effective_window_size, effective_window_size),
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+
+        return self.o_proj(attn_output.reshape(num_tokens, self.output_size))
+
 
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, expansion: float, mlp_dropout: float = 0.0):
@@ -559,6 +605,32 @@ class ConvSwiGLU(nn.Module):
         x_out = self.down_proj(self.mlp_dropout(x_conv))
 
         return x_out
+
+    def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        x_ffn = F.silu(gate) * up
+
+        gap = max(0, self.conv_kernel - 1)
+        if gap > 0 and x_ffn.shape[0] > 0:
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x_ffn.device, dtype=torch.long)
+            seq_ids = torch.repeat_interleave(
+                torch.arange(lengths.shape[0], device=x_ffn.device, dtype=torch.long),
+                lengths,
+            )
+            token_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long)
+            expanded_positions = token_positions + seq_ids * gap
+            expanded_len = x_ffn.shape[0] + lengths.shape[0] * gap
+            expanded = x_ffn.new_zeros((expanded_len, x_ffn.shape[-1]))
+            expanded[expanded_positions] = x_ffn
+        else:
+            expanded_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long)
+            expanded = x_ffn
+
+        x_conv = self.dwconv(expanded.unsqueeze(0).transpose(1, 2).to(self.dwconv.weight.dtype))
+        x_conv = x_conv[..., :expanded.size(0)]
+        x_conv = self.act(x_conv).transpose(1, 2).squeeze(0).contiguous()
+        x_conv = x_conv[expanded_positions]
+        return self.down_proj(self.mlp_dropout(x_conv))
 
 
 class FullyLinearGLU(nn.Module):

@@ -239,13 +239,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        model_config = getattr(getattr(model, "model", None), "config", None)
-        should_compile = (
-            "DISABLE_COMPILE" not in os.environ
-            and (model_config is None or not getattr(model_config, "profile", False))
-        )
-        if should_compile:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+        model = torch.compile(model, dynamic=train_metadata.variable_seq_lengths)  # type: ignore
 
         # Broadcast parameters from rank 0
         if world_size > 1:
