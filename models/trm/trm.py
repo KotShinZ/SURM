@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict, Optional, Union
 from dataclasses import dataclass, replace
 import math
 import torch
@@ -29,6 +29,39 @@ class TRMCarry:
     current_data: Dict[str, torch.Tensor]
 
 
+def _normalize_attention_window_sizes(
+    attention_window_size: Union[int, List[int]],
+    num_layers: int,
+    config_name: str,
+) -> List[int]:
+    if isinstance(attention_window_size, (list, tuple)):
+        layer_window_sizes = [int(window_size) for window_size in attention_window_size]
+    else:
+        layer_window_sizes = [int(attention_window_size)] * num_layers
+
+    if len(layer_window_sizes) != num_layers:
+        raise ValueError(
+            f"{config_name} must have exactly {num_layers} entries, but got {len(layer_window_sizes)}"
+        )
+
+    normalized_window_sizes = []
+    for layer_idx, window_size in enumerate(layer_window_sizes):
+        if window_size == -1:
+            normalized_window_sizes.append(-1)
+            continue
+        if window_size < 0:
+            raise ValueError(
+                f"{config_name}[{layer_idx}] must be -1 or a non-negative even integer, but got {window_size}"
+            )
+        if window_size % 2 != 0:
+            raise ValueError(
+                f"{config_name}[{layer_idx}] must be even so it can be split symmetrically, but got {window_size}"
+            )
+        normalized_window_sizes.append(window_size // 2)
+
+    return normalized_window_sizes
+
+
 class TRMConfig(BaseModel):
     batch_size: int
     seq_len: int
@@ -47,6 +80,7 @@ class TRMConfig(BaseModel):
     expansion: float
     num_heads: int
     pos_encodings: str
+    attention_window_size: Union[int, List[int]] = -1
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -70,7 +104,7 @@ class TRMConfig(BaseModel):
     profile: bool = False
 
 class TRMBlock(nn.Module):
-    def __init__(self, config: TRMConfig) -> None:
+    def __init__(self, config: TRMConfig, attention_window_size: int) -> None:
         super().__init__()
 
         self.config = config
@@ -88,6 +122,8 @@ class TRMBlock(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False,
                 attn_dropout=config.attn_dropout,
+                attention_type="full" if attention_window_size == -1 else "swa",
+                attention_window_size=attention_window_size,
                 prefix_seq_len=self.puzzle_emb_len,
             )
         self.mlp = SwiGLU(
@@ -202,7 +238,17 @@ class TRM_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = TRMReasoningModule(layers=[TRMBlock(self.config) for _i in range(self.config.L_layers)])
+        self.layer_attention_window_sizes = _normalize_attention_window_sizes(
+            self.config.attention_window_size,
+            self.config.L_layers,
+            "TRMConfig.attention_window_size",
+        )
+        self.L_level = TRMReasoningModule(
+            layers=[
+                TRMBlock(self.config, attention_window_size=self.layer_attention_window_sizes[layer_idx])
+                for layer_idx in range(self.config.L_layers)
+            ]
+        )
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)

@@ -20,6 +20,7 @@ hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
 expansion: 4
 attn_dropout: 0.0
+attention_window_size: -1  # Scalar broadcasts to all layers. Use -1 for full attention, or e.g. [128, 128, -1] for per-layer total SWA windows (128 -> (64, 64)).
 
 puzzle_emb_ndim: ${.hidden_size}
 

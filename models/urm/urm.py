@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict, Optional, Union
 from dataclasses import dataclass, replace
 import math
 import torch
@@ -28,6 +28,39 @@ class URMCarry:
     current_data: Optional[Dict[str, torch.Tensor]] = None
 
 
+def _normalize_attention_window_sizes(
+    attention_window_size: Union[int, List[int]],
+    num_layers: int,
+    config_name: str,
+) -> List[int]:
+    if isinstance(attention_window_size, (list, tuple)):
+        layer_window_sizes = [int(window_size) for window_size in attention_window_size]
+    else:
+        layer_window_sizes = [int(attention_window_size)] * num_layers
+
+    if len(layer_window_sizes) != num_layers:
+        raise ValueError(
+            f"{config_name} must have exactly {num_layers} entries, but got {len(layer_window_sizes)}"
+        )
+
+    normalized_window_sizes = []
+    for layer_idx, window_size in enumerate(layer_window_sizes):
+        if window_size == -1:
+            normalized_window_sizes.append(-1)
+            continue
+        if window_size < 0:
+            raise ValueError(
+                f"{config_name}[{layer_idx}] must be -1 or a non-negative even integer, but got {window_size}"
+            )
+        if window_size % 2 != 0:
+            raise ValueError(
+                f"{config_name}[{layer_idx}] must be even so it can be split symmetrically, but got {window_size}"
+            )
+        normalized_window_sizes.append(window_size // 2)
+
+    return normalized_window_sizes
+
+
 class URMConfig(BaseModel):
     batch_size: int
     seq_len: int
@@ -45,7 +78,7 @@ class URMConfig(BaseModel):
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
     attention_type: str = "full"
-    attention_window_size: int = -1
+    attention_window_size: Union[int, List[int]] = -1
     attention_window_size_2d: int = 1
     attention_topk: int = 0
     topk_sparsity: float = 0.0
@@ -72,9 +105,12 @@ class URMConfig(BaseModel):
 
 
 class URMBlock(nn.Module):
-    def __init__(self, config: URMConfig) -> None:
+    def __init__(self, config: URMConfig, attention_window_size: int) -> None:
         super().__init__()
         puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
+        attention_type = config.attention_type.lower()
+        if attention_type in {"full", "swa"}:
+            attention_type = "full" if attention_window_size == -1 else "swa"
         self.self_attn = Attention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
@@ -82,8 +118,8 @@ class URMBlock(nn.Module):
             num_key_value_heads=config.num_heads,
             causal=False,
             attn_dropout=config.attn_dropout,
-            attention_type=config.attention_type,
-            attention_window_size=config.attention_window_size,
+            attention_type=attention_type,
+            attention_window_size=attention_window_size,
             attention_window_size_2d=config.attention_window_size_2d,
             attention_topk=config.attention_topk,
             grid_height=config.grid_height,
@@ -231,7 +267,17 @@ class URM_Inner(nn.Module):
                 base=self.inner_config.rope_theta,
             )
 
-        self.layers = nn.ModuleList([URMBlock(self.inner_config) for _ in range(self.config.num_layers)])
+        self.layer_attention_window_sizes = _normalize_attention_window_sizes(
+            self.inner_config.attention_window_size,
+            self.config.num_layers,
+            "URMConfig.attention_window_size",
+        )
+        self.layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=self.layer_attention_window_sizes[layer_idx])
+                for layer_idx in range(self.config.num_layers)
+            ]
+        )
 
         self.init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
