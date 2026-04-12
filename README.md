@@ -51,6 +51,14 @@ python -m data.build_arc_dataset \
   --subsets training evaluation concept \
   --test-set-name evaluation
 
+# ARC-AGI-1-full
+python -m data.build_arc_dataset_full \
+  --input-file-prefix kaggle/combined/arc-agi \
+  --output-dir data/arc1concept-full-aug-1000-nopadding \
+  --subsets training evaluation concept \
+  --test-set-name evaluation \
+  --no_padding true
+
 # ARC-AGI-2
 python -m data.build_arc_dataset \
   --input-file-prefix kaggle/combined/arc-agi \

@@ -131,18 +131,27 @@ class PuzzleDataset(IterableDataset):
         # Load data
         self._data = {}
         for set_name in self.metadata.sets:
+            split_dir = os.path.join(self.config.dataset_path, self.split)
+            set_fields = dict(field_mmap_modes)
+            position_ids_path = os.path.join(split_dir, f"{set_name}__position_ids.npy")
+            if os.path.isfile(position_ids_path):
+                set_fields["position_ids"] = "r"
+
             # Load subset
             self._data[set_name] = {
-                field_name: np.load(os.path.join(self.config.dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
-                for field_name, mmap_mode in field_mmap_modes.items()
+                field_name: np.load(os.path.join(split_dir, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
+                for field_name, mmap_mode in set_fields.items()
             }
 
     def _select_examples(self, dataset: dict, indices: np.ndarray) -> dict:
         if not self.metadata.variable_seq_lengths:
-            return {
+            batch = {
                 "inputs": dataset["inputs"][indices],
                 "labels": dataset["labels"][indices],
             }
+            if "position_ids" in dataset:
+                batch["position_ids"] = dataset["position_ids"][indices]
+            return batch
 
         offsets = dataset["seq_offsets"]
         shapes = dataset["seq_shapes"][indices]
@@ -150,11 +159,14 @@ class PuzzleDataset(IterableDataset):
 
         input_chunks = []
         label_chunks = []
+        position_chunks = []
         for example_idx in indices:
             start = int(offsets[example_idx])
             end = int(offsets[example_idx + 1])
             input_chunks.append(dataset["inputs"][start:end])
             label_chunks.append(dataset["labels"][start:end])
+            if "position_ids" in dataset:
+                position_chunks.append(dataset["position_ids"][start:end])
 
         if input_chunks:
             inputs = np.concatenate(input_chunks).astype(np.uint8, copy=False)
@@ -163,7 +175,7 @@ class PuzzleDataset(IterableDataset):
             inputs = np.empty((0,), dtype=np.uint8)
             labels = np.empty((0,), dtype=np.uint8)
 
-        return {
+        batch = {
             "inputs": inputs,
             "labels": labels,
             "seq_lengths": lengths,
@@ -172,6 +184,15 @@ class PuzzleDataset(IterableDataset):
             ),
             "seq_shapes": shapes,
         }
+        if "position_ids" in dataset:
+            if position_chunks:
+                batch["position_ids"] = np.concatenate(position_chunks, axis=0).astype(
+                    dataset["position_ids"].dtype,
+                    copy=False,
+                )
+            else:
+                batch["position_ids"] = np.empty((0, dataset["position_ids"].shape[1]), dtype=dataset["position_ids"].dtype)
+        return batch
 
     def _make_masked_inputs(
         self,
@@ -246,9 +267,11 @@ class PuzzleDataset(IterableDataset):
                 pad_values["seq_lengths"] = 0
             if "seq_shapes" in batch:
                 pad_values["seq_shapes"] = 1
+            if "position_ids" in batch:
+                pad_values["position_ids"] = 0
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
 
-        if "seq_lengths" in batch and "seq_shapes" in batch:
+        if "position_ids" not in batch and "seq_lengths" in batch and "seq_shapes" in batch:
             seq_lengths = batch["seq_lengths"]
             seq_widths = np.maximum(batch["seq_shapes"][:, 1], 1)
             if self.metadata.variable_seq_lengths:
@@ -273,6 +296,7 @@ class PuzzleDataset(IterableDataset):
                     ],
                     axis=-1,
                 ).astype(np.int32, copy=False)
+        if "seq_shapes" in batch:
             del batch["seq_shapes"]
 
         # To tensor

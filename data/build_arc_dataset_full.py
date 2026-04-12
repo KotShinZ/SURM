@@ -24,12 +24,13 @@ class DataProcessConfig(BaseModel):
 
     seed: int = 42
     num_aug: int = 1000
-    no_padding: bool = False
+    no_padding: bool = True
     min_context_pairs: int = 2
 
 
 ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
+ARCOutputRowOffset = ARCMaxGridSize
 
 PuzzleIdSeparator = "|||"
 DummyPuzzleIdentifier = 1
@@ -394,15 +395,31 @@ def _make_pair_sequences(
     no_padding: bool,
 ):
     if no_padding:
-        (inp_seq, out_seq), _pair_shape = np_grids_to_unpadded_seq(inp, out)
+        (inp_seq, out_seq), pair_shape = np_grids_to_unpadded_seq(inp, out)
     else:
         inp_seq, out_seq = np_grid_to_fixed_seq_translational_augment(
             inp,
             out,
             do_translation=do_translation,
         )
+        pair_shape = (ARCMaxGridSize, ARCMaxGridSize)
 
-    return inp_seq.astype(np.uint8, copy=False), out_seq.astype(np.uint8, copy=False)
+    return (
+        inp_seq.astype(np.uint8, copy=False),
+        out_seq.astype(np.uint8, copy=False),
+        pair_shape,
+    )
+
+
+def _make_pair_position_ids(pair_shape: Tuple[int, int], example_index: int):
+    pair_h, pair_w = pair_shape
+    rows = np.repeat(np.arange(pair_h, dtype=np.uint8), pair_w)
+    cols = np.tile(np.arange(pair_w, dtype=np.uint8), pair_h)
+    depth = np.full((pair_h * pair_w,), example_index, dtype=np.uint8)
+
+    input_position_ids = np.stack([depth, rows, cols], axis=-1)
+    output_position_ids = np.stack([depth, rows + ARCOutputRowOffset, cols], axis=-1)
+    return input_position_ids, output_position_ids
 
 
 def _build_full_context_example(
@@ -422,26 +439,31 @@ def _build_full_context_example(
 
     input_parts = []
     label_parts = []
+    position_parts = []
 
     for pair_pos, pair_idx in enumerate(ordered_indices):
         inp, out = puzzle.pairs[pair_idx]
         do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
-        inp_seq, out_seq = _make_pair_sequences(inp, out, do_translation, no_padding)
+        inp_seq, out_seq, pair_shape = _make_pair_sequences(inp, out, do_translation, no_padding)
 
         zero_inp = np.zeros_like(inp_seq, dtype=np.uint8)
         zero_out = np.zeros_like(out_seq, dtype=np.uint8)
+        inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
 
         if pair_idx == target_idx:
             input_parts.extend([inp_seq, zero_out])
             label_parts.extend([zero_inp, out_seq])
+            position_parts.extend([inp_pos_ids, out_pos_ids])
         else:
             input_parts.extend([inp_seq, out_seq])
             label_parts.extend([zero_inp, zero_out])
+            position_parts.extend([inp_pos_ids, out_pos_ids])
 
     sample_input = np.concatenate(input_parts).astype(np.uint8, copy=False)
     sample_label = np.concatenate(label_parts).astype(np.uint8, copy=False)
+    sample_position_ids = np.concatenate(position_parts, axis=0).astype(np.uint8, copy=False)
     seq_shape = (1, int(sample_input.shape[0]))
-    return sample_input, sample_label, seq_shape
+    return sample_input, sample_label, seq_shape, sample_position_ids
 
 
 def convert_dataset(config: DataProcessConfig):
@@ -474,6 +496,7 @@ def convert_dataset(config: DataProcessConfig):
         total_examples = 0
         total_puzzles = 0
         total_groups = 0
+        split_max_position_id = np.zeros((3,), dtype=np.int32)
 
         for subset_name, subset in split.items():
             results = {
@@ -485,6 +508,7 @@ def convert_dataset(config: DataProcessConfig):
             }
             if config.no_padding:
                 results["seq_shapes"] = []
+                results["position_ids"] = []
 
             example_id = 0
             puzzle_id = 0
@@ -502,11 +526,16 @@ def convert_dataset(config: DataProcessConfig):
                         if built is None:
                             continue
 
-                        inp, out, seq_shape = built
+                        inp, out, seq_shape, position_ids = built
                         results["inputs"].append(inp)
                         results["labels"].append(out)
                         if config.no_padding:
                             results["seq_shapes"].append(seq_shape)
+                            results["position_ids"].append(position_ids)
+                            split_max_position_id = np.maximum(
+                                split_max_position_id,
+                                position_ids.max(axis=0).astype(np.int32) + 1,
+                            )
 
                         example_id += 1
                         total_examples += 1
@@ -555,6 +584,16 @@ def convert_dataset(config: DataProcessConfig):
                             os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
                             array,
                         )
+                elif key == "position_ids":
+                    flat_positions = (
+                        np.concatenate(value, axis=0).astype(np.uint8, copy=False)
+                        if value
+                        else np.empty((0, 3), dtype=np.uint8)
+                    )
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
+                        flat_positions,
+                    )
                 elif key == "seq_shapes":
                     np.save(
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
@@ -577,12 +616,15 @@ def convert_dataset(config: DataProcessConfig):
             mean_puzzle_examples=total_examples / max(total_puzzles, 1),
             sets=list(split.keys()),
             variable_seq_lengths=config.no_padding,
+            position_id_shape=split_max_position_id.tolist() if config.no_padding and total_examples > 0 else None,
         )
         print(f"  Total puzzles: {total_puzzles}")
         print(f"  Total examples: {total_examples}")
         print(f"  Total groups: {total_groups}")
         print(f"  Mean examples per puzzle: {metadata.mean_puzzle_examples:.2f}")
         print(f"  Sequence length upper bound: {metadata.seq_len}")
+        if metadata.position_id_shape is not None:
+            print(f"  Position ID shape: {metadata.position_id_shape}")
 
         with open(os.path.join(config.output_dir, split_name, "dataset.json"), "w") as f:
             json.dump(metadata.model_dump(), f)

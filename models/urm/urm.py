@@ -6,7 +6,17 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, ConvSwiGLU, Attention, RotaryEmbedding, RotaryEmbedding2D, CosSin, CastedEmbedding, CastedLinear
+from models.layers import (
+    rms_norm,
+    ConvSwiGLU,
+    Attention,
+    RotaryEmbedding,
+    RotaryEmbedding2D,
+    RotaryEmbedding3D,
+    CosSin,
+    CastedEmbedding,
+    CastedLinear,
+)
 from models.sparse_embedding import CastedSparseEmbedding
 from logger import global_logger
 
@@ -29,6 +39,7 @@ class URMConfig(BaseModel):
     expansion: float
     num_heads: int
     pos_encodings: str
+    grid_depth: int = 0  # Grid depth for 3D RoPE (0 = use 2D/1D RoPE)
     grid_height: int = 0  # Grid height for 2D RoPE (0 = use 1D RoPE)
     grid_width: int = 0   # Grid width  for 2D RoPE (0 = use 1D RoPE)
     attn_dropout: float = 0.0
@@ -133,6 +144,7 @@ class URM_Inner(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
         self.patch_area = self.config.patch_height * self.config.patch_width
         self.inner_seq_len = self.config.seq_len
+        self.inner_grid_depth = self.config.grid_depth
         self.inner_grid_height = self.config.grid_height
         self.inner_grid_width = self.config.grid_width
         self.padded_grid_height = self.config.grid_height
@@ -155,6 +167,7 @@ class URM_Inner(nn.Module):
 
         config_updates = dict(
             seq_len=self.inner_seq_len,
+            grid_depth=self.inner_grid_depth,
             grid_height=self.inner_grid_height,
             grid_width=self.inner_grid_width,
         )
@@ -190,7 +203,20 @@ class URM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        if self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
+        if (
+            self.inner_config.grid_depth > 0
+            and self.inner_config.grid_height > 0
+            and self.inner_config.grid_width > 0
+        ):
+            self.rotary_emb = RotaryEmbedding3D(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_depth=self.inner_config.grid_depth,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
+                puzzle_emb_len=self.puzzle_emb_len,
+                base=self.inner_config.rope_theta,
+            )
+        elif self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
             self.rotary_emb = RotaryEmbedding2D(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_height=self.inner_config.grid_height,
@@ -323,6 +349,28 @@ class URM_Inner(nn.Module):
     def _packed_lengths(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return batch["seq_lengths"].to(device=batch["inputs"].device, dtype=torch.long)
 
+    def _pack_rotary_axes(
+        self,
+        axes: CosSin,
+        batch: Dict[str, torch.Tensor],
+        token_indices: torch.Tensor,
+    ) -> CosSin:
+        if self.puzzle_emb_len == 0:
+            return axes
+
+        total_len = token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len
+        prefix_indices = self._packed_prefix_indices(batch)
+        packed_axes = []
+        for cos, sin in zip(axes[::2], axes[1::2]):
+            flat_cos = cos.new_empty((total_len, cos.shape[-1]))
+            flat_sin = sin.new_empty((total_len, sin.shape[-1]))
+            flat_cos[token_indices] = cos
+            flat_sin[token_indices] = sin
+            flat_cos[prefix_indices] = 1
+            flat_sin[prefix_indices] = 0
+            packed_axes.extend([flat_cos, flat_sin])
+        return tuple(packed_axes)
+
     @torch.compiler.disable
     def _packed_cu_seqlens(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, int]:
         lengths = self._packed_lengths(batch) + self.puzzle_emb_len
@@ -389,6 +437,10 @@ class URM_Inner(nn.Module):
         return embedding, token_indices
 
     def _rotary_cos_sin_packed(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> CosSin:
+        if isinstance(self.rotary_emb, RotaryEmbedding3D):
+            position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
+            return self._pack_rotary_axes(self.rotary_emb.lookup(position_ids), batch, token_indices)
+
         if isinstance(self.rotary_emb, RotaryEmbedding2D):
             position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
             data_flat_ids = self.puzzle_emb_len + position_ids[:, 0] * self.rotary_emb.grid_width + position_ids[:, 1]
@@ -446,8 +498,10 @@ class URM_Inner(nn.Module):
         return replace(carry, current_hidden=new_hidden)
 
     def _rotary_cos_sin(self, batch: Dict[str, torch.Tensor]):
-        if "position_ids" in batch and isinstance(self.rotary_emb, RotaryEmbedding2D):
+        if "position_ids" in batch and isinstance(self.rotary_emb, (RotaryEmbedding2D, RotaryEmbedding3D)):
             return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.puzzle_emb_len)
+        if isinstance(self.rotary_emb, RotaryEmbedding3D):
+            raise ValueError("RoPE3D requires explicit position_ids in the batch.")
         return self.rotary_emb()
 
     def _sequence_lengths(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:

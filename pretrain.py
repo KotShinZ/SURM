@@ -232,6 +232,15 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         causal=False,  # Non-autoregressive
     )
 
+    if train_metadata.position_id_shape is not None:
+        if len(train_metadata.position_id_shape) == 3:
+            model_cfg["grid_depth"] = model_cfg.get("grid_depth", 0) or train_metadata.position_id_shape[0]
+            model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or train_metadata.position_id_shape[1]
+            model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or train_metadata.position_id_shape[2]
+        elif len(train_metadata.position_id_shape) == 2:
+            model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or train_metadata.position_id_shape[0]
+            model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or train_metadata.position_id_shape[1]
+
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
