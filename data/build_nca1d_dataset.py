@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -22,7 +24,7 @@ from NCA_datas.NCA_data import (
     NCAConfig,
     NCATokenizer,
     get_device,
-    score_trajectory_gzip,
+    gzip_complexity_ratio_from_tokens,
     seed_everything,
 )
 
@@ -33,17 +35,17 @@ cli = ArgParser()
 class NCA1DDataConfig(BaseModel):
     output_dir: str = "data/nca1d-default"
 
-    train_size: int = 1024
-    test_size: int = 256
+    train_size: int = 1000000
+    test_size: int = 10000
     seed: int = 0
 
     state_height: int = 9
-    state_height_min: Optional[int] = None
-    state_height_max: Optional[int] = None
+    state_height_min: Optional[int] = 9
+    state_height_max: Optional[int] = 30
     state_width: int = 1
 
-    num_colors: int = 8
-    temperature: float = 1e-3
+    num_colors: int = 10
+    temperature: float = 1e-5
     identity_bias: float = 0.0
     conv_channels: int = 4
     hidden_dim: int = 16
@@ -52,23 +54,28 @@ class NCA1DDataConfig(BaseModel):
     patch_size: int = 1
 
     rollout_steps: int = 9
-    rollout_steps_min: Optional[int] = None
-    rollout_steps_max: Optional[int] = None
+    rollout_steps_min: Optional[int] = 9
+    rollout_steps_max: Optional[int] = 30
+    counts: int = 1
+    counts_min: Optional[int] = 2
+    counts_max: Optional[int] = 12
     time_subsample: int = 1
     start_step: int = 0
-    # When both are set, these directly specify the raw trajectory window [time_start, time_end].
-    time_start: Optional[int] = 30
-    time_end: Optional[int] = 38
+    # If set, sampling starts from this raw NCA step instead of start_step.
+    time_start: Optional[int] = 50
 
-    gzip_threshold_low: Optional[float] = None
-    gzip_threshold_high: Optional[float] = None
+    gzip_threshold_low: Optional[float] = 0.1
+    gzip_threshold_high: Optional[float] = 0.2
 
     # Number of candidate trajectories to generate in parallel per sampling round.
-    batch_candidate_size: int = 64
+    batch_candidate_size: int = 65536
     max_sampling_rounds: int = 200
+    max_data_seq_len: int = 9000
 
     # Reserve 0 for PAD and 1 for the default mask token used by PuzzleDataset.
     token_offset: int = 2
+    mask_token_id: int = 1
+    target_mask_ratio: float = 0.25
     save_dtype: str = "int32"
 
     @property
@@ -81,33 +88,23 @@ class NCA1DDataConfig(BaseModel):
 
     @property
     def sampled_rollout_steps_min(self) -> int:
-        if self.uses_explicit_time_range:
-            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_min is None else self.rollout_steps_min
 
     @property
     def sampled_rollout_steps_max(self) -> int:
-        if self.uses_explicit_time_range:
-            return self.selected_time_span
         return self.rollout_steps if self.rollout_steps_max is None else self.rollout_steps_max
 
     @property
-    def uses_explicit_time_range(self) -> bool:
-        return self.time_start is not None or self.time_end is not None
+    def sampled_counts_min(self) -> int:
+        return self.counts if self.counts_min is None else self.counts_min
+
+    @property
+    def sampled_counts_max(self) -> int:
+        return self.counts if self.counts_max is None else self.counts_max
 
     @property
     def resolved_start_step(self) -> int:
         return self.start_step if self.time_start is None else self.time_start
-
-    @property
-    def selected_time_span(self) -> int:
-        if self.time_start is None or self.time_end is None:
-            raise ValueError("time_start and time_end must both be set to use an explicit time range.")
-        return self.time_end - self.time_start + 1
-
-    @property
-    def resolved_time_end(self) -> int:
-        return self.resolved_start_step + self.sampled_rollout_steps_max - 1
 
     @property
     def valid_state_heights(self) -> list[int]:
@@ -116,6 +113,17 @@ class NCA1DDataConfig(BaseModel):
             for height in range(self.sampled_state_height_min, self.sampled_state_height_max + 1)
             if height % self.patch_size == 0
         ]
+
+    @property
+    def max_counts_allowed_by_canvas(self) -> int:
+        tokens_per_count = self.sampled_state_height_max * self.max_num_frames
+        if tokens_per_count <= 0:
+            return 0
+        return (self.max_data_seq_len - 1) // tokens_per_count
+
+    @property
+    def resolved_counts_max(self) -> int:
+        return min(self.sampled_counts_max, self.max_counts_allowed_by_canvas)
 
     @model_validator(mode="after")
     def _validate(self) -> "NCA1DDataConfig":
@@ -136,7 +144,7 @@ class NCA1DDataConfig(BaseModel):
             )
         if self.state_width != 1:
             raise ValueError(
-                f"state_width must be 1 for the requested 1xH -> HxT dataset, got {self.state_width}"
+                f"state_width must be 1 for the requested 1xH -> HxTxC dataset, got {self.state_width}"
             )
         if self.num_colors <= 1:
             raise ValueError(f"num_colors must be > 1, got {self.num_colors}")
@@ -153,7 +161,7 @@ class NCA1DDataConfig(BaseModel):
                 f"got range=({self.sampled_state_height_min}, {self.sampled_state_height_max}) "
                 f"and patch_size={self.patch_size}"
             )
-        if not self.uses_explicit_time_range and self.rollout_steps <= 0:
+        if self.rollout_steps <= 0:
             raise ValueError(f"rollout_steps must be > 0, got {self.rollout_steps}")
         if self.sampled_rollout_steps_min <= 0:
             raise ValueError(
@@ -165,25 +173,38 @@ class NCA1DDataConfig(BaseModel):
                 "rollout_steps_min must be <= rollout_steps_max, "
                 f"got min={self.sampled_rollout_steps_min}, max={self.sampled_rollout_steps_max}"
             )
+        if self.counts <= 0:
+            raise ValueError(f"counts must be > 0, got {self.counts}")
+        if self.sampled_counts_min <= 0:
+            raise ValueError(f"counts_min/counts must be > 0, got {self.sampled_counts_min}")
+        if self.sampled_counts_min > self.sampled_counts_max:
+            raise ValueError(
+                "counts_min must be <= counts_max, "
+                f"got min={self.sampled_counts_min}, max={self.sampled_counts_max}"
+            )
         if self.time_subsample <= 0:
             raise ValueError(f"time_subsample must be > 0, got {self.time_subsample}")
         if self.start_step < 0:
             raise ValueError(f"start_step must be >= 0, got {self.start_step}")
-        if self.uses_explicit_time_range:
-            if self.time_start is None or self.time_end is None:
-                raise ValueError("time_start and time_end must both be set when using an explicit time range.")
-            if self.time_start < 0:
-                raise ValueError(f"time_start must be >= 0, got {self.time_start}")
-            if self.time_end < self.time_start:
-                raise ValueError(
-                    f"time_end must be >= time_start, got time_start={self.time_start}, time_end={self.time_end}"
-                )
+        if self.time_start is not None and self.time_start < 0:
+            raise ValueError(f"time_start must be >= 0, got {self.time_start}")
         if self.batch_candidate_size <= 0:
             raise ValueError(f"batch_candidate_size must be > 0, got {self.batch_candidate_size}")
         if self.max_sampling_rounds <= 0:
             raise ValueError(f"max_sampling_rounds must be > 0, got {self.max_sampling_rounds}")
+        if self.max_data_seq_len <= 0:
+            raise ValueError(f"max_data_seq_len must be > 0, got {self.max_data_seq_len}")
         if self.token_offset < 2:
             raise ValueError(f"token_offset must be >= 2, got {self.token_offset}")
+        if not (0 < self.mask_token_id < self.token_offset):
+            raise ValueError(
+                "mask_token_id must be in the reserved token range [1, token_offset), "
+                f"got mask_token_id={self.mask_token_id}, token_offset={self.token_offset}"
+            )
+        if not (0.0 <= self.target_mask_ratio <= 1.0):
+            raise ValueError(
+                f"target_mask_ratio must be in [0, 1], got {self.target_mask_ratio}"
+            )
         if self.gzip_threshold_low is not None and self.gzip_threshold_low < 0.0:
             raise ValueError(
                 f"gzip_threshold_low must be >= 0.0 or None, got {self.gzip_threshold_low}"
@@ -201,6 +222,12 @@ class NCA1DDataConfig(BaseModel):
                 "gzip_threshold_low must be < gzip_threshold_high when both are set, "
                 f"got low={self.gzip_threshold_low}, high={self.gzip_threshold_high}"
             )
+        if self.max_counts_allowed_by_canvas < 1:
+            raise ValueError(
+                "The maximum state_height x num_frames already reaches the max_data_seq_len cap "
+                f"with a single count: state_height_max={self.sampled_state_height_max}, "
+                f"max_num_frames={self.max_num_frames}, max_data_seq_len={self.max_data_seq_len}"
+            )
         return self
 
     @property
@@ -212,13 +239,18 @@ class NCA1DDataConfig(BaseModel):
         return self.max_num_frames
 
     @property
-    def final_image_shape(self) -> tuple[int, int]:
-        return self.sampled_state_height_max, self.max_num_frames
+    def final_image_shape(self) -> tuple[int, int, int]:
+        return self.sampled_state_height_max, self.max_num_frames, self.resolved_counts_max
 
     @property
     def seq_len(self) -> int:
-        height, width = self.final_image_shape
-        return height * width
+        height, width, counts = self.final_image_shape
+        return height * width * counts
+
+    @property
+    def position_id_shape(self) -> tuple[int, int, int]:
+        height, width, counts = self.final_image_shape
+        return counts, height, width
 
     @property
     def vocab_size(self) -> int:
@@ -281,6 +313,38 @@ def make_nca_config_for_sample(
 
 def num_frames_for_rollout_steps(rollout_steps: int, time_subsample: int) -> int:
     return math.ceil(rollout_steps / time_subsample)
+
+
+def counts_limit_for_shape(
+    state_height: int,
+    num_frames: int,
+    max_data_seq_len: int,
+) -> int:
+    tokens_per_count = state_height * num_frames
+    if tokens_per_count <= 0:
+        raise ValueError(
+            f"state_height and num_frames must be > 0, got {state_height=} and {num_frames=}"
+        )
+    return (max_data_seq_len - 1) // tokens_per_count
+
+
+def _configure_generation_backend(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except RuntimeError:
+        pass
 
 
 def _sample_batched_rule_parameters(
@@ -384,6 +448,72 @@ def rollout_trajectories_batched(
     return trajectories.detach().cpu().numpy().astype(np.int16, copy=False)
 
 
+def _repeat_rule_parameters_interleaved(
+    rule_parameters: Dict[str, torch.Tensor],
+    repeat_count: int,
+) -> Dict[str, torch.Tensor]:
+    return {
+        key: value.repeat_interleave(repeat_count, dim=0)
+        for key, value in rule_parameters.items()
+    }
+
+
+@torch.no_grad()
+def rollout_trajectories_shared_rule(
+    cfg: NCAConfig,
+    count: int,
+    device: torch.device,
+) -> np.ndarray:
+    return rollout_trajectory_sets_batched(
+        cfg=cfg,
+        sample_batch_size=1,
+        count=count,
+        device=device,
+    )[0].detach().cpu().numpy().astype(np.int16, copy=False)
+
+
+@torch.no_grad()
+def rollout_trajectory_sets_batched(
+    cfg: NCAConfig,
+    sample_batch_size: int,
+    count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if sample_batch_size <= 0:
+        raise ValueError(f"sample_batch_size must be > 0, got {sample_batch_size}")
+    if count <= 0:
+        raise ValueError(f"count must be > 0, got {count}")
+
+    state = torch.randint(
+        low=0,
+        high=cfg.num_colors,
+        size=(sample_batch_size, count, cfg.grid_height, cfg.grid_width),
+        device=device,
+        dtype=torch.long,
+    )
+    base_rule_parameters = _sample_batched_rule_parameters(
+        cfg,
+        batch_size=sample_batch_size,
+        device=device,
+    )
+    rule_parameters = _repeat_rule_parameters_interleaved(
+        base_rule_parameters,
+        repeat_count=count,
+    )
+    frames: list[torch.Tensor] = []
+    total_steps = cfg.start_step + cfg.rollout_steps
+    state_flat = state.reshape(sample_batch_size * count, cfg.grid_height, cfg.grid_width)
+
+    for t in range(total_steps):
+        if t >= cfg.start_step and ((t - cfg.start_step) % cfg.time_subsample == 0):
+            frames.append(
+                state_flat.reshape(sample_batch_size, count, cfg.grid_height, cfg.grid_width)
+            )
+        state_flat = _batched_step(state_flat, rule_parameters, cfg)
+
+    return torch.stack(frames, dim=2)
+
+
 def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
     if trajectory.ndim != 3:
         raise ValueError(f"trajectory must have shape [T, H, W], got ndim={trajectory.ndim}")
@@ -394,27 +524,73 @@ def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
     return np.squeeze(trajectory, axis=2).T.astype(np.int16, copy=False)
 
 
+def trajectories_to_time_volume(trajectories: np.ndarray) -> np.ndarray:
+    if trajectories.ndim != 4:
+        raise ValueError(
+            f"trajectories must have shape [counts, T, H, W], got ndim={trajectories.ndim}"
+        )
+    if trajectories.shape[3] != 1:
+        raise ValueError(
+            "trajectory width must be 1 for 1xH -> HxTxC conversion, "
+            f"got shape={trajectories.shape}"
+        )
+    return np.transpose(np.squeeze(trajectories, axis=3), (2, 1, 0)).astype(np.int16, copy=False)
+
+
+def trajectory_sets_to_time_volumes_batched(trajectory_sets: torch.Tensor) -> torch.Tensor:
+    if trajectory_sets.ndim != 5:
+        raise ValueError(
+            "trajectory_sets must have shape [B, C, T, H, W], "
+            f"got ndim={trajectory_sets.ndim}"
+        )
+    if trajectory_sets.shape[-1] != 1:
+        raise ValueError(
+            "trajectory width must be 1 for 1xH -> HxTxC conversion, "
+            f"got shape={tuple(trajectory_sets.shape)}"
+        )
+    return trajectory_sets.squeeze(-1).permute(0, 3, 2, 1).contiguous()
+
+
 def flatten_time_image(
     time_image: np.ndarray,
     token_offset: int,
     padded_height: Optional[int] = None,
     padded_num_frames: Optional[int] = None,
 ) -> np.ndarray:
-    if time_image.ndim != 2:
-        raise ValueError(f"time_image must have shape [H, T], got ndim={time_image.ndim}")
-    image_height, num_frames = time_image.shape
+    return flatten_time_volume(
+        time_image[:, :, None],
+        token_offset=token_offset,
+        padded_height=padded_height,
+        padded_num_frames=padded_num_frames,
+        padded_counts=1,
+    )
+
+
+def flatten_time_volume(
+    time_volume: np.ndarray,
+    token_offset: int,
+    padded_height: Optional[int] = None,
+    padded_num_frames: Optional[int] = None,
+    padded_counts: Optional[int] = None,
+) -> np.ndarray:
+    if time_volume.ndim != 3:
+        raise ValueError(f"time_volume must have shape [H, T, C], got ndim={time_volume.ndim}")
+    image_height, num_frames, counts = time_volume.shape
     padded_height = image_height if padded_height is None else padded_height
     padded_num_frames = num_frames if padded_num_frames is None else padded_num_frames
+    padded_counts = counts if padded_counts is None else padded_counts
 
-    if image_height > padded_height or num_frames > padded_num_frames:
+    if image_height > padded_height or num_frames > padded_num_frames or counts > padded_counts:
         raise ValueError(
-            "time_image must fit inside the padded canvas, "
-            f"got image_shape={(image_height, num_frames)} and "
-            f"padded_shape={(padded_height, padded_num_frames)}"
+            "time_volume must fit inside the padded canvas, "
+            f"got image_shape={(image_height, num_frames, counts)} and "
+            f"padded_shape={(padded_height, padded_num_frames, padded_counts)}"
         )
 
-    canvas = np.zeros((padded_height, padded_num_frames), dtype=np.int32)
-    canvas[:image_height, :num_frames] = time_image.astype(np.int32, copy=False) + token_offset
+    canvas = np.zeros((padded_height, padded_num_frames, padded_counts), dtype=np.int32)
+    canvas[:image_height, :num_frames, :counts] = (
+        time_volume.astype(np.int32, copy=False) + token_offset
+    )
     return canvas.reshape(-1)
 
 
@@ -426,10 +602,301 @@ def unflatten_time_image(
     padded_height: Optional[int] = None,
     padded_num_frames: Optional[int] = None,
 ) -> np.ndarray:
+    return np.squeeze(
+        unflatten_time_volume(
+            flat_tokens,
+            image_height=image_height,
+            num_frames=num_frames,
+            counts=1,
+            token_offset=token_offset,
+            padded_height=padded_height,
+            padded_num_frames=padded_num_frames,
+            padded_counts=1,
+        ),
+        axis=2,
+    )
+
+
+def unflatten_time_volume(
+    flat_tokens: np.ndarray,
+    image_height: int,
+    num_frames: int,
+    counts: int,
+    token_offset: int,
+    padded_height: Optional[int] = None,
+    padded_num_frames: Optional[int] = None,
+    padded_counts: Optional[int] = None,
+) -> np.ndarray:
     padded_height = image_height if padded_height is None else padded_height
     padded_num_frames = num_frames if padded_num_frames is None else padded_num_frames
-    canvas = flat_tokens.reshape(padded_height, padded_num_frames)
-    return canvas[:image_height, :num_frames] - token_offset
+    padded_counts = counts if padded_counts is None else padded_counts
+    canvas = flat_tokens.reshape(padded_height, padded_num_frames, padded_counts)
+    return canvas[:image_height, :num_frames, :counts] - token_offset
+
+
+def score_trajectory_set_gzip(trajectories: np.ndarray, tokenizer: NCATokenizer) -> float:
+    if trajectories.ndim != 4:
+        raise ValueError(
+            f"trajectories must have shape [counts, T, H, W], got ndim={trajectories.ndim}"
+        )
+    frame_tokens = []
+    for trajectory in trajectories:
+        frame_tokens.extend(tokenizer.encode_frame(frame)[1:-1] for frame in trajectory)
+    flat = np.concatenate(frame_tokens, axis=0)
+    return gzip_complexity_ratio_from_tokens(flat)
+
+
+def _trajectory_set_tokens_for_gzip_patch1(
+    trajectory_sets: np.ndarray,
+    num_frames: np.ndarray,
+    counts: np.ndarray,
+) -> list[np.ndarray]:
+    if trajectory_sets.ndim != 5:
+        raise ValueError(
+            "trajectory_sets must have shape [B, C, T, H, W], "
+            f"got ndim={trajectory_sets.ndim}"
+        )
+    if trajectory_sets.shape[-1] != 1:
+        raise ValueError(
+            "trajectory width must be 1 for 1xH gzip scoring, "
+            f"got shape={trajectory_sets.shape}"
+        )
+
+    token_sets: list[np.ndarray] = []
+    for batch_idx in range(trajectory_sets.shape[0]):
+        token_sets.append(
+            trajectory_sets[
+                batch_idx,
+                : int(counts[batch_idx]),
+                : int(num_frames[batch_idx]),
+                :,
+                0,
+            ].reshape(-1).astype(np.int32, copy=False)
+        )
+    return token_sets
+
+
+def score_trajectory_sets_gzip_batched(
+    trajectory_sets: np.ndarray,
+    num_frames: np.ndarray,
+    counts: np.ndarray,
+    tokenizer: NCATokenizer,
+) -> np.ndarray:
+    if tokenizer.patch != 1:
+        scores = [
+            score_trajectory_set_gzip(
+                trajectory_sets[idx, : int(counts[idx]), : int(num_frames[idx])],
+                tokenizer,
+            )
+            for idx in range(trajectory_sets.shape[0])
+        ]
+        return np.asarray(scores, dtype=np.float32)
+
+    token_sets = _trajectory_set_tokens_for_gzip_patch1(trajectory_sets, num_frames, counts)
+    max_workers = min(len(token_sets), max(os.cpu_count() or 1, 1))
+    if max_workers <= 1:
+        scores = [gzip_complexity_ratio_from_tokens(tokens) for tokens in token_sets]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            scores = list(executor.map(gzip_complexity_ratio_from_tokens, token_sets))
+    return np.asarray(scores, dtype=np.float32)
+
+
+def _make_target_mask(
+    height: int,
+    num_frames: int,
+    rng: np.random.Generator,
+    mask_ratio: float,
+) -> np.ndarray:
+    mask = rng.random((height, num_frames)) < mask_ratio
+    if mask_ratio > 0.0 and not mask.any() and height > 0 and num_frames > 0:
+        flat_index = int(rng.integers(height * num_frames))
+        mask.reshape(-1)[flat_index] = True
+    return mask
+
+
+def build_sample_arrays(
+    time_volume: np.ndarray,
+    config: NCA1DDataConfig,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if time_volume.ndim != 3:
+        raise ValueError(f"time_volume must have shape [H, T, C], got ndim={time_volume.ndim}")
+
+    image_height, num_frames, counts = time_volume.shape
+    padded_height, padded_num_frames, padded_counts = config.final_image_shape
+
+    if (
+        image_height > padded_height
+        or num_frames > padded_num_frames
+        or counts > padded_counts
+    ):
+        raise ValueError(
+            "time_volume must fit inside the fixed dataset canvas, "
+            f"got image_shape={(image_height, num_frames, counts)} and "
+            f"padded_shape={config.final_image_shape}"
+        )
+
+    encoded_volume = time_volume.astype(np.int32, copy=False) + config.token_offset
+
+    input_canvas = np.zeros((padded_height, padded_num_frames, padded_counts), dtype=np.int32)
+    input_canvas[:image_height, :num_frames, :counts] = encoded_volume
+
+    label_canvas = np.zeros_like(input_canvas)
+    label_canvas[:image_height, :num_frames, counts - 1] = encoded_volume[:, :, counts - 1]
+
+    target_mask = _make_target_mask(
+        image_height,
+        num_frames,
+        rng=rng,
+        mask_ratio=config.target_mask_ratio,
+    )
+    input_canvas[:image_height, :num_frames, counts - 1][target_mask] = config.mask_token_id
+
+    position_ids = np.zeros((padded_height, padded_num_frames, padded_counts, 3), dtype=np.int32)
+    position_ids[:image_height, :num_frames, :counts, 0] = np.arange(
+        counts,
+        dtype=np.int32,
+    )[None, None, :]
+    position_ids[:image_height, :num_frames, :counts, 1] = np.arange(
+        image_height,
+        dtype=np.int32,
+    )[:, None, None]
+    position_ids[:image_height, :num_frames, :counts, 2] = np.arange(
+        num_frames,
+        dtype=np.int32,
+    )[None, :, None]
+
+    return (
+        input_canvas.reshape(-1),
+        label_canvas.reshape(-1),
+        position_ids.reshape(-1, 3),
+    )
+
+
+def build_sample_arrays_batched(
+    time_volumes: torch.Tensor,
+    *,
+    num_frames: np.ndarray,
+    counts: np.ndarray,
+    config: NCA1DDataConfig,
+    rng: np.random.Generator,
+    mask_generator: Optional[torch.Generator] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if time_volumes.ndim != 4:
+        raise ValueError(
+            f"time_volumes must have shape [B, H, T, C], got ndim={time_volumes.ndim}"
+        )
+
+    batch_size, image_height, max_num_frames, max_counts = time_volumes.shape
+    padded_height, padded_num_frames, padded_counts = config.final_image_shape
+    if (
+        image_height > padded_height
+        or max_num_frames > padded_num_frames
+        or max_counts > padded_counts
+    ):
+        raise ValueError(
+            "time_volumes must fit inside the fixed dataset canvas, "
+            f"got image_shape={(image_height, max_num_frames, max_counts)} and "
+            f"padded_shape={config.final_image_shape}"
+        )
+
+    device = time_volumes.device
+    dtype = torch.int32
+    num_frames_t = torch.as_tensor(num_frames, device=device, dtype=torch.int64)
+    counts_t = torch.as_tensor(counts, device=device, dtype=torch.int64)
+
+    encoded = time_volumes.to(dtype=dtype) + config.token_offset
+
+    input_canvas = torch.zeros(
+        (batch_size, padded_height, padded_num_frames, padded_counts),
+        dtype=dtype,
+        device=device,
+    )
+    input_canvas[:, :image_height, :max_num_frames, :max_counts] = encoded
+
+    time_ids = torch.arange(max_num_frames, device=device, dtype=torch.int64).view(1, 1, max_num_frames, 1)
+    count_ids = torch.arange(max_counts, device=device, dtype=torch.int64).view(1, 1, 1, max_counts)
+    valid_mask = (time_ids < num_frames_t.view(-1, 1, 1, 1)) & (
+        count_ids < counts_t.view(-1, 1, 1, 1)
+    )
+    input_canvas[:, :image_height, :max_num_frames, :max_counts] *= valid_mask.to(dtype)
+
+    label_canvas = torch.zeros_like(input_canvas)
+    label_region = torch.zeros(
+        (batch_size, image_height, max_num_frames, max_counts),
+        dtype=dtype,
+        device=device,
+    )
+    last_count_idx = (counts_t - 1).clamp_min(0)
+    last_count_idx_expanded = last_count_idx.view(-1, 1, 1, 1).expand(-1, image_height, max_num_frames, 1)
+    last_slices = encoded.gather(dim=3, index=last_count_idx_expanded)
+    valid_last = (time_ids[:, :, :, :1] < num_frames_t.view(-1, 1, 1, 1)).to(dtype)
+    label_region.scatter_(3, last_count_idx_expanded, last_slices * valid_last)
+    label_canvas[:, :image_height, :max_num_frames, :max_counts] = label_region
+
+    valid_target = (
+        torch.arange(max_num_frames, device=device, dtype=torch.int64).view(1, 1, max_num_frames)
+        < num_frames_t.view(-1, 1, 1)
+    ).expand(-1, image_height, -1)
+    target_mask = torch.rand(
+        (batch_size, image_height, max_num_frames),
+        device=device,
+        generator=mask_generator,
+    ) < config.target_mask_ratio
+    target_mask &= valid_target
+
+    if config.target_mask_ratio > 0.0:
+        needs_one = ~target_mask.reshape(batch_size, -1).any(dim=1) & valid_target.reshape(batch_size, -1).any(dim=1)
+        if torch.any(needs_one):
+            missing_indices = torch.nonzero(needs_one, as_tuple=False).squeeze(1)
+            random_rows = torch.randint(
+                image_height,
+                (missing_indices.numel(),),
+                device=device,
+                generator=mask_generator,
+            )
+            random_cols = (
+                torch.rand(
+                    missing_indices.numel(),
+                    device=device,
+                    generator=mask_generator,
+                ) * num_frames_t[missing_indices].to(torch.float32)
+            ).to(torch.int64)
+            target_mask[missing_indices, random_rows, random_cols] = True
+
+    input_region = input_canvas[:, :image_height, :max_num_frames, :max_counts]
+    last_inputs = input_region.gather(dim=3, index=last_count_idx_expanded).squeeze(-1)
+    last_inputs = torch.where(
+        target_mask,
+        torch.full_like(last_inputs, config.mask_token_id),
+        last_inputs,
+    )
+    input_region.scatter_(3, last_count_idx_expanded, last_inputs.unsqueeze(-1))
+
+    position_ids = torch.zeros(
+        (batch_size, padded_height, padded_num_frames, padded_counts, 3),
+        dtype=dtype,
+        device=device,
+    )
+    depth_grid = torch.arange(max_counts, dtype=dtype, device=device).view(1, 1, 1, max_counts)
+    row_grid = torch.arange(image_height, dtype=dtype, device=device).view(1, image_height, 1, 1)
+    col_grid = torch.arange(max_num_frames, dtype=dtype, device=device).view(1, 1, max_num_frames, 1)
+    position_region = torch.stack(
+        [
+            depth_grid.expand(batch_size, image_height, max_num_frames, max_counts),
+            row_grid.expand(batch_size, image_height, max_num_frames, max_counts),
+            col_grid.expand(batch_size, image_height, max_num_frames, max_counts),
+        ],
+        dim=-1,
+    )
+    position_ids[:, :image_height, :max_num_frames, :max_counts] = position_region * valid_mask.unsqueeze(-1).to(dtype)
+
+    return (
+        input_canvas.reshape(batch_size, -1).cpu().numpy(),
+        label_canvas.reshape(batch_size, -1).cpu().numpy(),
+        position_ids.reshape(batch_size, -1, 3).cpu().numpy(),
+    )
 
 
 def _passes_gzip_filter(score: float, config: NCA1DDataConfig) -> bool:
@@ -441,21 +908,25 @@ def _passes_gzip_filter(score: float, config: NCA1DDataConfig) -> bool:
 
 
 def _make_split_arrays(
-    flat_images: list[np.ndarray],
+    flat_inputs: list[np.ndarray],
+    flat_labels: list[np.ndarray],
+    position_ids: list[np.ndarray],
     gzip_scores: list[float],
     state_heights: list[int],
     num_frames: list[int],
     rollout_steps: list[int],
+    counts: list[int],
     config: NCA1DDataConfig,
 ) -> Dict[str, np.ndarray]:
-    num_examples = len(flat_images)
+    num_examples = len(flat_inputs)
 
-    inputs = np.stack(flat_images, axis=0).astype(config.save_dtype, copy=False)
-    labels = inputs.copy()
+    inputs = np.stack(flat_inputs, axis=0).astype(config.save_dtype, copy=False)
+    labels = np.stack(flat_labels, axis=0).astype(config.save_dtype, copy=False)
 
     results: Dict[str, np.ndarray] = {
         "inputs": inputs,
         "labels": labels,
+        "position_ids": np.stack(position_ids, axis=0).astype(np.int32, copy=False),
         "puzzle_identifiers": np.zeros((num_examples,), dtype=np.int32),
         "puzzle_indices": np.arange(num_examples + 1, dtype=np.int32),
         "group_indices": np.arange(num_examples + 1, dtype=np.int32),
@@ -463,6 +934,7 @@ def _make_split_arrays(
         "state_heights": np.asarray(state_heights, dtype=np.int32),
         "num_frames": np.asarray(num_frames, dtype=np.int32),
         "rollout_steps": np.asarray(rollout_steps, dtype=np.int32),
+        "counts": np.asarray(counts, dtype=np.int32),
     }
     return results
 
@@ -470,13 +942,19 @@ def _make_split_arrays(
 def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfig) -> Dict[str, np.ndarray]:
     seed_everything(seed)
     device = get_device()
+    _configure_generation_backend(device)
     rng = np.random.default_rng(seed)
+    mask_generator = torch.Generator(device=device)
+    mask_generator.manual_seed(seed + 1_000_000)
 
-    flat_images: list[np.ndarray] = []
+    flat_inputs: list[np.ndarray] = []
+    flat_labels: list[np.ndarray] = []
+    split_position_ids: list[np.ndarray] = []
     gzip_scores: list[float] = []
     state_heights: list[int] = []
     num_frames: list[int] = []
     rollout_steps: list[int] = []
+    counts: list[int] = []
 
     min_rounds_for_size = math.ceil(size / config.batch_candidate_size)
     effective_max_sampling_rounds = max(config.max_sampling_rounds, min_rounds_for_size)
@@ -484,7 +962,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     progress = tqdm(total=size, desc=f"Generating {split_name}", leave=False)
 
     rounds = 0
-    while len(flat_images) < size and rounds < effective_max_sampling_rounds:
+    while len(flat_inputs) < size and rounds < effective_max_sampling_rounds:
         rounds += 1
         sampled_state_heights = rng.choice(config.valid_state_heights, size=config.batch_candidate_size)
         sampled_rollout_steps = rng.integers(
@@ -492,81 +970,112 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
             config.sampled_rollout_steps_max + 1,
             size=config.batch_candidate_size,
         )
-
-        candidate_trajectories: list[Optional[np.ndarray]] = [None] * config.batch_candidate_size
-        candidate_tokenizers: list[Optional[NCATokenizer]] = [None] * config.batch_candidate_size
+        sampled_counts = rng.integers(
+            config.sampled_counts_min,
+            config.sampled_counts_max + 1,
+            size=config.batch_candidate_size,
+        )
+        sampled_num_frames = np.ceil(
+            sampled_rollout_steps.astype(np.float64) / config.time_subsample
+        ).astype(np.int32)
+        per_candidate_count_limits = (
+            (config.max_data_seq_len - 1)
+            // (sampled_state_heights.astype(np.int64) * sampled_num_frames.astype(np.int64))
+        ).astype(np.int32)
+        sampled_counts = np.minimum(sampled_counts, config.resolved_counts_max).astype(np.int32, copy=False)
+        sampled_counts = np.minimum(sampled_counts, per_candidate_count_limits).astype(np.int32, copy=False)
 
         for sampled_state_height in np.unique(sampled_state_heights):
             group_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
-            max_rollout_steps = int(sampled_rollout_steps[group_indices].max())
+            if group_indices.size == 0:
+                continue
+
+            group_valid = sampled_counts[group_indices] >= 1
+            if not np.any(group_valid):
+                continue
+
+            group_indices = group_indices[group_valid]
+            group_rollout_steps = sampled_rollout_steps[group_indices]
+            group_num_frames = sampled_num_frames[group_indices]
+            group_counts = sampled_counts[group_indices]
+
             nca_config = make_nca_config_for_sample(
                 config,
                 state_height=int(sampled_state_height),
-                rollout_steps=max_rollout_steps,
+                rollout_steps=int(group_rollout_steps.max()),
             )
             tokenizer = NCATokenizer(nca_config)
-            trajectories = rollout_trajectories_batched(
+            batched_trajectory_sets = rollout_trajectory_sets_batched(
                 nca_config,
-                batch_size=int(group_indices.size),
+                sample_batch_size=int(group_indices.size),
+                count=int(group_counts.max()),
                 device=device,
             )
-
-            for local_idx, candidate_idx in enumerate(group_indices):
-                candidate_trajectories[int(candidate_idx)] = trajectories[local_idx]
-                candidate_tokenizers[int(candidate_idx)] = tokenizer
-
-        for candidate_idx in range(config.batch_candidate_size):
-            sampled_state_height = int(sampled_state_heights[candidate_idx])
-            sampled_rollout_step_count = int(sampled_rollout_steps[candidate_idx])
-            sampled_num_frames = num_frames_for_rollout_steps(
-                sampled_rollout_step_count,
-                config.time_subsample,
+            batched_trajectory_sets_cpu = batched_trajectory_sets.cpu().numpy()
+            group_gzip_scores = score_trajectory_sets_gzip_batched(
+                batched_trajectory_sets_cpu,
+                num_frames=group_num_frames,
+                counts=group_counts,
+                tokenizer=tokenizer,
             )
-            trajectory = candidate_trajectories[candidate_idx]
-            tokenizer = candidate_tokenizers[candidate_idx]
-
-            if trajectory is None or tokenizer is None:
-                raise RuntimeError("Batched candidate generation failed to produce a trajectory.")
-
-            trajectory = trajectory[:sampled_num_frames]
-            gzip_score = score_trajectory_gzip(trajectory, tokenizer)
-
-            if not _passes_gzip_filter(gzip_score, config):
+            accepted_mask = np.array(
+                [_passes_gzip_filter(float(score), config) for score in group_gzip_scores],
+                dtype=bool,
+            )
+            if not np.any(accepted_mask):
                 continue
 
-            time_image = trajectory_to_time_image(trajectory)
-            flat_image = flatten_time_image(
-                time_image,
-                config.token_offset,
-                padded_height=config.final_image_shape[0],
-                padded_num_frames=config.final_image_shape[1],
+            remaining = size - len(flat_inputs)
+            accepted_indices = np.flatnonzero(accepted_mask)[:remaining]
+            accepted_num_frames = group_num_frames[accepted_indices]
+            accepted_rollout_steps = group_rollout_steps[accepted_indices]
+            accepted_counts = group_counts[accepted_indices]
+            accepted_scores = group_gzip_scores[accepted_indices]
+
+            accepted_trajectory_sets = batched_trajectory_sets[
+                torch.as_tensor(accepted_indices, device=batched_trajectory_sets.device, dtype=torch.long)
+            ]
+            accepted_time_volumes = trajectory_sets_to_time_volumes_batched(accepted_trajectory_sets)
+            batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
+                accepted_time_volumes,
+                num_frames=accepted_num_frames,
+                counts=accepted_counts,
+                config=config,
+                rng=rng,
+                mask_generator=mask_generator,
             )
 
-            flat_images.append(flat_image)
-            gzip_scores.append(gzip_score)
-            state_heights.append(sampled_state_height)
-            num_frames.append(int(time_image.shape[1]))
-            rollout_steps.append(sampled_rollout_step_count)
-            progress.update(1)
+            flat_inputs.extend(batch_inputs)
+            flat_labels.extend(batch_labels)
+            split_position_ids.extend(batch_position_ids)
+            gzip_scores.extend(accepted_scores.tolist())
+            state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
+            num_frames.extend(accepted_num_frames.astype(np.int32).tolist())
+            rollout_steps.extend(accepted_rollout_steps.astype(np.int32).tolist())
+            counts.extend(accepted_counts.astype(np.int32).tolist())
+            progress.update(int(accepted_indices.size))
 
-            if len(flat_images) >= size:
+            if len(flat_inputs) >= size:
                 break
 
     progress.close()
 
-    if len(flat_images) < size:
+    if len(flat_inputs) < size:
         raise RuntimeError(
             f"Could not collect enough {split_name} examples. "
-            f"Collected {len(flat_images)} / {size} after {rounds} rounds ({total_candidates} candidates budget). "
+            f"Collected {len(flat_inputs)} / {size} after {rounds} rounds ({total_candidates} candidates budget). "
             "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
         )
 
     return _make_split_arrays(
-        flat_images,
+        flat_inputs,
+        flat_labels,
+        split_position_ids,
         gzip_scores,
         state_heights,
         num_frames,
         rollout_steps,
+        counts,
         config,
     )
 
@@ -574,6 +1083,12 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
 def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA1DDataConfig) -> None:
     split_dir = Path(config.output_dir) / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
+
+    split_position_id_shape = (
+        split_arrays["position_ids"].max(axis=(0, 1)).astype(np.int32) + 1
+        if split_arrays["position_ids"].size > 0
+        else None
+    )
 
     metadata = PuzzleDatasetMetadata(
         seq_len=config.seq_len,
@@ -585,6 +1100,7 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
         total_groups=split_arrays["group_indices"].size - 1,
         mean_puzzle_examples=1.0,
         sets=["all"],
+        position_id_shape=split_position_id_shape.tolist() if split_position_id_shape is not None else None,
     )
 
     with open(split_dir / "dataset.json", "w") as f:
@@ -592,6 +1108,7 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
 
     np.save(split_dir / "all__inputs.npy", split_arrays["inputs"])
     np.save(split_dir / "all__labels.npy", split_arrays["labels"])
+    np.save(split_dir / "all__position_ids.npy", split_arrays["position_ids"])
     np.save(split_dir / "all__puzzle_identifiers.npy", split_arrays["puzzle_identifiers"])
     np.save(split_dir / "all__puzzle_indices.npy", split_arrays["puzzle_indices"])
     np.save(split_dir / "all__group_indices.npy", split_arrays["group_indices"])
@@ -599,6 +1116,7 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
     np.save(split_dir / "all__state_heights.npy", split_arrays["state_heights"])
     np.save(split_dir / "all__num_frames.npy", split_arrays["num_frames"])
     np.save(split_dir / "all__rollout_steps.npy", split_arrays["rollout_steps"])
+    np.save(split_dir / "all__counts.npy", split_arrays["counts"])
 
     with open(split_dir / "summary.json", "w") as f:
         json.dump(
@@ -617,6 +1135,9 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
                 "num_frames_max": int(split_arrays["num_frames"].max()),
                 "rollout_steps_min": int(split_arrays["rollout_steps"].min()),
                 "rollout_steps_max": int(split_arrays["rollout_steps"].max()),
+                "counts_min": int(split_arrays["counts"].min()),
+                "counts_max": int(split_arrays["counts"].max()),
+                "position_id_shape": metadata.position_id_shape,
             },
             f,
             indent=2,
@@ -637,20 +1158,27 @@ def save_dataset_config(config: NCA1DDataConfig) -> None:
                 "resolved_rollout_steps_min": config.sampled_rollout_steps_min,
                 "resolved_rollout_steps_max": config.sampled_rollout_steps_max,
                 "resolved_time_start": config.resolved_start_step,
-                "resolved_time_end": config.resolved_time_end,
                 "num_frames": config.max_num_frames,
                 "max_num_frames": config.max_num_frames,
                 "seq_len": config.seq_len,
                 "vocab_size": config.vocab_size,
                 "final_image_shape": list(config.final_image_shape),
+                "position_id_shape": list(config.position_id_shape),
+                "requested_counts_min": config.sampled_counts_min,
+                "requested_counts_max": config.sampled_counts_max,
+                "resolved_counts_max": config.resolved_counts_max,
                 "sample_random_state_height": config.sampled_state_height_min != config.sampled_state_height_max,
                 "sample_random_rollout_steps": config.sampled_rollout_steps_min != config.sampled_rollout_steps_max,
+                "sample_random_counts": config.sampled_counts_min != config.sampled_counts_max,
                 "time_axis": "width",
+                "count_axis": "depth",
+                "max_data_seq_len": config.max_data_seq_len,
                 "value_encoding": {
                     "pad": 0,
-                    "mask": 1,
+                    "mask": config.mask_token_id,
                     "nca_color_range": [config.token_offset, config.token_offset + config.num_colors - 1],
                 },
+                "target_mask_ratio": config.target_mask_ratio,
             },
             f,
             indent=2,
