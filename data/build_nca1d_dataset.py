@@ -33,15 +33,15 @@ cli = ArgParser()
 
 
 class NCA1DDataConfig(BaseModel):
-    output_dir: str = "data/nca1d-default"
+    output_dir: str = "data/nca1d-data"
 
-    train_size: int = 1000
-    test_size: int = 100
+    train_size: int = 1000000
+    test_size: int = 1000
     seed: int = 0
 
     state_height: int = 9
     state_height_min: Optional[int] = 9
-    state_height_max: Optional[int] = 30
+    state_height_max: Optional[int] = 60
     state_width: int = 1
 
     num_colors: int = 10
@@ -57,7 +57,7 @@ class NCA1DDataConfig(BaseModel):
     rollout_steps_min: Optional[int] = 9
     rollout_steps_max: Optional[int] = 30
     counts: int = 1
-    counts_min: Optional[int] = 2
+    counts_min: Optional[int] = 3
     counts_max: Optional[int] = 12
     time_subsample: int = 1
     start_step: int = 0
@@ -69,8 +69,8 @@ class NCA1DDataConfig(BaseModel):
     #  time_start + k * (rollout_steps + time_span) + rollout_steps).
     time_span: int = 10
 
-    gzip_threshold_low: Optional[float] = 0.05
-    gzip_threshold_high: Optional[float] = 0.1
+    gzip_threshold_low: Optional[float] = 0.1
+    gzip_threshold_high: Optional[float] = 0.15
 
     # Number of candidate trajectories to generate in parallel per sampling round.
     batch_candidate_size: int = 65536
@@ -936,6 +936,56 @@ def _passes_gzip_filter(score: float, config: NCA1DDataConfig) -> bool:
     return True
 
 
+def _shape_group_specs(config: NCA1DDataConfig) -> list[tuple[int, int]]:
+    return [
+        (state_height, rollout_steps)
+        for state_height in config.valid_state_heights
+        for rollout_steps in range(
+            config.sampled_rollout_steps_min,
+            config.sampled_rollout_steps_max + 1,
+        )
+    ]
+
+
+def _allocate_examples_per_shape_group(
+    size: int,
+    shape_groups: list[tuple[int, int]],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if size < 0:
+        raise ValueError(f"size must be >= 0, got {size}")
+    if not shape_groups:
+        raise ValueError("shape_groups must not be empty")
+
+    base_examples = size // len(shape_groups)
+    remainder = size % len(shape_groups)
+    allocated = np.full(len(shape_groups), base_examples, dtype=np.int32)
+    if remainder > 0:
+        allocated[rng.permutation(len(shape_groups))[:remainder]] += 1
+    return allocated
+
+
+def _shuffle_split_arrays(
+    split_arrays: Dict[str, np.ndarray],
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    if not split_arrays:
+        return split_arrays
+
+    num_examples = int(split_arrays["inputs"].shape[0])
+    if num_examples <= 1:
+        return split_arrays
+
+    permutation = rng.permutation(num_examples)
+    shuffled: Dict[str, np.ndarray] = {}
+    for key, value in split_arrays.items():
+        if isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] == num_examples:
+            shuffled[key] = value[permutation]
+        else:
+            shuffled[key] = value
+    return shuffled
+
+
 def _make_split_arrays(
     flat_inputs: list[np.ndarray],
     flat_labels: list[np.ndarray],
@@ -985,135 +1035,155 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
     rollout_steps: list[int] = []
     counts: list[int] = []
 
-    min_rounds_for_size = math.ceil(size / config.batch_candidate_size)
-    effective_max_sampling_rounds = max(config.max_sampling_rounds, min_rounds_for_size)
-    total_candidates = config.batch_candidate_size * effective_max_sampling_rounds
+    shape_groups = _shape_group_specs(config)
+    allocated_examples = _allocate_examples_per_shape_group(size, shape_groups, rng)
     progress = tqdm(total=size, desc=f"Generating {split_name}", leave=False)
 
-    rounds = 0
-    while len(flat_inputs) < size and rounds < effective_max_sampling_rounds:
-        rounds += 1
-        sampled_state_heights = rng.choice(config.valid_state_heights, size=config.batch_candidate_size)
-        sampled_rollout_steps = rng.integers(
-            config.sampled_rollout_steps_min,
-            config.sampled_rollout_steps_max + 1,
-            size=config.batch_candidate_size,
-        )
-        sampled_counts = rng.integers(
-            config.sampled_counts_min,
-            config.sampled_counts_max + 1,
-            size=config.batch_candidate_size,
-        )
-        sampled_num_frames = np.ceil(
-            sampled_rollout_steps.astype(np.float64) / config.time_subsample
-        ).astype(np.int32)
-        per_candidate_count_limits = (
-            (config.max_data_seq_len - 1)
-            // (sampled_state_heights.astype(np.int64) * sampled_num_frames.astype(np.int64))
-        ).astype(np.int32)
-        sampled_counts = np.minimum(sampled_counts, config.resolved_counts_max).astype(np.int32, copy=False)
-        sampled_counts = np.minimum(sampled_counts, per_candidate_count_limits).astype(np.int32, copy=False)
+    for (sampled_state_height, sampled_group_rollout_steps), target_group_size in zip(
+        shape_groups,
+        allocated_examples.tolist(),
+    ):
+        if target_group_size <= 0:
+            continue
 
-        for sampled_state_height in np.unique(sampled_state_heights):
-            height_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
-            if height_indices.size == 0:
+        target_group_size = int(target_group_size)
+        group_num_frames_value = num_frames_for_rollout_steps(
+            sampled_group_rollout_steps,
+            config.time_subsample,
+        )
+        group_count_limit = counts_limit_for_shape(
+            sampled_state_height,
+            group_num_frames_value,
+            config.max_data_seq_len,
+        )
+        candidate_batch_size = max(
+            1,
+            min(
+                config.batch_candidate_size,
+                max(target_group_size, 64),
+            ),
+        )
+        min_rounds_for_group = math.ceil(target_group_size / candidate_batch_size)
+        effective_max_sampling_rounds = max(config.max_sampling_rounds, min_rounds_for_group)
+
+        nca_config = make_nca_config_for_sample(
+            config,
+            state_height=int(sampled_state_height),
+            rollout_steps=int(sampled_group_rollout_steps),
+        )
+        tokenizer = NCATokenizer(nca_config)
+        collected_group_size = 0
+        rounds = 0
+
+        while collected_group_size < target_group_size and rounds < effective_max_sampling_rounds:
+            rounds += 1
+
+            sampled_counts = rng.integers(
+                config.sampled_counts_min,
+                config.sampled_counts_max + 1,
+                size=candidate_batch_size,
+            )
+            sampled_counts = np.minimum(sampled_counts, config.resolved_counts_max).astype(
+                np.int32,
+                copy=False,
+            )
+            sampled_counts = np.minimum(sampled_counts, group_count_limit).astype(
+                np.int32,
+                copy=False,
+            )
+
+            valid_counts = sampled_counts >= 1
+            if not np.any(valid_counts):
                 continue
 
-            for sampled_group_rollout_steps in np.unique(sampled_rollout_steps[height_indices]):
-                group_indices = height_indices[
-                    sampled_rollout_steps[height_indices] == sampled_group_rollout_steps
-                ]
-                if group_indices.size == 0:
-                    continue
+            group_counts = sampled_counts[valid_counts]
+            group_num_frames = np.full(
+                group_counts.shape[0],
+                group_num_frames_value,
+                dtype=np.int32,
+            )
+            group_rollout_steps = np.full(
+                group_counts.shape[0],
+                sampled_group_rollout_steps,
+                dtype=np.int32,
+            )
 
-                group_valid = sampled_counts[group_indices] >= 1
-                if not np.any(group_valid):
-                    continue
+            batched_trajectory_sets = rollout_trajectory_sets_batched(
+                nca_config,
+                sample_batch_size=int(group_counts.shape[0]),
+                count=int(group_counts.max()),
+                time_span=config.time_span,
+                device=device,
+            )
+            batched_trajectory_sets_cpu = batched_trajectory_sets.cpu().numpy()
+            group_gzip_scores = score_trajectory_sets_gzip_batched(
+                batched_trajectory_sets_cpu,
+                num_frames=group_num_frames,
+                counts=group_counts,
+                tokenizer=tokenizer,
+            )
+            accepted_mask = np.array(
+                [_passes_gzip_filter(float(score), config) for score in group_gzip_scores],
+                dtype=bool,
+            )
+            if not np.any(accepted_mask):
+                continue
 
-                group_indices = group_indices[group_valid]
-                group_rollout_steps = sampled_rollout_steps[group_indices]
-                group_num_frames = sampled_num_frames[group_indices]
-                group_counts = sampled_counts[group_indices]
+            remaining = target_group_size - collected_group_size
+            accepted_indices = np.flatnonzero(accepted_mask)[:remaining]
+            accepted_num_frames = group_num_frames[accepted_indices]
+            accepted_rollout_steps = group_rollout_steps[accepted_indices]
+            accepted_counts = group_counts[accepted_indices]
+            accepted_scores = group_gzip_scores[accepted_indices]
 
-                nca_config = make_nca_config_for_sample(
-                    config,
-                    state_height=int(sampled_state_height),
-                    rollout_steps=int(sampled_group_rollout_steps),
+            accepted_trajectory_sets = batched_trajectory_sets[
+                torch.as_tensor(
+                    accepted_indices,
+                    device=batched_trajectory_sets.device,
+                    dtype=torch.long,
                 )
-                tokenizer = NCATokenizer(nca_config)
-                batched_trajectory_sets = rollout_trajectory_sets_batched(
-                    nca_config,
-                    sample_batch_size=int(group_indices.size),
-                    count=int(group_counts.max()),
-                    time_span=config.time_span,
-                    device=device,
-                )
-                batched_trajectory_sets_cpu = batched_trajectory_sets.cpu().numpy()
-                group_gzip_scores = score_trajectory_sets_gzip_batched(
-                    batched_trajectory_sets_cpu,
-                    num_frames=group_num_frames,
-                    counts=group_counts,
-                    tokenizer=tokenizer,
-                )
-                accepted_mask = np.array(
-                    [_passes_gzip_filter(float(score), config) for score in group_gzip_scores],
-                    dtype=bool,
-                )
-                if not np.any(accepted_mask):
-                    continue
+            ]
+            accepted_time_volumes = trajectory_sets_to_time_volumes_batched(
+                accepted_trajectory_sets
+            )
+            batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
+                accepted_time_volumes,
+                num_frames=accepted_num_frames,
+                counts=accepted_counts,
+                config=config,
+                rng=rng,
+                mask_generator=mask_generator,
+            )
 
-                remaining = size - len(flat_inputs)
-                accepted_indices = np.flatnonzero(accepted_mask)[:remaining]
-                accepted_num_frames = group_num_frames[accepted_indices]
-                accepted_rollout_steps = group_rollout_steps[accepted_indices]
-                accepted_counts = group_counts[accepted_indices]
-                accepted_scores = group_gzip_scores[accepted_indices]
+            flat_inputs.extend(batch_inputs)
+            flat_labels.extend(batch_labels)
+            split_position_ids.extend(batch_position_ids)
+            gzip_scores.extend(accepted_scores.tolist())
+            state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
+            num_frames.extend(accepted_num_frames.astype(np.int32).tolist())
+            rollout_steps.extend(accepted_rollout_steps.astype(np.int32).tolist())
+            counts.extend(accepted_counts.astype(np.int32).tolist())
+            collected_group_size += int(accepted_indices.size)
+            progress.update(int(accepted_indices.size))
 
-                accepted_trajectory_sets = batched_trajectory_sets[
-                    torch.as_tensor(
-                        accepted_indices,
-                        device=batched_trajectory_sets.device,
-                        dtype=torch.long,
-                    )
-                ]
-                accepted_time_volumes = trajectory_sets_to_time_volumes_batched(
-                    accepted_trajectory_sets
-                )
-                batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
-                    accepted_time_volumes,
-                    num_frames=accepted_num_frames,
-                    counts=accepted_counts,
-                    config=config,
-                    rng=rng,
-                    mask_generator=mask_generator,
-                )
-
-                flat_inputs.extend(batch_inputs)
-                flat_labels.extend(batch_labels)
-                split_position_ids.extend(batch_position_ids)
-                gzip_scores.extend(accepted_scores.tolist())
-                state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
-                num_frames.extend(accepted_num_frames.astype(np.int32).tolist())
-                rollout_steps.extend(accepted_rollout_steps.astype(np.int32).tolist())
-                counts.extend(accepted_counts.astype(np.int32).tolist())
-                progress.update(int(accepted_indices.size))
-
-                if len(flat_inputs) >= size:
-                    break
-
-            if len(flat_inputs) >= size:
-                break
+        if collected_group_size < target_group_size:
+            progress.close()
+            raise RuntimeError(
+                f"Could not collect enough {split_name} examples for "
+                f"state_height={sampled_state_height}, rollout_steps={sampled_group_rollout_steps}. "
+                f"Collected {collected_group_size} / {target_group_size} after {rounds} rounds. "
+                "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
+            )
 
     progress.close()
 
-    if len(flat_inputs) < size:
+    if len(flat_inputs) != size:
         raise RuntimeError(
-            f"Could not collect enough {split_name} examples. "
-            f"Collected {len(flat_inputs)} / {size} after {rounds} rounds ({total_candidates} candidates budget). "
-            "Try increasing max_sampling_rounds or batch_candidate_size, or relax the gzip thresholds."
+            f"Expected to collect exactly {size} {split_name} examples, "
+            f"but got {len(flat_inputs)}."
         )
 
-    return _make_split_arrays(
+    split_arrays = _make_split_arrays(
         flat_inputs,
         flat_labels,
         split_position_ids,
@@ -1124,6 +1194,7 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
         counts,
         config,
     )
+    return _shuffle_split_arrays(split_arrays, rng)
 
 
 def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA1DDataConfig) -> None:
