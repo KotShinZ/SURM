@@ -16,6 +16,11 @@ if str(REPO_ROOT) not in sys.path:
 from data.build_nca1d_dataset import (  # noqa: E402
     NCA1DDataConfig,
     build_dataset,
+    get_device,
+    make_nca_config_for_sample,
+    rollout_trajectories_batched,
+    rollout_trajectory_sets_batched,
+    seed_everything,
     trajectory_to_time_image,
     unflatten_time_volume,
 )
@@ -279,6 +284,65 @@ class BuildNCA1DDatasetTests(unittest.TestCase):
         self.assertEqual(config.resolved_start_step, 30)
         self.assertEqual(config.sampled_rollout_steps_min, 6)
         self.assertEqual(config.sampled_rollout_steps_max, 14)
+
+    def test_counts_axis_samples_shifted_windows_from_same_trajectory(self) -> None:
+        config = NCA1DDataConfig(
+            train_size=1,
+            test_size=1,
+            state_height=5,
+            state_height_min=5,
+            state_height_max=5,
+            num_colors=4,
+            patch_size=1,
+            rollout_steps=10,
+            rollout_steps_min=10,
+            rollout_steps_max=10,
+            counts=3,
+            counts_min=3,
+            counts_max=3,
+            time_subsample=1,
+            time_start=50,
+            time_span=10,
+            gzip_threshold_low=None,
+            gzip_threshold_high=None,
+        )
+        device = get_device()
+        window_cfg = make_nca_config_for_sample(
+            config,
+            state_height=config.state_height,
+            rollout_steps=config.rollout_steps,
+        )
+        full_cfg = make_nca_config_for_sample(
+            config,
+            state_height=config.state_height,
+            rollout_steps=config.counts * config.rollout_steps + (config.counts - 1) * config.time_span,
+        )
+
+        seed_everything(123)
+        trajectory_sets = rollout_trajectory_sets_batched(
+            window_cfg,
+            sample_batch_size=2,
+            count=config.counts,
+            time_span=config.time_span,
+            device=device,
+        ).cpu().numpy()
+
+        seed_everything(123)
+        full_trajectories = rollout_trajectories_batched(
+            full_cfg,
+            batch_size=2,
+            device=device,
+        )
+        expected = np.stack(
+            [
+                full_trajectories[:, 0:10],
+                full_trajectories[:, 20:30],
+                full_trajectories[:, 40:50],
+            ],
+            axis=1,
+        )
+
+        np.testing.assert_array_equal(trajectory_sets, expected)
 
 
 if __name__ == "__main__":

@@ -35,8 +35,8 @@ cli = ArgParser()
 class NCA1DDataConfig(BaseModel):
     output_dir: str = "data/nca1d-default"
 
-    train_size: int = 1000000
-    test_size: int = 10000
+    train_size: int = 1000
+    test_size: int = 100
     seed: int = 0
 
     state_height: int = 9
@@ -61,11 +61,16 @@ class NCA1DDataConfig(BaseModel):
     counts_max: Optional[int] = 12
     time_subsample: int = 1
     start_step: int = 0
-    # If set, sampling starts from this raw NCA step instead of start_step.
+    # If set, the first temporal window starts from this raw NCA step instead of start_step.
     time_start: Optional[int] = 50
+    # Gap between consecutive temporal windows sampled along the counts axis.
+    # Window k covers
+    # [time_start + k * (rollout_steps + time_span),
+    #  time_start + k * (rollout_steps + time_span) + rollout_steps).
+    time_span: int = 10
 
-    gzip_threshold_low: Optional[float] = 0.1
-    gzip_threshold_high: Optional[float] = 0.2
+    gzip_threshold_low: Optional[float] = 0.05
+    gzip_threshold_high: Optional[float] = 0.1
 
     # Number of candidate trajectories to generate in parallel per sampling round.
     batch_candidate_size: int = 65536
@@ -188,6 +193,8 @@ class NCA1DDataConfig(BaseModel):
             raise ValueError(f"start_step must be >= 0, got {self.start_step}")
         if self.time_start is not None and self.time_start < 0:
             raise ValueError(f"time_start must be >= 0, got {self.time_start}")
+        if self.time_span < 0:
+            raise ValueError(f"time_span must be >= 0, got {self.time_span}")
         if self.batch_candidate_size <= 0:
             raise ValueError(f"batch_candidate_size must be > 0, got {self.batch_candidate_size}")
         if self.max_sampling_rounds <= 0:
@@ -313,6 +320,14 @@ def make_nca_config_for_sample(
 
 def num_frames_for_rollout_steps(rollout_steps: int, time_subsample: int) -> int:
     return math.ceil(rollout_steps / time_subsample)
+
+
+def time_window_stride(rollout_steps: int, time_span: int) -> int:
+    if rollout_steps <= 0:
+        raise ValueError(f"rollout_steps must be > 0, got {rollout_steps}")
+    if time_span < 0:
+        raise ValueError(f"time_span must be >= 0, got {time_span}")
+    return rollout_steps + time_span
 
 
 def counts_limit_for_shape(
@@ -448,26 +463,18 @@ def rollout_trajectories_batched(
     return trajectories.detach().cpu().numpy().astype(np.int16, copy=False)
 
 
-def _repeat_rule_parameters_interleaved(
-    rule_parameters: Dict[str, torch.Tensor],
-    repeat_count: int,
-) -> Dict[str, torch.Tensor]:
-    return {
-        key: value.repeat_interleave(repeat_count, dim=0)
-        for key, value in rule_parameters.items()
-    }
-
-
 @torch.no_grad()
 def rollout_trajectories_shared_rule(
     cfg: NCAConfig,
     count: int,
     device: torch.device,
+    time_span: int = 0,
 ) -> np.ndarray:
     return rollout_trajectory_sets_batched(
         cfg=cfg,
         sample_batch_size=1,
         count=count,
+        time_span=time_span,
         device=device,
     )[0].detach().cpu().numpy().astype(np.int16, copy=False)
 
@@ -478,40 +485,62 @@ def rollout_trajectory_sets_batched(
     sample_batch_size: int,
     count: int,
     device: torch.device,
+    time_span: int = 0,
 ) -> torch.Tensor:
     if sample_batch_size <= 0:
         raise ValueError(f"sample_batch_size must be > 0, got {sample_batch_size}")
     if count <= 0:
         raise ValueError(f"count must be > 0, got {count}")
+    if time_span < 0:
+        raise ValueError(f"time_span must be >= 0, got {time_span}")
 
     state = torch.randint(
         low=0,
         high=cfg.num_colors,
-        size=(sample_batch_size, count, cfg.grid_height, cfg.grid_width),
+        size=(sample_batch_size, cfg.grid_height, cfg.grid_width),
         device=device,
         dtype=torch.long,
     )
-    base_rule_parameters = _sample_batched_rule_parameters(
+    rule_parameters = _sample_batched_rule_parameters(
         cfg,
         batch_size=sample_batch_size,
         device=device,
     )
-    rule_parameters = _repeat_rule_parameters_interleaved(
-        base_rule_parameters,
-        repeat_count=count,
-    )
     frames: list[torch.Tensor] = []
-    total_steps = cfg.start_step + cfg.rollout_steps
-    state_flat = state.reshape(sample_batch_size * count, cfg.grid_height, cfg.grid_width)
+    num_frames = num_frames_for_rollout_steps(cfg.rollout_steps, cfg.time_subsample)
+    window_stride = time_window_stride(cfg.rollout_steps, time_span)
+    total_steps = cfg.start_step + (count - 1) * window_stride + cfg.rollout_steps
 
     for t in range(total_steps):
-        if t >= cfg.start_step and ((t - cfg.start_step) % cfg.time_subsample == 0):
-            frames.append(
-                state_flat.reshape(sample_batch_size, count, cfg.grid_height, cfg.grid_width)
-            )
-        state_flat = _batched_step(state_flat, rule_parameters, cfg)
+        relative_t = t - cfg.start_step
+        if relative_t >= 0:
+            window_idx = relative_t // window_stride
+            offset_within_window = relative_t % window_stride
+            if (
+                window_idx < count
+                # Each count keeps the same-length window [start, start + rollout_steps).
+                and offset_within_window < cfg.rollout_steps
+                and (offset_within_window % cfg.time_subsample == 0)
+            ):
+                frames.append(state)
+        state = _batched_step(state, rule_parameters, cfg)
 
-    return torch.stack(frames, dim=2)
+    expected_frame_count = count * num_frames
+    if len(frames) != expected_frame_count:
+        raise RuntimeError(
+            "Collected an unexpected number of temporal-window frames, "
+            f"got {len(frames)} but expected {expected_frame_count} "
+            f"for count={count}, rollout_steps={cfg.rollout_steps}, "
+            f"time_subsample={cfg.time_subsample}, time_span={time_span}"
+        )
+
+    return torch.stack(frames, dim=1).reshape(
+        sample_batch_size,
+        count,
+        num_frames,
+        cfg.grid_height,
+        cfg.grid_width,
+    )
 
 
 def trajectory_to_time_image(trajectory: np.ndarray) -> np.ndarray:
@@ -986,74 +1015,91 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA1DDataConfi
         sampled_counts = np.minimum(sampled_counts, per_candidate_count_limits).astype(np.int32, copy=False)
 
         for sampled_state_height in np.unique(sampled_state_heights):
-            group_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
-            if group_indices.size == 0:
+            height_indices = np.flatnonzero(sampled_state_heights == sampled_state_height)
+            if height_indices.size == 0:
                 continue
 
-            group_valid = sampled_counts[group_indices] >= 1
-            if not np.any(group_valid):
-                continue
+            for sampled_group_rollout_steps in np.unique(sampled_rollout_steps[height_indices]):
+                group_indices = height_indices[
+                    sampled_rollout_steps[height_indices] == sampled_group_rollout_steps
+                ]
+                if group_indices.size == 0:
+                    continue
 
-            group_indices = group_indices[group_valid]
-            group_rollout_steps = sampled_rollout_steps[group_indices]
-            group_num_frames = sampled_num_frames[group_indices]
-            group_counts = sampled_counts[group_indices]
+                group_valid = sampled_counts[group_indices] >= 1
+                if not np.any(group_valid):
+                    continue
 
-            nca_config = make_nca_config_for_sample(
-                config,
-                state_height=int(sampled_state_height),
-                rollout_steps=int(group_rollout_steps.max()),
-            )
-            tokenizer = NCATokenizer(nca_config)
-            batched_trajectory_sets = rollout_trajectory_sets_batched(
-                nca_config,
-                sample_batch_size=int(group_indices.size),
-                count=int(group_counts.max()),
-                device=device,
-            )
-            batched_trajectory_sets_cpu = batched_trajectory_sets.cpu().numpy()
-            group_gzip_scores = score_trajectory_sets_gzip_batched(
-                batched_trajectory_sets_cpu,
-                num_frames=group_num_frames,
-                counts=group_counts,
-                tokenizer=tokenizer,
-            )
-            accepted_mask = np.array(
-                [_passes_gzip_filter(float(score), config) for score in group_gzip_scores],
-                dtype=bool,
-            )
-            if not np.any(accepted_mask):
-                continue
+                group_indices = group_indices[group_valid]
+                group_rollout_steps = sampled_rollout_steps[group_indices]
+                group_num_frames = sampled_num_frames[group_indices]
+                group_counts = sampled_counts[group_indices]
 
-            remaining = size - len(flat_inputs)
-            accepted_indices = np.flatnonzero(accepted_mask)[:remaining]
-            accepted_num_frames = group_num_frames[accepted_indices]
-            accepted_rollout_steps = group_rollout_steps[accepted_indices]
-            accepted_counts = group_counts[accepted_indices]
-            accepted_scores = group_gzip_scores[accepted_indices]
+                nca_config = make_nca_config_for_sample(
+                    config,
+                    state_height=int(sampled_state_height),
+                    rollout_steps=int(sampled_group_rollout_steps),
+                )
+                tokenizer = NCATokenizer(nca_config)
+                batched_trajectory_sets = rollout_trajectory_sets_batched(
+                    nca_config,
+                    sample_batch_size=int(group_indices.size),
+                    count=int(group_counts.max()),
+                    time_span=config.time_span,
+                    device=device,
+                )
+                batched_trajectory_sets_cpu = batched_trajectory_sets.cpu().numpy()
+                group_gzip_scores = score_trajectory_sets_gzip_batched(
+                    batched_trajectory_sets_cpu,
+                    num_frames=group_num_frames,
+                    counts=group_counts,
+                    tokenizer=tokenizer,
+                )
+                accepted_mask = np.array(
+                    [_passes_gzip_filter(float(score), config) for score in group_gzip_scores],
+                    dtype=bool,
+                )
+                if not np.any(accepted_mask):
+                    continue
 
-            accepted_trajectory_sets = batched_trajectory_sets[
-                torch.as_tensor(accepted_indices, device=batched_trajectory_sets.device, dtype=torch.long)
-            ]
-            accepted_time_volumes = trajectory_sets_to_time_volumes_batched(accepted_trajectory_sets)
-            batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
-                accepted_time_volumes,
-                num_frames=accepted_num_frames,
-                counts=accepted_counts,
-                config=config,
-                rng=rng,
-                mask_generator=mask_generator,
-            )
+                remaining = size - len(flat_inputs)
+                accepted_indices = np.flatnonzero(accepted_mask)[:remaining]
+                accepted_num_frames = group_num_frames[accepted_indices]
+                accepted_rollout_steps = group_rollout_steps[accepted_indices]
+                accepted_counts = group_counts[accepted_indices]
+                accepted_scores = group_gzip_scores[accepted_indices]
 
-            flat_inputs.extend(batch_inputs)
-            flat_labels.extend(batch_labels)
-            split_position_ids.extend(batch_position_ids)
-            gzip_scores.extend(accepted_scores.tolist())
-            state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
-            num_frames.extend(accepted_num_frames.astype(np.int32).tolist())
-            rollout_steps.extend(accepted_rollout_steps.astype(np.int32).tolist())
-            counts.extend(accepted_counts.astype(np.int32).tolist())
-            progress.update(int(accepted_indices.size))
+                accepted_trajectory_sets = batched_trajectory_sets[
+                    torch.as_tensor(
+                        accepted_indices,
+                        device=batched_trajectory_sets.device,
+                        dtype=torch.long,
+                    )
+                ]
+                accepted_time_volumes = trajectory_sets_to_time_volumes_batched(
+                    accepted_trajectory_sets
+                )
+                batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
+                    accepted_time_volumes,
+                    num_frames=accepted_num_frames,
+                    counts=accepted_counts,
+                    config=config,
+                    rng=rng,
+                    mask_generator=mask_generator,
+                )
+
+                flat_inputs.extend(batch_inputs)
+                flat_labels.extend(batch_labels)
+                split_position_ids.extend(batch_position_ids)
+                gzip_scores.extend(accepted_scores.tolist())
+                state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
+                num_frames.extend(accepted_num_frames.astype(np.int32).tolist())
+                rollout_steps.extend(accepted_rollout_steps.astype(np.int32).tolist())
+                counts.extend(accepted_counts.astype(np.int32).tolist())
+                progress.update(int(accepted_indices.size))
+
+                if len(flat_inputs) >= size:
+                    break
 
             if len(flat_inputs) >= size:
                 break
