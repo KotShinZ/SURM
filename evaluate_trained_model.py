@@ -21,6 +21,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from data.build_arc_dataset import ARCMaxGridSize
 from models.losses import IGNORE_LABEL_ID
 from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
 from utils import load_model_class
@@ -88,7 +89,11 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
         rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
 
         for set_name, dataset in self._data.items():  # type: ignore
-            total_examples = len(dataset["inputs"])
+            total_examples = (
+                dataset["seq_offsets"].size - 1
+                if self.metadata.variable_seq_lengths
+                else len(dataset["inputs"])
+            )
             shuffled_indices = rng.permutation(total_examples)
 
             start_index = 0
@@ -101,15 +106,9 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
                 local_indices = global_indices[local_start:local_end]
                 puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
 
-                batch = self._collate_batch(
-                    {
-                        "inputs": dataset["inputs"][local_indices],
-                        "labels": dataset["labels"][local_indices],
-                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices],
-                    },
-                    rng,
-                    make_masked_inputs=False,
-                )
+                batch_fields = self._select_examples(dataset, local_indices)
+                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][puzzle_indices]
+                batch = self._collate_batch(batch_fields, rng, make_masked_inputs=False)
 
                 yield set_name, batch, end_index - start_index
 
@@ -236,6 +235,7 @@ def create_model_for_evaluation(config: PretrainConfig, metadata, device: torch.
         vocab_size=metadata.vocab_size,
         seq_len=metadata.seq_len,
         num_puzzle_identifiers=metadata.num_puzzle_identifiers,
+        variable_seq_lengths=metadata.variable_seq_lengths,
         causal=False,
     )
 
@@ -321,8 +321,35 @@ def load_model_weights(
     return None
 
 
-def _valid_example_mask(labels: torch.Tensor) -> torch.Tensor:
-    return (labels != IGNORE_LABEL_ID).any(dim=1)
+def _uses_packed_examples(batch: Dict[str, torch.Tensor]) -> bool:
+    return "seq_offsets" in batch and "seq_lengths" in batch and batch["labels"].ndim == 1
+
+
+def _batch_size_from_batch(batch: Dict[str, torch.Tensor]) -> int:
+    if _uses_packed_examples(batch):
+        return int(batch["puzzle_identifiers"].shape[0])
+    return int(batch["inputs"].shape[0])
+
+
+def _packed_example_ids(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    seq_lengths = batch["seq_lengths"].to(device=batch["labels"].device, dtype=torch.long)
+    return torch.repeat_interleave(
+        torch.arange(seq_lengths.shape[0], device=batch["labels"].device, dtype=torch.long),
+        seq_lengths,
+    )
+
+
+def _valid_example_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    labels = batch["labels"]
+    if labels.ndim != 1:
+        return (labels != IGNORE_LABEL_ID).any(dim=1)
+
+    example_ids = _packed_example_ids(batch)
+    token_mask = labels != IGNORE_LABEL_ID
+    return torch.bincount(
+        example_ids[token_mask],
+        minlength=batch["puzzle_identifiers"].shape[0],
+    ) > 0
 
 
 def _finalize_metric_totals(metric_totals: Dict[str, float]) -> Dict[str, float]:
@@ -364,7 +391,14 @@ def _estimate_total_batches(dataloader: DataLoader) -> Optional[int]:
         return None
 
     return sum(
-        math.ceil(len(per_set_data["inputs"]) / dataset.config.global_batch_size)
+        math.ceil(
+            (
+                per_set_data["seq_offsets"].size - 1
+                if dataset.metadata.variable_seq_lengths
+                else len(per_set_data["inputs"])
+            )
+            / dataset.config.global_batch_size
+        )
         for per_set_data in dataset._data.values()
     )
 
@@ -516,6 +550,109 @@ def _append_pruned_chunk(
     pruned_chunks.append(chunk)
 
 
+def _select_packed_tensor_segments(
+    tensor: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    example_indices: torch.Tensor,
+) -> torch.Tensor:
+    offsets = seq_offsets.detach().cpu().tolist()
+    indices = example_indices.detach().cpu().tolist()
+    chunks = [tensor[offsets[idx] : offsets[idx + 1]] for idx in indices]
+    if chunks:
+        return torch.cat(chunks, dim=0)
+
+    empty_shape = list(tensor.shape)
+    empty_shape[0] = 0
+    return tensor.new_empty(empty_shape)
+
+
+def _select_batch_examples(batch: Dict[str, torch.Tensor], example_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
+    if not _uses_packed_examples(batch):
+        return {key: value.index_select(0, example_indices) for key, value in batch.items()}
+
+    old_seq_offsets = batch["seq_offsets"]
+    old_batch_size = batch["puzzle_identifiers"].shape[0]
+    old_token_count = int(old_seq_offsets[-1].item())
+    selected_seq_lengths = batch["seq_lengths"].index_select(0, example_indices)
+    selected_seq_offsets = F.pad(torch.cumsum(selected_seq_lengths.to(torch.int32), dim=0), (1, 0))
+
+    selected: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if key == "seq_lengths":
+            selected[key] = selected_seq_lengths
+        elif key == "seq_offsets":
+            selected[key] = selected_seq_offsets
+        elif value.ndim > 0 and value.shape[0] == old_batch_size:
+            selected[key] = value.index_select(0, example_indices)
+        elif value.ndim > 0 and value.shape[0] == old_token_count:
+            selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
+        else:
+            selected[key] = value
+
+    return selected
+
+
+def _select_prediction_examples(
+    preds: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    example_indices: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    if not _uses_packed_examples(batch):
+        return {key: value.index_select(0, example_indices) for key, value in preds.items()}
+
+    old_seq_offsets = batch["seq_offsets"]
+    old_batch_size = batch["puzzle_identifiers"].shape[0]
+    old_token_count = int(old_seq_offsets[-1].item())
+    selected: Dict[str, torch.Tensor] = {}
+    for key, value in preds.items():
+        if value.ndim > 0 and value.shape[0] == old_batch_size:
+            selected[key] = value.index_select(0, example_indices)
+        elif value.ndim > 0 and value.shape[0] == old_token_count:
+            selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
+        else:
+            selected[key] = value
+    return selected
+
+
+def _dense_arc_grids_from_packed(tokens: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    seq_ids = _packed_example_ids(batch)
+    position_ids = batch["position_ids"].to(device=tokens.device, dtype=torch.long)
+    flat_positions = position_ids[:, 0] * ARCMaxGridSize + position_ids[:, 1]
+    dense = torch.zeros(
+        (batch["puzzle_identifiers"].shape[0], ARCMaxGridSize * ARCMaxGridSize),
+        dtype=tokens.dtype,
+        device=tokens.device,
+    )
+    dense[seq_ids, flat_positions] = tokens
+    return dense
+
+
+def _prepare_arc_batch(
+    batch: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor],
+    example_indices: torch.Tensor,
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    selected_batch = _select_batch_examples(batch, example_indices)
+    selected_preds = _select_prediction_examples(preds, batch, example_indices)
+    if not _uses_packed_examples(selected_batch):
+        return selected_batch, selected_preds
+
+    arc_batch = {
+        "puzzle_identifiers": selected_batch["puzzle_identifiers"],
+        "inputs": _dense_arc_grids_from_packed(selected_batch["inputs"], selected_batch),
+    }
+    if "source_inputs" in selected_batch:
+        arc_batch["source_inputs"] = _dense_arc_grids_from_packed(selected_batch["source_inputs"], selected_batch)
+
+    arc_preds = {
+        key: value
+        for key, value in selected_preds.items()
+        if key == "q_halt_logits"
+    }
+    arc_preds["preds"] = _dense_arc_grids_from_packed(selected_preds["preds"], selected_batch)
+    return arc_batch, arc_preds
+
+
 def _compute_batch_metric_sums(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
@@ -524,6 +661,51 @@ def _compute_batch_metric_sums(
     keep_mask: torch.Tensor,
 ) -> Dict[str, float]:
     labels = batch["labels"]
+    if labels.ndim == 1:
+        example_ids = _packed_example_ids(batch)
+        token_mask = labels != IGNORE_LABEL_ID
+        token_counts = torch.bincount(
+            example_ids[token_mask],
+            minlength=batch["puzzle_identifiers"].shape[0],
+        )
+        valid_examples = keep_mask & (token_counts > 0)
+        if not torch.any(valid_examples):
+            return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "lm_loss": 0.0, "steps": 0.0}
+
+        is_correct = token_mask & (preds["preds"] == labels)
+        correct_counts = torch.bincount(
+            example_ids[is_correct],
+            minlength=batch["puzzle_identifiers"].shape[0],
+        )
+        seq_token_accuracy = correct_counts.to(torch.float32) / token_counts.clamp_min(1).to(torch.float32)
+        seq_exact_accuracy = correct_counts == token_counts
+
+        logits = preds["logits"]
+        if hasattr(model, "loss_fn"):
+            token_loss = model.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID)  # type: ignore[misc]
+        else:
+            token_loss = F.cross_entropy(
+                logits.to(torch.float32),
+                labels.to(torch.long),
+                ignore_index=IGNORE_LABEL_ID,
+                reduction="none",
+            )
+        seq_loss_sums = torch.bincount(
+            example_ids,
+            weights=token_loss.to(torch.float32),
+            minlength=batch["puzzle_identifiers"].shape[0],
+        )
+        seq_lm_loss = seq_loss_sums / token_counts.clamp_min(1).to(torch.float32)
+        selected_steps = final_steps[valid_examples]
+
+        return {
+            "count": float(valid_examples.sum().item()),
+            "accuracy": float(seq_token_accuracy[valid_examples].sum().item()),
+            "exact_accuracy": float(seq_exact_accuracy[valid_examples].to(torch.float32).sum().item()),
+            "lm_loss": float(seq_lm_loss[valid_examples].sum().item()),
+            "steps": float(selected_steps.to(torch.float32).sum().item()),
+        }
+
     selected_labels = labels[keep_mask]
     selected_preds = preds["preds"][keep_mask]
     selected_steps = final_steps[keep_mask]
@@ -623,7 +805,10 @@ def evaluate_model(
     model.eval()
 
     return_keys: Set[str] = {"preds", "logits"}
-    act_early_stop_enabled = _act_early_stop_enabled(model)
+    packed_variable_length_eval = bool(getattr(getattr(dataloader.dataset, "metadata", None), "variable_seq_lengths", False))
+    batch_pruning_supported = not packed_variable_length_eval
+    raw_act_early_stop_enabled = _act_early_stop_enabled(model)
+    act_early_stop_enabled = raw_act_early_stop_enabled and batch_pruning_supported
     if act_early_stop_enabled:
         return_keys.add("q_halt_logits")
     if save_predictions:
@@ -651,13 +836,18 @@ def evaluate_model(
         progress_total = min(progress_total, math.ceil(max_problems / dataloader.dataset.config.global_batch_size))  # type: ignore[attr-defined]
 
     hidden_pruning_enabled = (
-        hidden_diff_threshold is not None
+        batch_pruning_supported
+        and hidden_diff_threshold is not None
         and hidden_diff_threshold > 0
         and _supports_hidden_pruning(model)
     )
     print("hidden_pruning_enabled:", hidden_pruning_enabled, ", hidden_diff_threshold:", hidden_diff_threshold)
     print("ACT early stopping enabled:", act_early_stop_enabled)
-    if hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
+    if packed_variable_length_eval and raw_act_early_stop_enabled:
+        print("ACT early stopping batch pruning is not supported for packed variable-length evaluation; running without batch pruning.")
+    if packed_variable_length_eval and hidden_diff_threshold is not None and hidden_diff_threshold > 0:
+        print("Hidden-state pruning is not supported for packed variable-length evaluation; running standard evaluation.")
+    elif hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
         print("Hidden-state pruning is not supported by this model; running standard evaluation.")
 
     with torch.inference_mode():
@@ -670,9 +860,9 @@ def evaluate_model(
 
             processed_batches += 1
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            batch_size = batch["inputs"].shape[0]
+            batch_size = _batch_size_from_batch(batch)
 
-            valid_example_mask = _valid_example_mask(batch["labels"])
+            valid_example_mask = _valid_example_mask(batch)
             keep_mask = valid_example_mask.clone()
             if max_problems is not None:
                 remaining = max_problems - processed_problems
@@ -837,17 +1027,19 @@ def evaluate_model(
             if arc_majority_evaluator is not None:
                 kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
                 if kept_indices.numel() > 0:
-                    arc_majority_evaluator.update_batch(
-                        _index_structure(batch, kept_indices),
-                        _index_structure(preds, kept_indices),
-                    )
+                    arc_batch, arc_preds = _prepare_arc_batch(batch, preds, kept_indices)
+                    arc_majority_evaluator.update_batch(arc_batch, arc_preds)
 
             if save_predictions:
-                for key, value in batch.items():
-                    if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs"}:
-                        saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())
-                for key, value in preds.items():
-                    saved_outputs[set_name][key].append(value[keep_mask].detach().cpu())
+                kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+                if kept_indices.numel() > 0:
+                    saved_batch = _select_batch_examples(batch, kept_indices)
+                    saved_preds = _select_prediction_examples(preds, batch, kept_indices)
+                    for key, value in saved_batch.items():
+                        if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs", "seq_lengths", "position_ids"}:
+                            saved_outputs[set_name][key].append(value.detach().cpu())
+                    for key, value in saved_preds.items():
+                        saved_outputs[set_name][key].append(value.detach().cpu())
 
             if max_problems is not None and processed_problems >= max_problems:
                 break
