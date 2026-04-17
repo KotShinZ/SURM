@@ -74,8 +74,8 @@ class NCA2DDataConfig(BaseModel):
     gzip_threshold_low: Optional[float] = None
     gzip_threshold_high: Optional[float] = None
 
-    batch_candidate_size: int = 1024
-    max_sampling_rounds: int = 200
+    batch_candidate_size: int = 2048
+    max_sampling_rounds: int = 2000
     # Approximate upper bound used to adapt the per-group batch size:
     # batch_size * H * W * (2 * (counts + 1)).
     max_cells_per_candidate_batch: int = 8_000_000
