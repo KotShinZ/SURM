@@ -88,6 +88,33 @@ python data/build_nca1d_dataset.py \
   --time-start 30 \
   --time-end 38
 
+# NCA-2D
+python data/build_nca2d_dataset.py \
+  --output-dir data/nca2d-1k \
+  --train-size 800 \
+  --test-size 200 \
+  --state-height 12 \
+  --state-height-min 8 \
+  --state-height-max 12 \
+  --state-width 12 \
+  --state-width-min 8 \
+  --state-width-max 12 \
+  --num-colors 4 \
+  --patch-size 1 \
+  --answer-steps 1 \
+  --counts 3 \
+  --counts-min 2 \
+  --counts-max 4 \
+  --time-start 24 \
+  --time-span 2 \
+  --batch-candidate-size 256 \
+  --max-sampling-rounds 20 \
+  --max-cells-per-candidate-batch 4000000 \
+  --save-dtype int32 \
+  --gzip-threshold-low 0.025 \
+  --gzip-threshold-high 0.1
+
+
 # upload ARC-AGI-1
 export HF_TOKEN=YOUR_HF_TOKEN
 python -m data.upload_arc_dataset \
