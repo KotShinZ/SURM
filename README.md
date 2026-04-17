@@ -57,7 +57,7 @@ python -m data.build_arc_dataset_full \
   --output-dir data/arc1concept-full-aug-1000-nopadding \
   --subsets training evaluation concept \
   --test-set-name evaluation \
-  --no_padding true
+  --no-padding
 
 # ARC-AGI-2
 python -m data.build_arc_dataset \

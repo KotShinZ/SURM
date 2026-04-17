@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import os
 import math
 import json
+import sys
 import yaml
 import shutil
 import re
@@ -126,6 +127,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Extras
     load_checkpoint: Optional[str] = None
+    load_checkpoint_file: Optional[str] = None
     load_strict: bool = True
     load_optimizer_state: bool = True
 
@@ -348,7 +350,7 @@ def init_train_state(
         carry=None,
     )
 
-    load_checkpoint(train_state, config, rank)
+    load_initial_state(train_state, config, rank)
 
     return train_state
 
@@ -465,39 +467,41 @@ def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: dict):
             )
 
 
-def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
-    load_path = config.load_checkpoint
-    if load_path is None:
-        return
+def _prepare_rng_state(state: Any, device: str | None) -> Any:
+    """Ensure RNG state tensors are on the correct device and uint8 dtype."""
 
+    if state is None:
+        return None
+
+    if isinstance(state, (list, tuple)):
+        return [_prepare_rng_state(s, device) for s in state]
+
+    tensor_state = torch.as_tensor(state, device=device)
+    if tensor_state.dtype != torch.uint8:
+        tensor_state = tensor_state.to(torch.uint8)
+
+    return tensor_state
+
+
+def _resolve_requested_checkpoint_path(load_path: str, checkpoint_path: Optional[str]) -> str:
     if load_path == "latest":
-        if config.checkpoint_path is None:
+        if checkpoint_path is None:
             raise ValueError("Cannot load latest checkpoint without a checkpoint_path configured.")
-        load_path = config.checkpoint_path
+        load_path = checkpoint_path
 
     resolved_path = _resolve_checkpoint_path(load_path)
     if resolved_path is None:
         raise FileNotFoundError(f"Could not resolve checkpoint path from '{load_path}'")
 
+    return resolved_path
+
+
+def _load_checkpoint_payload(load_path: str, checkpoint_path: Optional[str], rank: int):
+    resolved_path = _resolve_requested_checkpoint_path(load_path, checkpoint_path)
     if rank == 0:
         print(f"Loading checkpoint {resolved_path}")
 
     checkpoint = torch.load(resolved_path, map_location="cuda")
-
-    def _prepare_rng_state(state: Any, device: str | None) -> Any:
-        """Ensure RNG state tensors are on the correct device and uint8 dtype."""
-
-        if state is None:
-            return None
-
-        if isinstance(state, (list, tuple)):
-            return [_prepare_rng_state(s, device) for s in state]
-
-        tensor_state = torch.as_tensor(state, device=device)
-        if tensor_state.dtype != torch.uint8:
-            tensor_state = tensor_state.to(torch.uint8)
-
-        return tensor_state
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -513,6 +517,10 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
         rng_state = None
         cuda_rng_state = None
 
+    return state_dict, optimizer_states, step, rng_state, cuda_rng_state
+
+
+def _load_model_state(train_state: TrainState, config: PretrainConfig, state_dict: dict, rank: int):
     _resize_puzzle_embedding_if_needed(train_state.model, state_dict)
     try:
         # Keep parameter objects stable so pre-created optimizers still point at
@@ -528,6 +536,17 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
             print(f"Warning: missing keys during checkpoint load: {missing}")
         if unexpected:
             print(f"Warning: unexpected keys during checkpoint load: {unexpected}")
+
+
+def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
+    load_path = config.load_checkpoint
+    if load_path is None:
+        return
+
+    state_dict, optimizer_states, step, rng_state, cuda_rng_state = _load_checkpoint_payload(
+        load_path, checkpoint_path=config.checkpoint_path, rank=rank
+    )
+    _load_model_state(train_state, config, state_dict, rank)
 
     if optimizer_states is not None:
         if not config.load_optimizer_state:
@@ -574,6 +593,32 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
                 else normalized_cuda_state
             )
             torch.cuda.set_rng_state(fallback_state)
+
+
+def load_checkpoint_file(train_state: TrainState, config: PretrainConfig, rank: int):
+    load_path = config.load_checkpoint_file
+    if load_path is None:
+        return
+
+    state_dict, _, _, _, _ = _load_checkpoint_payload(
+        load_path, checkpoint_path=config.checkpoint_path, rank=rank
+    )
+    _load_model_state(train_state, config, state_dict, rank)
+
+    # Weight-only initialization intentionally keeps optimizer, step, and RNG state fresh.
+    train_state.carry = None
+    if rank == 0:
+        print("Loaded model weights only; optimizer state, step, and RNG state were not restored.")
+
+
+def load_initial_state(train_state: TrainState, config: PretrainConfig, rank: int):
+    if config.load_checkpoint is not None and config.load_checkpoint_file is not None:
+        raise ValueError("load_checkpoint and load_checkpoint_file are mutually exclusive.")
+
+    if config.load_checkpoint is not None:
+        load_checkpoint(train_state, config, rank)
+    elif config.load_checkpoint_file is not None:
+        load_checkpoint_file(train_state, config, rank)
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -1002,6 +1047,9 @@ def _build_pretrain_config(hydra_config: DictConfig, rank: int) -> PretrainConfi
             )
 
         merged_config = resume_config.model_dump()
+        # Do not carry over a past checkpoint-loading request when resuming from saved config.
+        merged_config["load_checkpoint"] = None
+        merged_config["load_checkpoint_file"] = None
         # Only allow runtime-oriented overrides here. The saved training config remains the source
         # of truth for architecture and dataset settings so resume stays faithful to the checkpoint.
         for key in (
@@ -1009,6 +1057,7 @@ def _build_pretrain_config(hydra_config: DictConfig, rank: int) -> PretrainConfi
             "run_name",
             "checkpoint_path",
             "load_checkpoint",
+            "load_checkpoint_file",
             "load_strict",
             "load_optimizer_state",
             "seed",
@@ -1035,6 +1084,38 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         dist.broadcast_object_list(objects, src=0)
 
     return objects[0]  # type: ignore
+
+
+def _rewrite_cli_checkpoint_file_flag(argv: List[str]) -> List[str]:
+    """Translate --load_checkpoint_file into a Hydra config override."""
+
+    rewritten: List[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--load_checkpoint_file", "--load-checkpoint-file"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"Expected a path after {arg}")
+            rewritten.append(f"+load_checkpoint_file={argv[i + 1]}")
+            i += 2
+            continue
+
+        matched_flag = None
+        for flag in ("--load_checkpoint_file=", "--load-checkpoint-file="):
+            if arg.startswith(flag):
+                matched_flag = flag
+                value = arg[len(flag):]
+                if value == "":
+                    raise ValueError(f"Expected a path after {flag[:-1]}")
+                rewritten.append(f"+load_checkpoint_file={value}")
+                break
+
+        if matched_flag is None:
+            rewritten.append(arg)
+
+        i += 1
+
+    return rewritten
 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
@@ -1237,4 +1318,5 @@ def launch(hydra_config: DictConfig):
 
 
 if __name__ == "__main__":
+    sys.argv = _rewrite_cli_checkpoint_file_flag(sys.argv)
     launch()

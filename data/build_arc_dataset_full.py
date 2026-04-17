@@ -43,9 +43,6 @@ class DataProcessConfig(BaseModel):
 ARCMaxGridSize = 30
 # 拡張は重複が起きうるため、多少多めに試して十分な数を集める。
 ARCAugmentRetriesFactor = 5
-# 出力側の position id では、入力行と重ならないように行方向へオフセットを足す。
-ARCOutputRowOffset = ARCMaxGridSize
-
 # 拡張情報を puzzle id に埋め込むときの区切り文字。
 PuzzleIdSeparator = "|||"
 # 実際の puzzle id を埋め込まない代わりに、全問題共通で使う識別子。
@@ -429,10 +426,20 @@ def _pair_seq_upper_bound(
 
 def _full_sample_upper_bound(group: List[ARCFullPuzzle], no_padding: bool):
     # 同一グループ内で最も長くなりうるサンプル長を保存時の上限として使う。
+    # 文脈ペアは input/output の 2 枚、ターゲットは query_input の 1 枚だけを
+    # 入力側へ並べるので、上限は target 候補ごとに 1 枚ぶんだけ短くなる。
     if not group:
         return 0
     return max(
-        sum(_pair_seq_upper_bound(inp, out, no_padding) for inp, out in puzzle.pairs)
+        max(
+            2 * sum(_pair_seq_upper_bound(inp, out, no_padding) for inp, out in puzzle.pairs)
+            - _pair_seq_upper_bound(
+                puzzle.pairs[target_idx][0],
+                puzzle.pairs[target_idx][1],
+                no_padding,
+            )
+            for target_idx in puzzle.target_indices
+        )
         for puzzle in group
     )
 
@@ -462,16 +469,17 @@ def _make_pair_sequences(
 
 
 def _make_pair_position_ids(pair_shape: Tuple[int, int], example_index: int):
-    # position id は [ペア番号, 行, 列] の 3 軸で持つ。
-    # これにより連結後も「どのペアのどの位置か」を復元しやすい。
+    # position id は [画像番号, 行, 列] の 3 軸で持つ。
+    # 1 ペアにつき input / output を別 depth に置き、後段では
+    # [例問1, 解答1, 例問2, 解答2, ...] の順に復元できるようにする。
     pair_h, pair_w = pair_shape
     rows = np.repeat(np.arange(pair_h, dtype=np.uint8), pair_w)
     cols = np.tile(np.arange(pair_w, dtype=np.uint8), pair_h)
-    depth = np.full((pair_h * pair_w,), example_index, dtype=np.uint8)
+    input_depth = np.full((pair_h * pair_w,), 2 * example_index, dtype=np.uint8)
+    output_depth = np.full((pair_h * pair_w,), 2 * example_index + 1, dtype=np.uint8)
 
-    # 出力側は入力側と行番号が衝突しないよう、行方向をオフセットしておく。
-    input_position_ids = np.stack([depth, rows, cols], axis=-1)
-    output_position_ids = np.stack([depth, rows + ARCOutputRowOffset, cols], axis=-1)
+    input_position_ids = np.stack([input_depth, rows, cols], axis=-1)
+    output_position_ids = np.stack([output_depth, rows, cols], axis=-1)
     return input_position_ids, output_position_ids
 
 
@@ -487,9 +495,10 @@ def _build_full_context_example(
     if context_indices is None:
         return None
 
-    # ターゲットを最後に固定せず混ぜることで、位置依存の学習を避ける。
+    # 文脈だけをシャッフルし、query_input は常に最後へ置く。
+    # これにより [例問1, 解答1, 例問2, 解答2, ... 問題1] の並びを保つ。
+    np.random.shuffle(context_indices)
     ordered_indices = [*context_indices, target_idx]
-    np.random.shuffle(ordered_indices)
     # 少なくとも 1 ペアは平行移動させず、元の配置情報も常に残す。
     no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
 
@@ -508,11 +517,11 @@ def _build_full_context_example(
         inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
 
         if pair_idx == target_idx:
-            # ターゲット問題では、モデル入力には output を見せず、
-            # そのぶんラベル側にだけ正解 output を置く。
-            input_parts.extend([inp_seq, zero_out])
-            label_parts.extend([zero_inp, out_seq])
-            position_parts.extend([inp_pos_ids, out_pos_ids])
+            # ターゲット問題では query_input だけを入力へ置き、
+            # query_output は同じ depth のラベルとして学習させる。
+            input_parts.append(inp_seq)
+            label_parts.append(out_seq)
+            position_parts.append(inp_pos_ids)
         else:
             # 文脈問題では input/output の両方を入力へ入れ、ラベルは空にする。
             input_parts.extend([inp_seq, out_seq])
