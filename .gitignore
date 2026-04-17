@@ -10,6 +10,7 @@ kaggle/combined/arc-agi_training-challenges copy.json
 .devcontainer/devcontainer.json
 data/**
 !data/build_nca1d_dataset.py
+!data/build_nca2d_dataset.py
 !data/build_1d_arc_dataset.py
 !data/build_arc_dataset_full.py
 NCA_datas/nca_dataset_colab_demo/*

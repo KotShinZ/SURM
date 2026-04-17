@@ -112,6 +112,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(saved_config["position_id_shape"], [5, 4, 5])
             self.assertEqual(saved_config["seq_len"], 100)
             self.assertEqual(saved_config["vocab_size"], 6)
+            self.assertEqual(saved_config["resolved_out_colors"], 4)
             self.assertEqual(saved_config["resolved_state_height_min"], 4)
             self.assertEqual(saved_config["resolved_state_height_max"], 4)
             self.assertEqual(saved_config["resolved_state_width_min"], 5)
@@ -175,9 +176,9 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             )
             self.assertEqual(decoded_input.shape, (4, 5, 5))
             self.assertEqual(decoded_label.shape, (4, 5, 1))
-            self.assertTrue(np.all(decoded_input <= config.num_colors - 1))
+            self.assertTrue(np.all(decoded_input <= config.resolved_out_colors - 1))
             self.assertTrue(np.all(decoded_input >= 0))
-            self.assertTrue(np.all(decoded_label <= config.num_colors - 1))
+            self.assertTrue(np.all(decoded_label <= config.resolved_out_colors - 1))
             self.assertTrue(np.all(decoded_label >= 0))
 
             input_canvas = train_inputs[0].reshape(config.final_image_shape)
@@ -254,6 +255,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(saved_config["resolved_state_width_max"], 7)
             self.assertEqual(saved_config["resolved_answer_steps_min"], 2)
             self.assertEqual(saved_config["resolved_answer_steps_max"], 4)
+            self.assertEqual(saved_config["resolved_out_colors"], 4)
             self.assertEqual(saved_config["final_image_shape"], [6, 7, 7])
             self.assertEqual(saved_config["position_id_shape"], [7, 6, 7])
             self.assertEqual(saved_config["seq_len"], 294)
@@ -299,8 +301,86 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                     int(train_input_channels[0]),
                 ),
             )
-            self.assertTrue(np.all(decoded_input <= config.num_colors - 1))
+            self.assertTrue(np.all(decoded_input <= config.resolved_out_colors - 1))
             self.assertTrue(np.all(decoded_input >= 0))
+
+    def test_build_dataset_can_remap_internal_colors_into_larger_output_palette(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_dir = Path(tmp_dir) / "nca2d-remap"
+            config = NCA2DDataConfig(
+                output_dir=str(dataset_dir),
+                train_size=6,
+                test_size=2,
+                seed=19,
+                state_height=6,
+                state_height_min=6,
+                state_height_max=6,
+                state_width=6,
+                state_width_min=6,
+                state_width_max=6,
+                num_colors=3,
+                out_colors=10,
+                patch_size=1,
+                answer_steps=2,
+                answer_steps_min=2,
+                answer_steps_max=2,
+                counts=2,
+                counts_min=2,
+                counts_max=2,
+                gzip_threshold_low=None,
+                gzip_threshold_high=None,
+                batch_candidate_size=8,
+                max_sampling_rounds=20,
+                save_dtype="int32",
+            )
+
+            build_dataset(config)
+
+            with open(dataset_dir / "config.json") as f:
+                saved_config = json.load(f)
+            self.assertEqual(saved_config["resolved_out_colors"], 10)
+            self.assertEqual(saved_config["vocab_size"], 12)
+
+            train_inputs = np.load(dataset_dir / "train" / "all__inputs.npy")
+            train_labels = np.load(dataset_dir / "train" / "all__labels.npy")
+            train_counts = np.load(dataset_dir / "train" / "all__counts.npy")
+
+            saw_extended_palette = False
+            for sample_idx in range(train_inputs.shape[0]):
+                counts = int(train_counts[sample_idx])
+                decoded_input = unflatten_input_grid(
+                    train_inputs[sample_idx],
+                    image_height=config.state_height,
+                    image_width=config.state_width,
+                    counts=counts,
+                    token_offset=config.token_offset,
+                    padded_height=config.final_image_shape[0],
+                    padded_width=config.final_image_shape[1],
+                    padded_channels=config.final_image_shape[2],
+                )
+                decoded_label = extract_label_grid(
+                    train_labels[sample_idx],
+                    image_height=config.state_height,
+                    image_width=config.state_width,
+                    counts=counts,
+                    token_offset=config.token_offset,
+                    padded_height=config.final_image_shape[0],
+                    padded_width=config.final_image_shape[1],
+                    padded_channels=config.final_image_shape[2],
+                )
+
+                combined = np.concatenate(
+                    [decoded_input.reshape(-1), decoded_label.reshape(-1)],
+                    axis=0,
+                )
+                unique_colors = np.unique(combined)
+                self.assertLessEqual(unique_colors.size, config.num_colors)
+                self.assertTrue(np.all(unique_colors >= 0))
+                self.assertTrue(np.all(unique_colors < config.out_colors))
+                if np.any(unique_colors >= config.num_colors):
+                    saw_extended_palette = True
+
+            self.assertTrue(saw_extended_palette)
 
     def test_counts_are_capped_to_respect_max_data_seq_len(self) -> None:
         config = NCA2DDataConfig(
