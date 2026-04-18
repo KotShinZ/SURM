@@ -57,7 +57,26 @@ python -m data.build_arc_dataset_full \
   --output-dir data/arc1concept-full-aug-1000-nopadding-13_2 \
   --subsets training evaluation concept \
   --test-set-name evaluation \
-  --no-padding
+  --no-padding \
+  --no-padding-mode sample
+
+# pair ごとの最小キャンバスで詰め、EOS は残す
+python -m data.build_arc_dataset_full \
+  --input-file-prefix kaggle/combined/arc-agi \
+  --output-dir data/arc1concept-full-aug-1000-pair-eos \
+  --subsets training evaluation concept \
+  --test-set-name evaluation \
+  --no-padding \
+  --no-padding-mode pair_eos
+
+# pair ごとの最小キャンバスで詰め、EOS も入れない
+python -m data.build_arc_dataset_full \
+  --input-file-prefix kaggle/combined/arc-agi \
+  --output-dir data/arc1concept-full-aug-1000-pair-no-eos \
+  --subsets training evaluation concept \
+  --test-set-name evaluation \
+  --no-padding \
+  --no-padding-mode pair_no_eos
 
 # ARC-AGI-2
 python -m data.build_arc_dataset \

@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pydantic
@@ -35,6 +35,22 @@ class MaskedInputConfig(pydantic.BaseModel):
             )
         if self.mask_token_id < 0:
             raise ValueError(f"mask_token_id must be >= 0, got {self.mask_token_id}")
+        return self
+
+
+class ARCOutputMaskConfig(pydantic.BaseModel):
+    enabled: bool = True
+    fill_mode: Literal["zero", "random_color"] = "zero"
+    preserve_source_inputs: bool = True
+    answer_slot_max_grid_size: Optional[int] = None
+
+    @pydantic.model_validator(mode="after")
+    def _validate_answer_slot_size(self):
+        if self.answer_slot_max_grid_size is not None and self.answer_slot_max_grid_size <= 0:
+            raise ValueError(
+                "answer_slot_max_grid_size must be a positive integer when provided, "
+                f"got {self.answer_slot_max_grid_size}"
+            )
         return self
 
 
@@ -88,6 +104,9 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # Replace model inputs with randomly masked labels.
     masked_input: Optional[MaskedInputConfig] = None
 
+    # ARC full-context training: mask one output pair on the fly and generate labels from it.
+    arc_output_mask: Optional[ARCOutputMaskConfig] = None
+
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -117,7 +136,6 @@ class PuzzleDataset(IterableDataset):
 
         field_mmap_modes = {
             "inputs": "r",
-            "labels": "r",
 
             # Keep indices in memory
             "puzzle_identifiers": None,
@@ -133,6 +151,9 @@ class PuzzleDataset(IterableDataset):
         for set_name in self.metadata.sets:
             split_dir = os.path.join(self.config.dataset_path, self.split)
             set_fields = dict(field_mmap_modes)
+            labels_path = os.path.join(split_dir, f"{set_name}__labels.npy")
+            if os.path.isfile(labels_path):
+                set_fields["labels"] = "r"
             position_ids_path = os.path.join(split_dir, f"{set_name}__position_ids.npy")
             if os.path.isfile(position_ids_path):
                 set_fields["position_ids"] = "r"
@@ -147,8 +168,9 @@ class PuzzleDataset(IterableDataset):
         if not self.metadata.variable_seq_lengths:
             batch = {
                 "inputs": dataset["inputs"][indices],
-                "labels": dataset["labels"][indices],
             }
+            if "labels" in dataset:
+                batch["labels"] = dataset["labels"][indices]
             if "position_ids" in dataset:
                 batch["position_ids"] = dataset["position_ids"][indices]
             return batch
@@ -158,32 +180,35 @@ class PuzzleDataset(IterableDataset):
         lengths = (offsets[indices + 1] - offsets[indices]).astype(np.int32, copy=False)
 
         input_chunks = []
-        label_chunks = []
         position_chunks = []
+        label_chunks = [] if "labels" in dataset else None
         for example_idx in indices:
             start = int(offsets[example_idx])
             end = int(offsets[example_idx + 1])
             input_chunks.append(dataset["inputs"][start:end])
-            label_chunks.append(dataset["labels"][start:end])
+            if label_chunks is not None:
+                label_chunks.append(dataset["labels"][start:end])
             if "position_ids" in dataset:
                 position_chunks.append(dataset["position_ids"][start:end])
 
         if input_chunks:
             inputs = np.concatenate(input_chunks).astype(np.uint8, copy=False)
-            labels = np.concatenate(label_chunks).astype(np.uint8, copy=False)
         else:
             inputs = np.empty((0,), dtype=np.uint8)
-            labels = np.empty((0,), dtype=np.uint8)
 
         batch = {
             "inputs": inputs,
-            "labels": labels,
             "seq_lengths": lengths,
             "seq_offsets": np.concatenate(
                 [np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)]
             ),
             "seq_shapes": shapes,
         }
+        if label_chunks is not None:
+            if label_chunks:
+                batch["labels"] = np.concatenate(label_chunks).astype(np.uint8, copy=False)
+            else:
+                batch["labels"] = np.empty((0,), dtype=np.uint8)
         if "position_ids" in dataset:
             if position_chunks:
                 batch["position_ids"] = np.concatenate(position_chunks, axis=0).astype(
@@ -236,6 +261,233 @@ class PuzzleDataset(IterableDataset):
 
         return masked_inputs
 
+    def _should_apply_arc_output_mask(self, make_masked_inputs: bool) -> bool:
+        cfg = self._arc_output_mask_cfg()
+        return bool(
+            make_masked_inputs
+            and cfg is not None
+            and cfg.enabled
+            and self.split == "train"
+            and self.metadata.train_target_mode == "random_output_pair"
+        )
+
+    def _arc_output_mask_cfg(self) -> Optional[ARCOutputMaskConfig]:
+        if self.config.arc_output_mask is not None:
+            return self.config.arc_output_mask
+        if self.metadata.train_target_mode == "random_output_pair":
+            return ARCOutputMaskConfig()
+        return None
+
+    def _arc_answer_slot_size(self) -> int:
+        cfg = self._arc_output_mask_cfg()
+        if cfg is not None and cfg.answer_slot_max_grid_size is not None:
+            return int(cfg.answer_slot_max_grid_size)
+        if self.metadata.answer_slot_max_grid_size is not None:
+            return int(self.metadata.answer_slot_max_grid_size)
+        return 30
+
+    def _arc_mask_fill_token(self, rng: np.random.Generator) -> int:
+        cfg = self._arc_output_mask_cfg()
+        assert cfg is not None
+        if cfg.fill_mode == "zero":
+            return 2
+        return int(rng.integers(2, 12))
+
+    @staticmethod
+    def _make_arc_position_ids(pair_id: int, io_id: int, canvas_shape: Tuple[int, int]) -> np.ndarray:
+        canvas_h, canvas_w = canvas_shape
+        row_col_ids = np.moveaxis(np.indices((canvas_h, canvas_w), dtype=np.int32), 0, -1).reshape(-1, 2)
+        pair_ids = np.full((row_col_ids.shape[0], 1), pair_id, dtype=np.int32)
+        io_ids = np.full((row_col_ids.shape[0], 1), io_id, dtype=np.int32)
+        return np.concatenate([pair_ids, io_ids, row_col_ids], axis=-1)
+
+    def _extract_arc_pair_entries(
+        self,
+        sample_tokens: np.ndarray,
+        sample_position_ids: np.ndarray,
+        rng: Optional[np.random.Generator] = None,
+    ) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+        if sample_position_ids.ndim != 2 or sample_position_ids.shape[1] != 4:
+            raise ValueError(
+                "ARC output masking requires 4D position_ids with shape [seq_len, 4], "
+                f"got {sample_position_ids.shape}"
+            )
+
+        pair_entries: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        for pair_id in np.unique(sample_position_ids[:, 0]).astype(np.int32, copy=False).tolist():
+            pair_mask = sample_position_ids[:, 0] == pair_id
+            if not np.any(sample_tokens[pair_mask] != self.metadata.pad_id):
+                continue
+
+            canvases: Dict[int, np.ndarray] = {}
+            for io_id in (0, 1):
+                io_mask = pair_mask & (sample_position_ids[:, 1] == io_id)
+                if not np.any(io_mask):
+                    continue
+
+                coords = sample_position_ids[io_mask][:, 2:].astype(np.int32, copy=False)
+                canvas_h = int(coords[:, 0].max()) + 1
+                canvas_w = int(coords[:, 1].max()) + 1
+                canvas = np.zeros((canvas_h, canvas_w), dtype=np.int32)
+                canvas[coords[:, 0], coords[:, 1]] = sample_tokens[io_mask]
+                canvases[io_id] = canvas
+
+            if 0 in canvases and 1 in canvases:
+                pair_entries.append((pair_id, canvases[0], canvases[1]))
+
+        if rng is not None and len(pair_entries) > 1:
+            rng.shuffle(pair_entries)
+
+        return pair_entries
+
+    def _build_arc_masked_variable_sample(
+        self,
+        pair_entries: List[Tuple[int, np.ndarray, np.ndarray]],
+        target_pair_id: int,
+        fill_token: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
+        answer_slot_size = self._arc_answer_slot_size()
+
+        masked_chunks = []
+        label_chunks = []
+        source_chunks = []
+        position_chunks = []
+        max_pair_h = 0
+        max_pair_w = 0
+
+        for pair_id, inp_canvas, out_canvas in pair_entries:
+            masked_chunks.append(inp_canvas.reshape(-1).astype(np.int32, copy=False))
+            label_chunks.append(np.zeros((inp_canvas.size,), dtype=np.int32))
+            source_chunks.append(inp_canvas.reshape(-1).astype(np.int32, copy=False))
+            position_chunks.append(self._make_arc_position_ids(pair_id, 0, inp_canvas.shape))
+            max_pair_h = max(max_pair_h, inp_canvas.shape[0])
+            max_pair_w = max(max_pair_w, inp_canvas.shape[1])
+
+            if pair_id == target_pair_id:
+                masked_out = np.full((answer_slot_size, answer_slot_size), fill_token, dtype=np.int32)
+                label_out = np.zeros((answer_slot_size, answer_slot_size), dtype=np.int32)
+                label_out[: out_canvas.shape[0], : out_canvas.shape[1]] = out_canvas
+                source_out = label_out
+            else:
+                masked_out = out_canvas.astype(np.int32, copy=False)
+                label_out = np.zeros_like(masked_out)
+                source_out = masked_out
+
+            masked_chunks.append(masked_out.reshape(-1).astype(np.int32, copy=False))
+            label_chunks.append(label_out.reshape(-1).astype(np.int32, copy=False))
+            source_chunks.append(source_out.reshape(-1).astype(np.int32, copy=False))
+            position_chunks.append(self._make_arc_position_ids(pair_id, 1, masked_out.shape))
+            max_pair_h = max(max_pair_h, masked_out.shape[0])
+            max_pair_w = max(max_pair_w, masked_out.shape[1])
+
+        inputs = np.concatenate(masked_chunks).astype(np.int32, copy=False)
+        labels = np.concatenate(label_chunks).astype(np.int32, copy=False)
+        source_inputs = np.concatenate(source_chunks).astype(np.int32, copy=False)
+        position_ids = np.concatenate(position_chunks, axis=0).astype(np.int32, copy=False)
+        seq_shape = (len(pair_entries), 2, max_pair_h, max_pair_w)
+        return inputs, labels, source_inputs, position_ids, seq_shape
+
+    def _apply_arc_output_mask_variable(
+        self,
+        batch: dict,
+        rng: np.random.Generator,
+    ) -> dict:
+        if "position_ids" not in batch:
+            raise ValueError("ARC output masking requires position_ids in the batch.")
+
+        masked_samples = []
+        label_samples = []
+        source_samples = []
+        position_samples = []
+        seq_lengths = []
+        seq_shapes = []
+
+        seq_offsets = batch["seq_offsets"].astype(np.int32, copy=False)
+        for sample_idx in range(batch["puzzle_identifiers"].shape[0]):
+            start = int(seq_offsets[sample_idx])
+            end = int(seq_offsets[sample_idx + 1])
+            pair_entries = self._extract_arc_pair_entries(
+                batch["inputs"][start:end],
+                batch["position_ids"][start:end],
+                rng=rng,
+            )
+            if not pair_entries:
+                raise ValueError("ARC output masking found an empty sample with no valid pair entries.")
+
+            target_pair_id = int(pair_entries[int(rng.integers(len(pair_entries)))][0])
+            fill_token = self._arc_mask_fill_token(rng)
+            (
+                sample_inputs,
+                sample_labels,
+                sample_source_inputs,
+                sample_position_ids,
+                seq_shape,
+            ) = self._build_arc_masked_variable_sample(
+                pair_entries=pair_entries,
+                target_pair_id=target_pair_id,
+                fill_token=fill_token,
+            )
+            masked_samples.append(sample_inputs)
+            label_samples.append(sample_labels)
+            source_samples.append(sample_source_inputs)
+            position_samples.append(sample_position_ids)
+            seq_lengths.append(sample_inputs.shape[0])
+            seq_shapes.append(seq_shape)
+
+        batch["inputs"] = np.concatenate(masked_samples).astype(np.int32, copy=False)
+        batch["labels"] = np.concatenate(label_samples).astype(np.int32, copy=False)
+        cfg = self._arc_output_mask_cfg()
+        if cfg is not None and cfg.preserve_source_inputs:
+            batch["source_inputs"] = np.concatenate(source_samples).astype(np.int32, copy=False)
+        batch["position_ids"] = np.concatenate(position_samples, axis=0).astype(np.int32, copy=False)
+        batch["seq_lengths"] = np.array(seq_lengths, dtype=np.int32)
+        batch["seq_offsets"] = np.concatenate(
+            [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
+        )
+        batch["seq_shapes"] = np.array(seq_shapes, dtype=np.int32)
+        return batch
+
+    def _apply_arc_output_mask_fixed(
+        self,
+        batch: dict,
+        rng: np.random.Generator,
+    ) -> dict:
+        if "position_ids" not in batch:
+            raise ValueError("ARC output masking requires position_ids in the batch.")
+
+        source_inputs = batch["inputs"].copy()
+        batch["labels"] = np.zeros_like(batch["inputs"])
+
+        for sample_idx in range(batch["inputs"].shape[0]):
+            sample_tokens = source_inputs[sample_idx]
+            sample_position_ids = batch["position_ids"][sample_idx]
+            pair_entries = self._extract_arc_pair_entries(sample_tokens, sample_position_ids, rng=rng)
+            if not pair_entries:
+                continue
+
+            target_pair_id = int(pair_entries[int(rng.integers(len(pair_entries)))][0])
+            target_mask = (
+                (sample_position_ids[:, 0] == target_pair_id)
+                & (sample_position_ids[:, 1] == 1)
+            )
+            fill_token = self._arc_mask_fill_token(rng)
+            batch["inputs"][sample_idx, target_mask] = fill_token
+            batch["labels"][sample_idx, target_mask] = source_inputs[sample_idx, target_mask]
+
+        cfg = self._arc_output_mask_cfg()
+        if cfg is not None and cfg.preserve_source_inputs:
+            batch["source_inputs"] = source_inputs
+        return batch
+
+    def _apply_arc_output_mask(
+        self,
+        batch: dict,
+        rng: np.random.Generator,
+    ) -> dict:
+        if self.metadata.variable_seq_lengths:
+            return self._apply_arc_output_mask_variable(batch, rng)
+        return self._apply_arc_output_mask_fixed(batch, rng)
+
     def _flatten_fixed_example_fields(self, batch: dict) -> dict:
         if self.metadata.variable_seq_lengths:
             return batch
@@ -258,6 +510,16 @@ class PuzzleDataset(IterableDataset):
 
         # Convert dtype
         batch = {k: v.astype(np.int32, copy=True) for k, v in batch.items()}
+
+        arc_output_mask_enabled = self._should_apply_arc_output_mask(make_masked_inputs)
+        if arc_output_mask_enabled:
+            if self.config.masked_input is not None and self.config.masked_input.enabled:
+                raise ValueError("masked_input cannot be combined with arc_output_mask on the same dataset.")
+            batch = self._apply_arc_output_mask(batch, rng)
+        elif "labels" not in batch:
+            raise ValueError(
+                f"Dataset split '{self.split}' does not contain labels, and no dynamic label generation is enabled."
+            )
 
         # Convert ignore label IDs
         if self.metadata.ignore_label_id is not None:

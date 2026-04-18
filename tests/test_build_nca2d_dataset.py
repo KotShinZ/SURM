@@ -88,6 +88,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                 state_width_min=5,
                 state_width_max=5,
                 num_colors=4,
+                out_colors=4,
                 patch_size=1,
                 answer_steps=3,
                 answer_steps_min=3,
@@ -108,9 +109,9 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
 
             with open(dataset_dir / "config.json") as f:
                 saved_config = json.load(f)
-            self.assertEqual(saved_config["final_image_shape"], [4, 5, 5])
-            self.assertEqual(saved_config["position_id_shape"], [5, 4, 5])
-            self.assertEqual(saved_config["seq_len"], 100)
+            self.assertEqual(saved_config["final_image_shape"], [3, 2, 4, 5])
+            self.assertEqual(saved_config["position_id_shape"], [3, 2, 4, 5])
+            self.assertEqual(saved_config["seq_len"], 120)
             self.assertEqual(saved_config["vocab_size"], 6)
             self.assertEqual(saved_config["resolved_out_colors"], 4)
             self.assertEqual(saved_config["resolved_state_height_min"], 4)
@@ -137,9 +138,9 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             with open(dataset_dir / "train" / "dataset.json") as f:
                 train_metadata = json.load(f)
 
-            self.assertEqual(train_inputs.shape, (3, config.seq_len))
-            self.assertEqual(train_labels.shape, (3, config.seq_len))
-            self.assertEqual(train_position_ids.shape, (3, config.seq_len, 3))
+            self.assertEqual(train_inputs.shape, (3, *config.final_image_shape))
+            self.assertEqual(train_labels.shape, (3, *config.final_image_shape))
+            self.assertEqual(train_position_ids.shape, (3, *config.final_image_shape, 4))
             self.assertEqual(train_gzip.shape, (3,))
             self.assertTrue(np.all(train_gzip == -1.0))
             self.assertEqual(train_puzzle_indices.tolist(), [0, 1, 2, 3])
@@ -150,7 +151,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(train_counts.tolist(), [2, 2, 2])
             self.assertEqual(train_input_channels.tolist(), [5, 5, 5])
             self.assertEqual(train_query_channel_indices.tolist(), [4, 4, 4])
-            self.assertEqual(train_metadata["position_id_shape"], [5, 4, 5])
+            self.assertEqual(train_metadata["position_id_shape"], [3, 2, 4, 5])
             self.assertTrue(np.all((train_inputs == 0) | (train_inputs >= config.token_offset)))
             self.assertTrue(np.all((train_labels == 0) | (train_labels >= config.token_offset)))
 
@@ -160,9 +161,10 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                 image_width=5,
                 counts=2,
                 token_offset=config.token_offset,
-                padded_height=config.final_image_shape[0],
-                padded_width=config.final_image_shape[1],
-                padded_channels=config.final_image_shape[2],
+                padded_pairs=config.final_image_shape[0],
+                padded_io_slots=config.final_image_shape[1],
+                padded_height=config.final_image_shape[2],
+                padded_width=config.final_image_shape[3],
             )
             decoded_label = extract_label_grid(
                 train_labels[0],
@@ -170,9 +172,10 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                 image_width=5,
                 counts=2,
                 token_offset=config.token_offset,
-                padded_height=config.final_image_shape[0],
-                padded_width=config.final_image_shape[1],
-                padded_channels=config.final_image_shape[2],
+                padded_pairs=config.final_image_shape[0],
+                padded_io_slots=config.final_image_shape[1],
+                padded_height=config.final_image_shape[2],
+                padded_width=config.final_image_shape[3],
             )
             self.assertEqual(decoded_input.shape, (4, 5, 5))
             self.assertEqual(decoded_label.shape, (4, 5, 1))
@@ -181,17 +184,19 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertTrue(np.all(decoded_label <= config.resolved_out_colors - 1))
             self.assertTrue(np.all(decoded_label >= 0))
 
-            input_canvas = train_inputs[0].reshape(config.final_image_shape)
-            label_canvas = train_labels[0].reshape(config.final_image_shape)
-            self.assertTrue(np.all(label_canvas[:, :, :-1] == 0))
-            self.assertTrue(np.all(label_canvas[:, :, -1] >= config.token_offset))
-            self.assertTrue(np.all(input_canvas[:, :, :-1] >= config.token_offset))
-            self.assertTrue(np.all(input_canvas[:, :, -1] >= config.token_offset))
+            input_canvas = train_inputs[0]
+            label_canvas = train_labels[0]
+            self.assertTrue(np.all(label_canvas[:2] == 0))
+            self.assertTrue(np.all(label_canvas[2, 0] == 0))
+            self.assertTrue(np.all(label_canvas[2, 1] >= config.token_offset))
+            self.assertTrue(np.all(input_canvas[:2] >= config.token_offset))
+            self.assertTrue(np.all(input_canvas[2, 0] >= config.token_offset))
+            np.testing.assert_array_equal(input_canvas[2, 0], input_canvas[2, 1])
 
-            position_grid = train_position_ids[0].reshape(*config.final_image_shape, 3)
-            np.testing.assert_array_equal(position_grid[0, 0, 0], np.array([0, 0, 0], dtype=np.int32))
-            np.testing.assert_array_equal(position_grid[3, 4, 4], np.array([4, 3, 4], dtype=np.int32))
-            np.testing.assert_array_equal(position_grid[2, 1, 3], np.array([3, 2, 1], dtype=np.int32))
+            position_grid = train_position_ids[0]
+            np.testing.assert_array_equal(position_grid[0, 0, 0, 0], np.array([0, 0, 0, 0], dtype=np.int32))
+            np.testing.assert_array_equal(position_grid[2, 1, 3, 4], np.array([2, 1, 3, 4], dtype=np.int32))
+            np.testing.assert_array_equal(position_grid[1, 1, 2, 3], np.array([1, 1, 2, 3], dtype=np.int32))
 
             dataset = PuzzleDataset(
                 PuzzleDatasetConfig(
@@ -211,7 +216,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(effective_batch_size, 2)
             self.assertEqual(tuple(batch["inputs"].shape), (2, config.seq_len))
             self.assertEqual(tuple(batch["labels"].shape), (2, config.seq_len))
-            self.assertEqual(tuple(batch["position_ids"].shape), (2, config.seq_len, 3))
+            self.assertEqual(tuple(batch["position_ids"].shape), (2, config.seq_len, 4))
             self.assertEqual(tuple(batch["puzzle_identifiers"].shape), (2,))
 
     def test_build_dataset_supports_random_heights_widths_counts(self) -> None:
@@ -229,6 +234,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                 state_width_min=5,
                 state_width_max=7,
                 num_colors=4,
+                out_colors=4,
                 patch_size=1,
                 answer_steps=4,
                 answer_steps_min=2,
@@ -256,9 +262,9 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(saved_config["resolved_answer_steps_min"], 2)
             self.assertEqual(saved_config["resolved_answer_steps_max"], 4)
             self.assertEqual(saved_config["resolved_out_colors"], 4)
-            self.assertEqual(saved_config["final_image_shape"], [6, 7, 7])
-            self.assertEqual(saved_config["position_id_shape"], [7, 6, 7])
-            self.assertEqual(saved_config["seq_len"], 294)
+            self.assertEqual(saved_config["final_image_shape"], [4, 2, 6, 7])
+            self.assertEqual(saved_config["position_id_shape"], [4, 2, 6, 7])
+            self.assertEqual(saved_config["seq_len"], 336)
 
             train_inputs = np.load(dataset_dir / "train" / "all__inputs.npy")
             train_state_heights = np.load(dataset_dir / "train" / "all__state_heights.npy")
@@ -267,7 +273,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             train_counts = np.load(dataset_dir / "train" / "all__counts.npy")
             train_input_channels = np.load(dataset_dir / "train" / "all__input_channels.npy")
 
-            self.assertEqual(train_inputs.shape, (18, 294))
+            self.assertEqual(train_inputs.shape, (18, *config.final_image_shape))
             self.assertTrue(np.all(train_state_heights >= 4))
             self.assertTrue(np.all(train_state_heights <= 6))
             self.assertTrue(np.all(train_state_widths >= 5))
@@ -289,9 +295,10 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                 image_width=int(train_state_widths[0]),
                 counts=int(train_counts[0]),
                 token_offset=config.token_offset,
-                padded_height=config.final_image_shape[0],
-                padded_width=config.final_image_shape[1],
-                padded_channels=config.final_image_shape[2],
+                padded_pairs=config.final_image_shape[0],
+                padded_io_slots=config.final_image_shape[1],
+                padded_height=config.final_image_shape[2],
+                padded_width=config.final_image_shape[3],
             )
             self.assertEqual(
                 decoded_input.shape,
@@ -354,9 +361,10 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                     image_width=config.state_width,
                     counts=counts,
                     token_offset=config.token_offset,
-                    padded_height=config.final_image_shape[0],
-                    padded_width=config.final_image_shape[1],
-                    padded_channels=config.final_image_shape[2],
+                    padded_pairs=config.final_image_shape[0],
+                    padded_io_slots=config.final_image_shape[1],
+                    padded_height=config.final_image_shape[2],
+                    padded_width=config.final_image_shape[3],
                 )
                 decoded_label = extract_label_grid(
                     train_labels[sample_idx],
@@ -364,9 +372,10 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
                     image_width=config.state_width,
                     counts=counts,
                     token_offset=config.token_offset,
-                    padded_height=config.final_image_shape[0],
-                    padded_width=config.final_image_shape[1],
-                    padded_channels=config.final_image_shape[2],
+                    padded_pairs=config.final_image_shape[0],
+                    padded_io_slots=config.final_image_shape[1],
+                    padded_height=config.final_image_shape[2],
+                    padded_width=config.final_image_shape[3],
                 )
 
                 combined = np.concatenate(
@@ -397,9 +406,9 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             max_data_seq_len=9000,
         )
 
-        self.assertEqual(config.resolved_counts_max, 7)
-        self.assertEqual(config.final_image_shape, (24, 24, 15))
-        self.assertEqual(config.seq_len, 8640)
+        self.assertEqual(config.resolved_counts_max, 6)
+        self.assertEqual(config.final_image_shape, (7, 2, 24, 24))
+        self.assertEqual(config.seq_len, 8064)
 
     def test_pair_windows_follow_answer_steps_and_span_on_same_trajectory(self) -> None:
         config = NCA2DDataConfig(
