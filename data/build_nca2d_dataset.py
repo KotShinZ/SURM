@@ -7,7 +7,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -85,6 +85,8 @@ class NCA2DDataConfig(BaseModel):
     token_offset: int = 2
     mask_token_id: int = 1
     save_dtype: str = "int32"
+    no_padding: bool = True
+    no_padding_mode: Literal["sample", "pair_eos", "pair_no_eos"] = "pair_eos"
 
     @property
     def sampled_state_height_min(self) -> int:
@@ -140,7 +142,7 @@ class NCA2DDataConfig(BaseModel):
 
     @property
     def max_counts_allowed_by_canvas(self) -> int:
-        max_tokens_per_sample = 2 * self.sampled_state_height_max * self.sampled_state_width_max
+        max_tokens_per_sample = 2 * self.max_pair_canvas_height * self.max_pair_canvas_width
         if max_tokens_per_sample <= 0:
             return 0
         return max(self.max_data_seq_len // max_tokens_per_sample - 1, 0)
@@ -162,8 +164,8 @@ class NCA2DDataConfig(BaseModel):
         return (
             self.max_pair_slots,
             2,
-            self.sampled_state_height_max,
-            self.sampled_state_width_max,
+            self.max_pair_canvas_height,
+            self.max_pair_canvas_width,
         )
 
     @property
@@ -174,6 +176,22 @@ class NCA2DDataConfig(BaseModel):
     @property
     def position_id_shape(self) -> tuple[int, int, int, int]:
         return self.final_image_shape
+
+    @property
+    def max_pair_canvas_height(self) -> int:
+        return self.sampled_state_height_max + (
+            1 if self.no_padding and self.no_padding_mode == "pair_eos" else 0
+        )
+
+    @property
+    def max_pair_canvas_width(self) -> int:
+        return self.sampled_state_width_max + (
+            1 if self.no_padding and self.no_padding_mode == "pair_eos" else 0
+        )
+
+    @property
+    def sequence_layout(self) -> str:
+        return self.no_padding_mode if self.no_padding else "fixed"
 
     @property
     def vocab_size(self) -> int:
@@ -320,11 +338,14 @@ class NCA2DDataConfig(BaseModel):
                 "mask_token_id must be in the reserved token range [1, token_offset), "
                 f"got mask_token_id={self.mask_token_id}, token_offset={self.token_offset}"
             )
+        if not self.no_padding and self.no_padding_mode != "sample":
+            raise ValueError("no_padding_mode is only used when no_padding=True.")
         if self.max_counts_allowed_by_canvas < 1:
             raise ValueError(
                 "The maximum HxW canvas already exceeds the max_data_seq_len cap for a single "
-                f"example count: state_height_max={self.sampled_state_height_max}, "
-                f"state_width_max={self.sampled_state_width_max}, max_data_seq_len={self.max_data_seq_len}"
+                f"example count: pair_canvas_height_max={self.max_pair_canvas_height}, "
+                f"pair_canvas_width_max={self.max_pair_canvas_width}, "
+                f"max_data_seq_len={self.max_data_seq_len}"
             )
         return self
 
@@ -616,6 +637,127 @@ def pair_windows_to_input_label_grids_batched(
     return torch.cat([example_channels, query_input], dim=-1), target_label
 
 
+def _make_sample_position_ids(
+    num_pair_slots: int,
+    canvas_shape: Tuple[int, int],
+    *,
+    dtype: np.dtype = np.int32,
+) -> np.ndarray:
+    canvas_h, canvas_w = canvas_shape
+    return np.moveaxis(
+        np.indices((num_pair_slots, 2, canvas_h, canvas_w), dtype=dtype),
+        0,
+        -1,
+    )
+
+
+def _token_to_debug_symbol(token: int, token_offset: int) -> str:
+    token = int(token)
+    if token == 0:
+        return "."
+    if token == 1:
+        return "#"
+    return str(token - token_offset)
+
+
+def _format_debug_grid(grid: np.ndarray, token_offset: int) -> str:
+    return "\n".join(
+        " ".join(_token_to_debug_symbol(token, token_offset) for token in row)
+        for row in grid
+    )
+
+
+def _print_terminal_friendly_arc_sample(
+    flat_tokens: np.ndarray,
+    position_ids: np.ndarray,
+    sample_name: str,
+    *,
+    token_offset: int = 2,
+    seq_shape: Optional[Tuple[int, ...]] = None,
+) -> None:
+    print(f"{sample_name}:")
+
+    if flat_tokens.size == 0:
+        print("  empty sample")
+        return
+
+    if flat_tokens.ndim == 4:
+        flat_tokens = flat_tokens.reshape(-1)
+    if position_ids.ndim == 5 and position_ids.shape[-1] == 4:
+        position_ids = position_ids.reshape(-1, 4)
+
+    if flat_tokens.ndim != 1:
+        print(f"  unexpected token shape={flat_tokens.shape}; falling back to raw print")
+        print(flat_tokens)
+        return
+
+    if position_ids.ndim != 2 or position_ids.shape != (flat_tokens.shape[0], 4):
+        print(
+            f"  unexpected position_ids shape={position_ids.shape}; "
+            f"expected ({flat_tokens.shape[0]}, 4), falling back to raw print"
+        )
+        print(flat_tokens)
+        return
+
+    pair_ids = np.unique(position_ids[:, 0]).astype(np.int32, copy=False)
+    seq_shape_repr = seq_shape if seq_shape is not None else "unknown"
+    print(f"  packed_len={flat_tokens.shape[0]}, seq_shape={seq_shape_repr}, pair_slots={len(pair_ids)}")
+    print("  legend: .=PAD  #=EOS  other values=encoded NCA colors")
+
+    for pair_pos in pair_ids:
+        print(f"  pair {int(pair_pos)}:")
+        for io_idx, io_name in enumerate(("input", "output")):
+            mask = (position_ids[:, 0] == pair_pos) & (position_ids[:, 1] == io_idx)
+            if not np.any(mask):
+                continue
+
+            coords = position_ids[mask][:, 2:].astype(np.int32, copy=False)
+            grid_h = int(coords[:, 0].max()) + 1
+            grid_w = int(coords[:, 1].max()) + 1
+            grid = np.zeros((grid_h, grid_w), dtype=flat_tokens.dtype)
+            grid[coords[:, 0], coords[:, 1]] = flat_tokens[mask]
+
+            print(f"    {io_name} shape=({grid_h}, {grid_w})")
+            for line in _format_debug_grid(grid, token_offset).splitlines():
+                print(f"      {line}")
+
+
+def _build_pair_window_canvas_batched(
+    pair_window_sets: torch.Tensor,
+    *,
+    token_offset: int,
+    include_eos: bool,
+) -> tuple[torch.Tensor, int, int]:
+    if pair_window_sets.ndim != 5:
+        raise ValueError(
+            f"pair_window_sets must have shape [B, N, 2, H, W], got ndim={pair_window_sets.ndim}"
+        )
+
+    batch_size, pair_slots, io_slots, image_height, image_width = pair_window_sets.shape
+    if io_slots != 2:
+        raise ValueError(
+            f"pair_window_sets third axis must be 2, got shape={tuple(pair_window_sets.shape)}"
+        )
+
+    canvas_height = image_height + (1 if include_eos else 0)
+    canvas_width = image_width + (1 if include_eos else 0)
+    device = pair_window_sets.device
+    dtype = torch.int32
+
+    canvas = torch.zeros(
+        (batch_size, pair_slots, io_slots, canvas_height, canvas_width),
+        dtype=dtype,
+        device=device,
+    )
+    canvas[:, :, :, :image_height, :image_width] = pair_window_sets.to(dtype=dtype) + token_offset
+
+    if include_eos:
+        canvas[:, :, :, image_height, :image_width] = 1
+        canvas[:, :, :, :image_height, image_width] = 1
+
+    return canvas, canvas_height, canvas_width
+
+
 def sample_output_color_maps_batched(
     *,
     batch_size: int,
@@ -861,7 +1003,8 @@ def build_sample_arrays_batched(
     pair_window_sets: torch.Tensor,
     *,
     config: NCA2DDataConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    store_all_pairs: bool,
+) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
     if pair_window_sets.ndim != 5:
         raise ValueError(
             f"pair_window_sets must have shape [B, N, 2, H, W], got ndim={pair_window_sets.ndim}"
@@ -872,21 +1015,6 @@ def build_sample_arrays_batched(
         )
 
     batch_size, pair_slots, io_slots, image_height, image_width = pair_window_sets.shape
-    padded_pairs, padded_io_slots, padded_height, padded_width = config.final_image_shape
-    if (
-        pair_slots > padded_pairs
-        or io_slots > padded_io_slots
-        or image_height > padded_height
-        or image_width > padded_width
-    ):
-        raise ValueError(
-            "pair_window_sets must fit inside the fixed dataset canvas, "
-            f"got image_shape={(pair_slots, io_slots, image_height, image_width)} and "
-            f"padded_shape={config.final_image_shape}"
-        )
-
-    device = pair_window_sets.device
-    dtype = torch.int32
     example_count = pair_slots - 1
     if example_count <= 0:
         raise ValueError(
@@ -894,38 +1022,98 @@ def build_sample_arrays_batched(
             f"got shape={tuple(pair_window_sets.shape)}"
         )
 
-    encoded_pairs = pair_window_sets.to(dtype=dtype) + config.token_offset
+    include_eos = config.no_padding and config.no_padding_mode == "pair_eos"
+    encoded_pairs, canvas_height, canvas_width = _build_pair_window_canvas_batched(
+        pair_window_sets,
+        token_offset=config.token_offset,
+        include_eos=include_eos,
+    )
+
+    device = pair_window_sets.device
+    dtype = torch.int32
+    pair_axis = pair_slots if config.no_padding else config.max_pair_slots
+    io_axis = 2
+    height_axis = canvas_height if config.no_padding else config.max_pair_canvas_height
+    width_axis = canvas_width if config.no_padding else config.max_pair_canvas_width
+
+    if (
+        pair_slots > pair_axis
+        or io_slots > io_axis
+        or canvas_height > height_axis
+        or canvas_width > width_axis
+    ):
+        raise ValueError(
+            "pair_window_sets must fit inside the requested dataset canvas, "
+            f"got image_shape={(pair_slots, io_slots, canvas_height, canvas_width)} and "
+            f"padded_shape={(pair_axis, io_axis, height_axis, width_axis)}"
+        )
+
     input_canvas = torch.zeros(
-        (batch_size, padded_pairs, padded_io_slots, padded_height, padded_width),
+        (batch_size, pair_axis, io_axis, height_axis, width_axis),
         dtype=dtype,
         device=device,
     )
-    label_canvas = torch.zeros_like(input_canvas)
+    label_canvas = None
 
-    if example_count > 0:
-        input_canvas[:, :example_count, :, :image_height, :image_width] = encoded_pairs[:, :example_count]
+    if store_all_pairs:
+        input_canvas[:, :pair_slots, :, :canvas_height, :canvas_width] = encoded_pairs
+    else:
+        label_canvas = torch.zeros_like(input_canvas)
+        if example_count > 0:
+            input_canvas[:, :example_count, :, :canvas_height, :canvas_width] = encoded_pairs[:, :example_count]
 
-    query_inputs = encoded_pairs[:, example_count, 0]
-    query_outputs = encoded_pairs[:, example_count, 1]
-    input_canvas[:, example_count, 0, :image_height, :image_width] = query_inputs
-    input_canvas[:, example_count, 1, :image_height, :image_width] = query_inputs
-    label_canvas[:, example_count, 1, :image_height, :image_width] = query_outputs
+        query_inputs = encoded_pairs[:, example_count, 0]
+        query_outputs = encoded_pairs[:, example_count, 1]
+        input_canvas[:, example_count, 0, :canvas_height, :canvas_width] = query_inputs
+        input_canvas[:, example_count, 1, :canvas_height, :canvas_width] = query_inputs
+        label_canvas[:, example_count, 1, :canvas_height, :canvas_width] = query_outputs
 
     position_ids = torch.stack(
         torch.meshgrid(
-            torch.arange(padded_pairs, dtype=dtype, device=device),
-            torch.arange(padded_io_slots, dtype=dtype, device=device),
-            torch.arange(padded_height, dtype=dtype, device=device),
-            torch.arange(padded_width, dtype=dtype, device=device),
+            torch.arange(pair_axis, dtype=dtype, device=device),
+            torch.arange(io_axis, dtype=dtype, device=device),
+            torch.arange(height_axis, dtype=dtype, device=device),
+            torch.arange(width_axis, dtype=dtype, device=device),
             indexing="ij",
         ),
         dim=-1,
     ).unsqueeze(0).expand(batch_size, -1, -1, -1, -1, -1)
 
+    seq_shape = np.tile(
+        np.array(
+            [
+                pair_slots if config.no_padding else pair_axis,
+                io_axis,
+                canvas_height if config.no_padding else height_axis,
+                canvas_width if config.no_padding else width_axis,
+            ],
+            dtype=np.int32,
+        ),
+        (batch_size, 1),
+    )
+
+    if config.no_padding:
+        flat_inputs = input_canvas[:, :pair_slots, :, :canvas_height, :canvas_width].reshape(batch_size, -1)
+        flat_position_ids = position_ids[:, :pair_slots, :, :canvas_height, :canvas_width].reshape(
+            batch_size,
+            -1,
+            4,
+        )
+        flat_labels = None
+        if label_canvas is not None:
+            flat_labels = label_canvas[:, :pair_slots, :, :canvas_height, :canvas_width].reshape(batch_size, -1)
+        return (
+            flat_inputs.cpu().numpy(),
+            None if flat_labels is None else flat_labels.cpu().numpy(),
+            flat_position_ids.cpu().numpy(),
+            seq_shape,
+        )
+
     return (
         input_canvas.cpu().numpy(),
-        label_canvas.cpu().numpy(),
+        None if label_canvas is None else label_canvas.cpu().numpy(),
         position_ids.cpu().numpy(),
+        seq_shape,
     )
 
 
@@ -971,47 +1159,73 @@ def _allocate_examples_per_shape_group(
     return allocated
 
 
-def _shuffle_split_arrays(
-    split_arrays: Dict[str, np.ndarray],
-    rng: np.random.Generator,
-) -> Dict[str, np.ndarray]:
-    if not split_arrays:
-        return split_arrays
-
-    num_examples = int(split_arrays["inputs"].shape[0])
-    if num_examples <= 1:
-        return split_arrays
-
-    permutation = rng.permutation(num_examples)
-    shuffled: Dict[str, np.ndarray] = {}
-    for key, value in split_arrays.items():
-        if isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] == num_examples:
-            shuffled[key] = value[permutation]
-        else:
-            shuffled[key] = value
-    return shuffled
-
-
 def _make_split_arrays(
     flat_inputs: list[np.ndarray],
-    flat_labels: list[np.ndarray],
+    flat_labels: Optional[list[np.ndarray]],
     position_ids: list[np.ndarray],
+    seq_shapes: Optional[list[np.ndarray]],
     gzip_scores: list[float],
     state_heights: list[int],
     state_widths: list[int],
     answer_steps: list[int],
     counts: list[int],
     config: NCA2DDataConfig,
-) -> Dict[str, np.ndarray]:
+) -> tuple[Dict[str, np.ndarray], dict[str, Optional[list[int]] | int | bool]]:
     num_examples = len(flat_inputs)
+    save_labels = flat_labels is not None
 
-    inputs = np.stack(flat_inputs, axis=0).astype(config.save_dtype, copy=False)
-    labels = np.stack(flat_labels, axis=0).astype(config.save_dtype, copy=False)
+    if config.no_padding:
+        seq_lengths = np.asarray([sample.shape[0] for sample in flat_inputs], dtype=np.int64)
+        seq_offsets = np.concatenate(
+            [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
+        )
+        inputs = (
+            np.concatenate(flat_inputs, axis=0).astype(config.save_dtype, copy=False)
+            if flat_inputs
+            else np.empty((0,), dtype=config.save_dtype)
+        )
+        position_id_array = (
+            np.concatenate(position_ids, axis=0).astype(np.int32, copy=False)
+            if position_ids
+            else np.empty((0, 4), dtype=np.int32)
+        )
+        labels = None
+        if flat_labels is not None:
+            labels = (
+                np.concatenate(flat_labels, axis=0).astype(config.save_dtype, copy=False)
+                if flat_labels
+                else np.empty((0,), dtype=config.save_dtype)
+            )
+        split_max_seq_len = int(seq_lengths.max()) if seq_lengths.size > 0 else 0
+        split_position_id_shape = (
+            (position_id_array.max(axis=0).astype(np.int32) + 1).tolist()
+            if position_id_array.size > 0
+            else None
+        )
+    else:
+        inputs = (
+            np.stack(flat_inputs, axis=0).astype(config.save_dtype, copy=False)
+            if flat_inputs
+            else np.empty((0, *config.final_image_shape), dtype=config.save_dtype)
+        )
+        position_id_array = (
+            np.stack(position_ids, axis=0).astype(np.int32, copy=False)
+            if position_ids
+            else np.empty((0, *config.final_image_shape, 4), dtype=np.int32)
+        )
+        labels = None
+        if flat_labels is not None:
+            labels = (
+                np.stack(flat_labels, axis=0).astype(config.save_dtype, copy=False)
+                if flat_labels
+                else np.empty((0, *config.final_image_shape), dtype=config.save_dtype)
+            )
+        split_max_seq_len = int(config.seq_len)
+        split_position_id_shape = list(config.position_id_shape) if num_examples > 0 else None
 
-    return {
+    arrays = {
         "inputs": inputs,
-        "labels": labels,
-        "position_ids": np.stack(position_ids, axis=0).astype(np.int32, copy=False),
+        "position_ids": position_id_array,
         "puzzle_identifiers": np.zeros((num_examples,), dtype=np.int32),
         "puzzle_indices": np.arange(num_examples + 1, dtype=np.int32),
         "group_indices": np.arange(num_examples + 1, dtype=np.int32),
@@ -1029,6 +1243,23 @@ def _make_split_arrays(
             dtype=np.int32,
         ),
     }
+    if labels is not None:
+        arrays["labels"] = labels
+    if config.no_padding:
+        arrays["seq_offsets"] = seq_offsets
+        arrays["seq_shapes"] = (
+            np.asarray(seq_shapes, dtype=np.int32)
+            if seq_shapes is not None
+            else np.empty((0, 4), dtype=np.int32)
+        )
+
+    stats: dict[str, Optional[list[int]] | int | bool] = {
+        "num_examples": num_examples,
+        "save_labels": save_labels,
+        "seq_len": split_max_seq_len,
+        "position_id_shape": split_position_id_shape,
+    }
+    return arrays, stats
 
 
 def _candidate_batch_size_for_group(
@@ -1039,7 +1270,9 @@ def _candidate_batch_size_for_group(
     counts: int,
     target_group_size: int,
 ) -> int:
-    per_sample_cells = state_height * state_width * max(2 * (counts + 1), 1)
+    canvas_height = state_height + (1 if config.no_padding and config.no_padding_mode == "pair_eos" else 0)
+    canvas_width = state_width + (1 if config.no_padding and config.no_padding_mode == "pair_eos" else 0)
+    per_sample_cells = canvas_height * canvas_width * max(2 * (counts + 1), 1)
     adaptive_cap = max(1, config.max_cells_per_candidate_batch // max(per_sample_cells, 1))
     return max(
         1,
@@ -1068,15 +1301,22 @@ def _summarize_gzip(values: np.ndarray) -> dict[str, Optional[float]]:
     }
 
 
-def generate_split(split_name: str, size: int, seed: int, config: NCA2DDataConfig) -> Dict[str, np.ndarray]:
+def generate_split(
+    split_name: str,
+    size: int,
+    seed: int,
+    config: NCA2DDataConfig,
+) -> tuple[Dict[str, np.ndarray], dict[str, Optional[list[int]] | int | bool]]:
     seed_everything(seed)
     device = get_device()
     _configure_generation_backend(device)
     rng = np.random.default_rng(seed)
+    store_all_pairs = split_name == "train"
 
     flat_inputs: list[np.ndarray] = []
-    flat_labels: list[np.ndarray] = []
+    flat_labels: Optional[list[np.ndarray]] = [] if not store_all_pairs else None
     split_position_ids: list[np.ndarray] = []
+    split_seq_shapes: Optional[list[np.ndarray]] = [] if config.no_padding else None
     gzip_scores: list[float] = []
     state_heights: list[int] = []
     state_widths: list[int] = []
@@ -1162,14 +1402,20 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA2DDataConfi
                 accepted_pair_window_sets,
                 config=config,
             )
-            batch_inputs, batch_labels, batch_position_ids = build_sample_arrays_batched(
+            batch_inputs, batch_labels, batch_position_ids, batch_seq_shapes = build_sample_arrays_batched(
                 accepted_pair_window_sets,
                 config=config,
+                store_all_pairs=store_all_pairs,
             )
 
             flat_inputs.extend(batch_inputs)
-            flat_labels.extend(batch_labels)
+            if flat_labels is not None:
+                if batch_labels is None:
+                    raise RuntimeError("Expected labels for non-train split, but build_sample_arrays_batched returned None.")
+                flat_labels.extend(batch_labels)
             split_position_ids.extend(batch_position_ids)
+            if split_seq_shapes is not None:
+                split_seq_shapes.extend(batch_seq_shapes)
             gzip_scores.extend(accepted_scores.tolist())
             state_heights.extend([int(sampled_state_height)] * accepted_indices.size)
             state_widths.extend([int(sampled_state_width)] * accepted_indices.size)
@@ -1195,10 +1441,43 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA2DDataConfi
             f"Expected to collect exactly {size} {split_name} examples, but got {len(flat_inputs)}."
         )
 
-    split_arrays = _make_split_arrays(
+    if size > 1:
+        permutation = rng.permutation(size).tolist()
+        flat_inputs = [flat_inputs[idx] for idx in permutation]
+        split_position_ids = [split_position_ids[idx] for idx in permutation]
+        gzip_scores = [gzip_scores[idx] for idx in permutation]
+        state_heights = [state_heights[idx] for idx in permutation]
+        state_widths = [state_widths[idx] for idx in permutation]
+        sampled_answer_steps = [sampled_answer_steps[idx] for idx in permutation]
+        counts = [counts[idx] for idx in permutation]
+        if flat_labels is not None:
+            flat_labels = [flat_labels[idx] for idx in permutation]
+        if split_seq_shapes is not None:
+            split_seq_shapes = [split_seq_shapes[idx] for idx in permutation]
+
+    if flat_inputs:
+        seq_shape = tuple(int(x) for x in (split_seq_shapes[0] if split_seq_shapes is not None else flat_inputs[0].shape))
+        _print_terminal_friendly_arc_sample(
+            flat_inputs[0],
+            split_position_ids[0],
+            f"{split_name}/inputs[0]",
+            token_offset=config.token_offset,
+            seq_shape=seq_shape,
+        )
+        if flat_labels is not None:
+            _print_terminal_friendly_arc_sample(
+                flat_labels[0],
+                split_position_ids[0],
+                f"{split_name}/labels[0]",
+                token_offset=config.token_offset,
+                seq_shape=seq_shape,
+            )
+
+    split_arrays, split_stats = _make_split_arrays(
         flat_inputs,
         flat_labels,
         split_position_ids,
+        split_seq_shapes,
         gzip_scores,
         state_heights,
         state_widths,
@@ -1206,21 +1485,21 @@ def generate_split(split_name: str, size: int, seed: int, config: NCA2DDataConfi
         counts,
         config,
     )
-    return _shuffle_split_arrays(split_arrays, rng)
+    return split_arrays, split_stats
 
 
-def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA2DDataConfig) -> None:
+def save_split(
+    split_name: str,
+    split_arrays: Dict[str, np.ndarray],
+    split_stats: dict[str, Optional[list[int]] | int | bool],
+    config: NCA2DDataConfig,
+) -> None:
     split_dir = Path(config.output_dir) / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
-
-    split_position_id_shape = (
-        split_arrays["position_ids"].max(axis=tuple(range(split_arrays["position_ids"].ndim - 1))).astype(np.int32) + 1
-        if split_arrays["position_ids"].size > 0
-        else None
-    )
+    save_labels = bool(split_stats["save_labels"])
 
     metadata = PuzzleDatasetMetadata(
-        seq_len=config.seq_len,
+        seq_len=int(split_stats["seq_len"]),
         vocab_size=config.vocab_size,
         pad_id=0,
         ignore_label_id=0,
@@ -1229,15 +1508,22 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
         total_groups=split_arrays["group_indices"].size - 1,
         mean_puzzle_examples=1.0,
         sets=["all"],
-        position_id_shape=split_position_id_shape.tolist() if split_position_id_shape is not None else None,
+        variable_seq_lengths=config.no_padding,
+        position_id_shape=split_stats["position_id_shape"],
+        sequence_layout=config.sequence_layout,
+        train_target_mode="random_output_pair" if split_name == "train" else None,
     )
 
     with open(split_dir / "dataset.json", "w") as f:
         json.dump(metadata.model_dump(), f, indent=2)
 
     np.save(split_dir / "all__inputs.npy", split_arrays["inputs"])
-    np.save(split_dir / "all__labels.npy", split_arrays["labels"])
+    if save_labels:
+        np.save(split_dir / "all__labels.npy", split_arrays["labels"])
     np.save(split_dir / "all__position_ids.npy", split_arrays["position_ids"])
+    if config.no_padding:
+        np.save(split_dir / "all__seq_offsets.npy", split_arrays["seq_offsets"])
+        np.save(split_dir / "all__seq_shapes.npy", split_arrays["seq_shapes"])
     np.save(split_dir / "all__puzzle_identifiers.npy", split_arrays["puzzle_identifiers"])
     np.save(split_dir / "all__puzzle_indices.npy", split_arrays["puzzle_indices"])
     np.save(split_dir / "all__group_indices.npy", split_arrays["group_indices"])
@@ -1254,9 +1540,12 @@ def save_split(split_name: str, split_arrays: Dict[str, np.ndarray], config: NCA
         json.dump(
             {
                 "split": split_name,
-                "num_examples": int(split_arrays["inputs"].shape[0]),
-                "seq_len": int(config.seq_len),
+                "num_examples": int(split_stats["num_examples"]),
+                "seq_len": int(split_stats["seq_len"]),
                 "final_image_shape": list(config.final_image_shape),
+                "variable_seq_lengths": config.no_padding,
+                "sequence_layout": config.sequence_layout,
+                "save_labels": save_labels,
                 **gzip_summary,
                 "state_height_min": int(split_arrays["state_heights"].min()),
                 "state_height_max": int(split_arrays["state_heights"].max()),
@@ -1292,22 +1581,29 @@ def save_dataset_config(config: NCA2DDataConfig) -> None:
                 "resolved_answer_steps_max": config.sampled_answer_steps_max,
                 "resolved_counts_max": config.resolved_counts_max,
                 "resolved_out_colors": config.resolved_out_colors,
+                "max_pair_canvas_height": config.max_pair_canvas_height,
+                "max_pair_canvas_width": config.max_pair_canvas_width,
                 "max_pair_slots": config.max_pair_slots,
                 "max_input_channels": config.max_input_channels,
                 "seq_len": config.seq_len,
                 "vocab_size": config.vocab_size,
                 "final_image_shape": list(config.final_image_shape),
                 "position_id_shape": list(config.position_id_shape),
+                "variable_seq_lengths": config.no_padding,
+                "sequence_layout": config.sequence_layout,
                 "sample_random_state_height": config.sampled_state_height_min != config.sampled_state_height_max,
                 "sample_random_state_width": config.sampled_state_width_min != config.sampled_state_width_max,
                 "sample_random_answer_steps": config.sampled_answer_steps_min != config.sampled_answer_steps_max,
                 "sample_random_counts": config.sampled_counts_min != config.resolved_counts_max,
                 "pair_layout": {
                     "stored_shape": ["num_pairs", "question_answer", "H", "W"],
-                    "num_pairs": "counts + 1 (examples + final query)",
+                    "train_split": "stores all counts + 1 pairs without labels; one output pair is selected dynamically during training",
+                    "eval_split": "stores counts context pairs plus one labeled query pair",
+                    "num_pairs": "counts + 1 sampled temporal pairs",
                     "question_answer": ["question", "answer"],
+                    "train_pair_content": "all pairs are saved as-is",
                     "target_pair_input": ["query_input", "query_input_copy"],
-                    "target_pair_label": "stored only at [query_pair, answer]",
+                    "target_pair_label": "stored only for eval samples at [query_pair, answer]",
                 },
                 "legacy_channel_view": {
                     "input_shape": ["H", "W", "2 * counts + 1"],
@@ -1392,6 +1688,7 @@ def benchmark_generation(
         build_sample_arrays_batched(
             pair_windows,
             config=config,
+            store_all_pairs=True,
         )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1417,6 +1714,7 @@ def benchmark_generation(
         build_sample_arrays_batched(
             pair_windows,
             config=config,
+            store_all_pairs=True,
         )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1444,11 +1742,11 @@ def benchmark_generation(
 def build_dataset(config: NCA2DDataConfig) -> None:
     save_dataset_config(config)
 
-    train_arrays = generate_split("train", config.train_size, config.seed, config)
-    save_split("train", train_arrays, config)
+    train_arrays, train_stats = generate_split("train", config.train_size, config.seed, config)
+    save_split("train", train_arrays, train_stats, config)
 
-    test_arrays = generate_split("test", config.test_size, config.seed + 1, config)
-    save_split("test", test_arrays, config)
+    test_arrays, test_stats = generate_split("test", config.test_size, config.seed + 1, config)
+    save_split("test", test_arrays, test_stats, config)
 
 
 @cli.command(singleton=True)

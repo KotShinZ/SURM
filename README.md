@@ -110,8 +110,8 @@ python data/build_nca1d_dataset.py \
 # NCA-2D
 python data/build_nca2d_dataset.py \
   --output-dir data/nca2d-1k \
-  --train-size 800 \
-  --test-size 200 \
+  --train-size 1000000 \
+  --test-size 10000 \
   --state-height 12 \
   --state-height-min 8 \
   --state-height-max 12 \

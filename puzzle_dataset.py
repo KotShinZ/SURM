@@ -278,13 +278,13 @@ class PuzzleDataset(IterableDataset):
             return ARCOutputMaskConfig()
         return None
 
-    def _arc_answer_slot_size(self) -> int:
+    def _arc_answer_slot_size(self) -> Optional[int]:
         cfg = self._arc_output_mask_cfg()
         if cfg is not None and cfg.answer_slot_max_grid_size is not None:
             return int(cfg.answer_slot_max_grid_size)
         if self.metadata.answer_slot_max_grid_size is not None:
             return int(self.metadata.answer_slot_max_grid_size)
-        return 30
+        return None
 
     def _arc_mask_fill_token(self, rng: np.random.Generator) -> int:
         cfg = self._arc_output_mask_cfg()
@@ -364,10 +364,15 @@ class PuzzleDataset(IterableDataset):
             max_pair_w = max(max_pair_w, inp_canvas.shape[1])
 
             if pair_id == target_pair_id:
-                masked_out = np.full((answer_slot_size, answer_slot_size), fill_token, dtype=np.int32)
-                label_out = np.zeros((answer_slot_size, answer_slot_size), dtype=np.int32)
-                label_out[: out_canvas.shape[0], : out_canvas.shape[1]] = out_canvas
-                source_out = label_out
+                if answer_slot_size is None:
+                    masked_out = np.full(out_canvas.shape, fill_token, dtype=np.int32)
+                    label_out = out_canvas.astype(np.int32, copy=False)
+                    source_out = out_canvas.astype(np.int32, copy=False)
+                else:
+                    masked_out = np.full((answer_slot_size, answer_slot_size), fill_token, dtype=np.int32)
+                    label_out = np.zeros((answer_slot_size, answer_slot_size), dtype=np.int32)
+                    label_out[: out_canvas.shape[0], : out_canvas.shape[1]] = out_canvas
+                    source_out = label_out
             else:
                 masked_out = out_canvas.astype(np.int32, copy=False)
                 label_out = np.zeros_like(masked_out)
