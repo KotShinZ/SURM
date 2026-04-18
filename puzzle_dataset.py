@@ -236,7 +236,26 @@ class PuzzleDataset(IterableDataset):
 
         return masked_inputs
 
+    def _flatten_fixed_example_fields(self, batch: dict) -> dict:
+        if self.metadata.variable_seq_lengths:
+            return batch
+
+        for key in ("inputs", "labels", "source_inputs"):
+            if key in batch and batch[key].ndim > 2:
+                batch[key] = batch[key].reshape(batch[key].shape[0], -1)
+
+        if "position_ids" in batch and batch["position_ids"].ndim > 3:
+            batch["position_ids"] = batch["position_ids"].reshape(
+                batch["position_ids"].shape[0],
+                -1,
+                batch["position_ids"].shape[-1],
+            )
+
+        return batch
+
     def _collate_batch(self, batch, rng: np.random.Generator, make_masked_inputs: bool = True):
+        batch = self._flatten_fixed_example_fields(batch)
+
         # Convert dtype
         batch = {k: v.astype(np.int32, copy=True) for k, v in batch.items()}
 

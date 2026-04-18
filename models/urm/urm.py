@@ -13,6 +13,7 @@ from models.layers import (
     RotaryEmbedding,
     RotaryEmbedding2D,
     RotaryEmbedding3D,
+    RotaryEmbedding4D,
     CosSin,
     CastedEmbedding,
     CastedLinear,
@@ -73,6 +74,7 @@ class URMConfig(BaseModel):
     num_heads: int
     pos_encodings: str
     grid_depth: int = 0  # Grid depth for 3D RoPE (0 = use 2D/1D RoPE)
+    grid_io: int = 0  # Input/output slot axis for 4D RoPE (0 = use 3D/2D/1D RoPE)
     grid_height: int = 0  # Grid height for 2D RoPE (0 = use 1D RoPE)
     grid_width: int = 0   # Grid width  for 2D RoPE (0 = use 1D RoPE)
     attn_dropout: float = 0.0
@@ -181,6 +183,7 @@ class URM_Inner(nn.Module):
         self.patch_area = self.config.patch_height * self.config.patch_width
         self.inner_seq_len = self.config.seq_len
         self.inner_grid_depth = self.config.grid_depth
+        self.inner_grid_io = self.config.grid_io
         self.inner_grid_height = self.config.grid_height
         self.inner_grid_width = self.config.grid_width
         self.padded_grid_height = self.config.grid_height
@@ -204,6 +207,7 @@ class URM_Inner(nn.Module):
         config_updates = dict(
             seq_len=self.inner_seq_len,
             grid_depth=self.inner_grid_depth,
+            grid_io=self.inner_grid_io,
             grid_height=self.inner_grid_height,
             grid_width=self.inner_grid_width,
         )
@@ -240,6 +244,21 @@ class URM_Inner(nn.Module):
             )
 
         if (
+            self.inner_config.grid_depth > 0
+            and self.inner_config.grid_io > 0
+            and self.inner_config.grid_height > 0
+            and self.inner_config.grid_width > 0
+        ):
+            self.rotary_emb = RotaryEmbedding4D(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_depth=self.inner_config.grid_depth,
+                grid_io=self.inner_config.grid_io,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
+                puzzle_emb_len=self.puzzle_emb_len,
+                base=self.inner_config.rope_theta,
+            )
+        elif (
             self.inner_config.grid_depth > 0
             and self.inner_config.grid_height > 0
             and self.inner_config.grid_width > 0
@@ -288,7 +307,8 @@ class URM_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
             
-        self.generator = torch.Generator(device="cuda").manual_seed(self.config.noise_seed)
+        generator_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.generator = torch.Generator(device=generator_device).manual_seed(self.config.noise_seed)
 
     def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim == 3:
@@ -483,6 +503,10 @@ class URM_Inner(nn.Module):
         return embedding, token_indices
 
     def _rotary_cos_sin_packed(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> CosSin:
+        if isinstance(self.rotary_emb, RotaryEmbedding4D):
+            position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
+            return self._pack_rotary_axes(self.rotary_emb.lookup(position_ids), batch, token_indices)
+
         if isinstance(self.rotary_emb, RotaryEmbedding3D):
             position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
             return self._pack_rotary_axes(self.rotary_emb.lookup(position_ids), batch, token_indices)
@@ -544,10 +568,13 @@ class URM_Inner(nn.Module):
         return replace(carry, current_hidden=new_hidden)
 
     def _rotary_cos_sin(self, batch: Dict[str, torch.Tensor]):
-        if "position_ids" in batch and isinstance(self.rotary_emb, (RotaryEmbedding2D, RotaryEmbedding3D)):
+        if "position_ids" in batch and isinstance(
+            self.rotary_emb,
+            (RotaryEmbedding2D, RotaryEmbedding3D, RotaryEmbedding4D),
+        ):
             return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.puzzle_emb_len)
-        if isinstance(self.rotary_emb, RotaryEmbedding3D):
-            raise ValueError("RoPE3D requires explicit position_ids in the batch.")
+        if isinstance(self.rotary_emb, (RotaryEmbedding3D, RotaryEmbedding4D)):
+            raise ValueError(f"{type(self.rotary_emb).__name__} requires explicit position_ids in the batch.")
         return self.rotary_emb()
 
     def _sequence_lengths(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:

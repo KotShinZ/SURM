@@ -19,10 +19,12 @@ loop_deltas: [0]
 
 puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: rope
-# 3D RoPE: set depth/height/width to enable explicit (depth,row,col) rotary positions.
-# 2D RoPE: leave depth=0 and set height/width only.
+# 4D RoPE: set depth/io/height/width to enable explicit (pair,io,row,col) rotary positions.
+# 3D RoPE: leave io=0 and set depth/height/width for (depth,row,col).
+# 2D RoPE: leave depth=0/io=0 and set height/width only.
 # 0 (default) falls back to standard 1D RoPE.
 grid_depth: 0
+grid_io: 0
 grid_height: 0
 grid_width: 0
 

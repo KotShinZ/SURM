@@ -41,6 +41,10 @@ class DataProcessConfig(BaseModel):
 
 # ARCの各グリッドは最大 30x30 なので、その制約を定数化しておく。
 ARCMaxGridSize = 30
+# ARC の full-context 版では、最大 12 個の例題に対して 1 個の問題を足して
+# 合計 13 ペアぶんのスロットを確保する。
+ARCMaxPairSlots = 13
+ARCIOPairSlots = 2
 # 拡張は重複が起きうるため、多少多めに試して十分な数を集める。
 ARCAugmentRetriesFactor = 5
 # 拡張情報を puzzle id に埋め込むときの区切り文字。
@@ -71,7 +75,7 @@ def arc_grid_to_np(grid: List[List[int]]):
     return arr.astype(np.uint8)
 
 
-def np_grid_to_fixed_seq_translational_augment(
+def np_grid_to_fixed_canvas_translational_augment(
     inp: np.ndarray,
     out: np.ndarray,
     do_translation: bool,
@@ -85,7 +89,7 @@ def np_grid_to_fixed_seq_translational_augment(
     else:
         pad_r = pad_c = 0
 
-    # 入力グリッドと出力グリッドをそれぞれトークン列へ変換する。
+    # 入力グリッドと出力グリッドをそれぞれ固定サイズのキャンバスへ変換する。
     result = []
     for grid in [inp, out]:
         nrow, ncol = grid.shape
@@ -102,18 +106,16 @@ def np_grid_to_fixed_seq_translational_augment(
         if eos_col < ARCMaxGridSize:
             grid[pad_r:eos_row, eos_col] = 1
 
-        # 2 次元を 1 次元へ潰して Transformer に入れやすい形へする。
-        result.append(grid.flatten())
+        result.append(grid.astype(np.uint8, copy=False))
 
     return result
 
 
-def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
+def np_grids_to_unpadded_canvases(inp: np.ndarray, out: np.ndarray):
     # PAD: 0, <eos>: 1, digits: 2 ... 11
     #
-    # full-context 版では複数ペアを 1 本の列へ連結する。
-    # そのため各ペアは「入力と出力を両方収められる最小キャンバス」に圧縮し、
-    # 必要なときだけ EOS 用に 1 行 / 1 列を追加する。
+    # full-context 版では後段で [pair, io, row, col] の 4 次元へ並べ替えるため、
+    # 各ペアは「入力と出力を両方収められる最小キャンバス」としていったん保持する。
     canvas_h = max(inp.shape[0], out.shape[0])
     canvas_w = max(inp.shape[1], out.shape[1])
     if canvas_h < ARCMaxGridSize:
@@ -135,7 +137,7 @@ def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
         if ncol < canvas_w:
             canvas[:nrow, ncol] = 1
 
-        result.append(canvas.flatten())
+        result.append(canvas)
 
     return result, (canvas_h, canvas_w)
 
@@ -396,23 +398,26 @@ def _sample_context_indices(
 ):
     # ターゲット自身以外から文脈候補を集める。
     candidate_indices = [idx for idx in range(num_pairs) if idx != target_idx]
-    if len(candidate_indices) < min_context_pairs:
+    max_context_pairs = min(len(candidate_indices), ARCMaxPairSlots - 1)
+    if max_context_pairs < min_context_pairs:
         return None
 
     # 文脈数は固定せず、最小値以上でランダムに揺らす。
-    num_context = np.random.randint(min_context_pairs, len(candidate_indices) + 1)
+    # ただし [例題..., 問題] の first axis は 13 に固定したいので、
+    # 問題スロット 1 個を引いた 12 個までに抑える。
+    num_context = np.random.randint(min_context_pairs, max_context_pairs + 1)
     context_indices = np.random.choice(candidate_indices, size=num_context, replace=False).tolist()
     return context_indices
 
 
-def _pair_seq_upper_bound(
+def _pair_canvas_shape(
     inp: np.ndarray,
     out: np.ndarray,
     no_padding: bool,
 ):
-    # 固定長なら 30x30 の input と output を 1 本ずつ持つので上限は一定。
+    # 固定長なら全ペアが 30x30 に揃う。
     if not no_padding:
-        return 2 * ARCMaxGridSize * ARCMaxGridSize
+        return ARCMaxGridSize, ARCMaxGridSize
 
     # 可変長なら「入力/出力の大きい方 + EOS 分」を見積もれば十分。
     canvas_h = max(inp.shape[0], out.shape[0])
@@ -421,30 +426,30 @@ def _pair_seq_upper_bound(
         canvas_h += 1
     if canvas_w < ARCMaxGridSize:
         canvas_w += 1
-    return 2 * canvas_h * canvas_w
+    return canvas_h, canvas_w
 
 
 def _full_sample_upper_bound(group: List[ARCFullPuzzle], no_padding: bool):
     # 同一グループ内で最も長くなりうるサンプル長を保存時の上限として使う。
-    # 文脈ペアは input/output の 2 枚、ターゲットは query_input の 1 枚だけを
-    # 入力側へ並べるので、上限は target 候補ごとに 1 枚ぶんだけ短くなる。
+    # 新形式では各サンプルを [13, 2, H, W] で持つので、長さは
+    # 13 * 2 * H * W のみで決まる。
     if not group:
         return 0
-    return max(
-        max(
-            2 * sum(_pair_seq_upper_bound(inp, out, no_padding) for inp, out in puzzle.pairs)
-            - _pair_seq_upper_bound(
-                puzzle.pairs[target_idx][0],
-                puzzle.pairs[target_idx][1],
-                no_padding,
-            )
-            for target_idx in puzzle.target_indices
-        )
-        for puzzle in group
-    )
+    if not no_padding:
+        return ARCMaxPairSlots * ARCIOPairSlots * ARCMaxGridSize * ARCMaxGridSize
+
+    max_h = 0
+    max_w = 0
+    for puzzle in group:
+        for inp, out in puzzle.pairs:
+            pair_h, pair_w = _pair_canvas_shape(inp, out, no_padding)
+            max_h = max(max_h, pair_h)
+            max_w = max(max_w, pair_w)
+
+    return ARCMaxPairSlots * ARCIOPairSlots * max_h * max_w
 
 
-def _make_pair_sequences(
+def _make_pair_canvases(
     inp: np.ndarray,
     out: np.ndarray,
     do_translation: bool,
@@ -452,9 +457,9 @@ def _make_pair_sequences(
 ):
     # 可変長モードでは最小キャンバス、固定長モードでは 30x30 + 平行移動拡張を使う。
     if no_padding:
-        (inp_seq, out_seq), pair_shape = np_grids_to_unpadded_seq(inp, out)
+        (inp_canvas, out_canvas), pair_shape = np_grids_to_unpadded_canvases(inp, out)
     else:
-        inp_seq, out_seq = np_grid_to_fixed_seq_translational_augment(
+        inp_canvas, out_canvas = np_grid_to_fixed_canvas_translational_augment(
             inp,
             out,
             do_translation=do_translation,
@@ -462,25 +467,22 @@ def _make_pair_sequences(
         pair_shape = (ARCMaxGridSize, ARCMaxGridSize)
 
     return (
-        inp_seq.astype(np.uint8, copy=False),
-        out_seq.astype(np.uint8, copy=False),
+        inp_canvas.astype(np.uint8, copy=False),
+        out_canvas.astype(np.uint8, copy=False),
         pair_shape,
     )
 
 
-def _make_pair_position_ids(pair_shape: Tuple[int, int], example_index: int):
-    # position id は [画像番号, 行, 列] の 3 軸で持つ。
-    # 1 ペアにつき input / output を別 depth に置き、後段では
-    # [例問1, 解答1, 例問2, 解答2, ...] の順に復元できるようにする。
-    pair_h, pair_w = pair_shape
-    rows = np.repeat(np.arange(pair_h, dtype=np.uint8), pair_w)
-    cols = np.tile(np.arange(pair_w, dtype=np.uint8), pair_h)
-    input_depth = np.full((pair_h * pair_w,), 2 * example_index, dtype=np.uint8)
-    output_depth = np.full((pair_h * pair_w,), 2 * example_index + 1, dtype=np.uint8)
-
-    input_position_ids = np.stack([input_depth, rows, cols], axis=-1)
-    output_position_ids = np.stack([output_depth, rows, cols], axis=-1)
-    return input_position_ids, output_position_ids
+def _make_sample_position_ids(canvas_shape: Tuple[int, int]):
+    # position id は [例題/問題 index, input/output index, 行, 列] の 4 軸で持つ。
+    # 未使用スロットも含めて full canvas 全体の座標を持たせ、
+    # metadata 側では常に [13, 2, H, W] を復元できるようにする。
+    canvas_h, canvas_w = canvas_shape
+    return np.moveaxis(
+        np.indices((ARCMaxPairSlots, ARCIOPairSlots, canvas_h, canvas_w), dtype=np.uint8),
+        0,
+        -1,
+    )
 
 
 def _build_full_context_example(
@@ -499,41 +501,47 @@ def _build_full_context_example(
     # これにより [例問1, 解答1, 例問2, 解答2, ... 問題1] の並びを保つ。
     np.random.shuffle(context_indices)
     ordered_indices = [*context_indices, target_idx]
+    assert len(ordered_indices) <= ARCMaxPairSlots
     # 少なくとも 1 ペアは平行移動させず、元の配置情報も常に残す。
     no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
 
-    input_parts = []
-    label_parts = []
-    position_parts = []
+    pair_slots: List[Tuple[int, np.ndarray, np.ndarray, Tuple[int, int]]] = []
+    sample_h = 0
+    sample_w = 0
 
     for pair_pos, pair_idx in enumerate(ordered_indices):
         inp, out = puzzle.pairs[pair_idx]
         do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
-        inp_seq, out_seq, pair_shape = _make_pair_sequences(inp, out, do_translation, no_padding)
+        inp_canvas, out_canvas, pair_shape = _make_pair_canvases(inp, out, do_translation, no_padding)
+        pair_slots.append((pair_idx, inp_canvas, out_canvas, pair_shape))
+        sample_h = max(sample_h, pair_shape[0])
+        sample_w = max(sample_w, pair_shape[1])
 
-        # ラベルが不要な箇所は 0 で埋め、loss 計算時に無視できる形へ揃える。
-        zero_inp = np.zeros_like(inp_seq, dtype=np.uint8)
-        zero_out = np.zeros_like(out_seq, dtype=np.uint8)
-        inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
+    # 各サンプルを [13, 2, H, W] に揃える。
+    sample_input = np.zeros((ARCMaxPairSlots, ARCIOPairSlots, sample_h, sample_w), dtype=np.uint8)
+    sample_label = np.zeros_like(sample_input)
 
+    for pair_pos, (pair_idx, inp_canvas, out_canvas, pair_shape) in enumerate(pair_slots):
+        pair_h, pair_w = pair_shape
+        sample_input[pair_pos, 0, :pair_h, :pair_w] = inp_canvas
         if pair_idx == target_idx:
-            # ターゲット問題では query_input だけを入力へ置き、
-            # query_output は同じ depth のラベルとして学習させる。
-            input_parts.append(inp_seq)
-            label_parts.append(out_seq)
-            position_parts.append(inp_pos_ids)
+            # ターゲット問題は [問題, 問題コピー] を入力へ置き、
+            # [問題, 解答] の 2 枚目だけ loss を計算する。
+            sample_input[pair_pos, 1, :pair_h, :pair_w] = inp_canvas
+            sample_label[pair_pos, 1, :pair_h, :pair_w] = out_canvas
         else:
-            # 文脈問題では input/output の両方を入力へ入れ、ラベルは空にする。
-            input_parts.extend([inp_seq, out_seq])
-            label_parts.extend([zero_inp, zero_out])
-            position_parts.extend([inp_pos_ids, out_pos_ids])
+            # 文脈問題は [入力, 出力] をそのまま入力へ置く。
+            sample_input[pair_pos, 1, :pair_h, :pair_w] = out_canvas
 
-    # 連結して 1 サンプルぶんの 1 次元列へまとめる。
-    sample_input = np.concatenate(input_parts).astype(np.uint8, copy=False)
-    sample_label = np.concatenate(label_parts).astype(np.uint8, copy=False)
-    sample_position_ids = np.concatenate(position_parts, axis=0).astype(np.uint8, copy=False)
-    # seq_shape は後段で各サンプル長を復元するために使う。
-    seq_shape = (1, int(sample_input.shape[0]))
+    sample_position_ids = _make_sample_position_ids((sample_h, sample_w)).astype(np.uint8, copy=False)
+    seq_shape = tuple(int(x) for x in sample_input.shape)
+    if no_padding:
+        return (
+            sample_input.reshape(-1).astype(np.uint8, copy=False),
+            sample_label.reshape(-1).astype(np.uint8, copy=False),
+            seq_shape,
+            sample_position_ids.reshape(-1, 4).astype(np.uint8, copy=False),
+        )
     return sample_input, sample_label, seq_shape, sample_position_ids
 
 
@@ -575,19 +583,19 @@ def convert_dataset(config: DataProcessConfig):
         total_examples = 0
         total_puzzles = 0
         total_groups = 0
-        split_max_position_id = np.zeros((3,), dtype=np.int32)
+        split_max_position_id = np.zeros((4,), dtype=np.int32)
 
         for subset_name, subset in split.items():
             results = {
                 "inputs": [],
                 "labels": [],
+                "position_ids": [],
                 "puzzle_identifiers": [],
                 "puzzle_indices": [0],
                 "group_indices": [0],
             }
             if config.no_padding:
                 results["seq_shapes"] = []
-                results["position_ids"] = []
 
             example_id = 0
             puzzle_id = 0
@@ -611,13 +619,13 @@ def convert_dataset(config: DataProcessConfig):
                         # 後でフラット化して offsets 付きで保存する。
                         results["inputs"].append(inp)
                         results["labels"].append(out)
+                        results["position_ids"].append(position_ids)
+                        split_max_position_id = np.maximum(
+                            split_max_position_id,
+                            position_ids.reshape(-1, position_ids.shape[-1]).max(axis=0).astype(np.int32) + 1,
+                        )
                         if config.no_padding:
                             results["seq_shapes"].append(seq_shape)
-                            results["position_ids"].append(position_ids)
-                            split_max_position_id = np.maximum(
-                                split_max_position_id,
-                                position_ids.max(axis=0).astype(np.int32) + 1,
-                            )
 
                         example_id += 1
                         total_examples += 1
@@ -656,30 +664,39 @@ def convert_dataset(config: DataProcessConfig):
                                 seq_offsets,
                             )
                     else:
-                        # 固定長モードでは最大長まで PAD して 2 次元配列で保存する。
-                        padded = [
-                            np.pad(seq, (0, global_seq_len - seq.shape[0]), constant_values=0)
-                            for seq in value
-                        ]
+                        # 固定長モードでは [13, 2, 30, 30] をそのまま保存する。
                         array = (
-                            np.stack(padded, 0).astype(np.uint8, copy=False)
-                            if padded
-                            else np.empty((0, global_seq_len), dtype=np.uint8)
+                            np.stack(value, 0).astype(np.uint8, copy=False)
+                            if value
+                            else np.empty(
+                                (0, ARCMaxPairSlots, ARCIOPairSlots, ARCMaxGridSize, ARCMaxGridSize),
+                                dtype=np.uint8,
+                            )
                         )
                         np.save(
                             os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
                             array,
                         )
                 elif key == "position_ids":
-                    # position_ids も可変長トークン列と同じ順序でフラット化する。
-                    flat_positions = (
-                        np.concatenate(value, axis=0).astype(np.uint8, copy=False)
-                        if value
-                        else np.empty((0, 3), dtype=np.uint8)
-                    )
+                    if config.no_padding:
+                        # 可変長モードでは position_ids もトークン列と同じ順序でフラット化する。
+                        position_array = (
+                            np.concatenate(value, axis=0).astype(np.uint8, copy=False)
+                            if value
+                            else np.empty((0, 4), dtype=np.uint8)
+                        )
+                    else:
+                        position_array = (
+                            np.stack(value, 0).astype(np.uint8, copy=False)
+                            if value
+                            else np.empty(
+                                (0, ARCMaxPairSlots, ARCIOPairSlots, ARCMaxGridSize, ARCMaxGridSize, 4),
+                                dtype=np.uint8,
+                            )
+                        )
                     np.save(
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
-                        flat_positions,
+                        position_array,
                     )
                 elif key == "seq_shapes":
                     # 各サンプルの元の長さを保持して、復元可能にしておく。
@@ -706,7 +723,7 @@ def convert_dataset(config: DataProcessConfig):
             mean_puzzle_examples=total_examples / max(total_puzzles, 1),
             sets=list(split.keys()),
             variable_seq_lengths=config.no_padding,
-            position_id_shape=split_max_position_id.tolist() if config.no_padding and total_examples > 0 else None,
+            position_id_shape=split_max_position_id.tolist() if total_examples > 0 else None,
         )
         print(f"  Total puzzles: {total_puzzles}")
         print(f"  Total examples: {total_examples}")

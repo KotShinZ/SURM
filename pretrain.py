@@ -223,6 +223,26 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     return dataloader, dataset.metadata
 
 
+def _apply_position_id_shape_to_model_cfg(model_cfg: dict, position_id_shape: Optional[Sequence[int]]) -> dict:
+    if position_id_shape is None:
+        return model_cfg
+
+    if len(position_id_shape) == 4:
+        model_cfg["grid_depth"] = model_cfg.get("grid_depth", 0) or position_id_shape[0]
+        model_cfg["grid_io"] = model_cfg.get("grid_io", 0) or position_id_shape[1]
+        model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or position_id_shape[2]
+        model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or position_id_shape[3]
+    elif len(position_id_shape) == 3:
+        model_cfg["grid_depth"] = model_cfg.get("grid_depth", 0) or position_id_shape[0]
+        model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or position_id_shape[1]
+        model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or position_id_shape[2]
+    elif len(position_id_shape) == 2:
+        model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or position_id_shape[0]
+        model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or position_id_shape[1]
+
+    return model_cfg
+
+
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
@@ -233,15 +253,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         variable_seq_lengths=train_metadata.variable_seq_lengths,
         causal=False,  # Non-autoregressive
     )
-
-    if train_metadata.position_id_shape is not None:
-        if len(train_metadata.position_id_shape) == 3:
-            model_cfg["grid_depth"] = model_cfg.get("grid_depth", 0) or train_metadata.position_id_shape[0]
-            model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or train_metadata.position_id_shape[1]
-            model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or train_metadata.position_id_shape[2]
-        elif len(train_metadata.position_id_shape) == 2:
-            model_cfg["grid_height"] = model_cfg.get("grid_height", 0) or train_metadata.position_id_shape[0]
-            model_cfg["grid_width"] = model_cfg.get("grid_width", 0) or train_metadata.position_id_shape[1]
+    model_cfg = _apply_position_id_shape_to_model_cfg(model_cfg, train_metadata.position_id_shape)
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)

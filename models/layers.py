@@ -133,6 +133,56 @@ def apply_rotary_pos_emb_3d(
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 
+def apply_rotary_pos_emb_4d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_pair: torch.Tensor,
+    sin_pair: torch.Tensor,
+    cos_io: torch.Tensor,
+    sin_io: torch.Tensor,
+    cos_row: torch.Tensor,
+    sin_row: torch.Tensor,
+    cos_col: torch.Tensor,
+    sin_col: torch.Tensor,
+):
+    # q, k: [..., num_heads, head_dim]
+    # Each axis gets its own slice of head_dim.
+    orig_dtype = q.dtype
+    q = q.to(cos_pair.dtype)
+    k = k.to(cos_pair.dtype)
+
+    axis_dims = (
+        cos_pair.shape[-1],
+        cos_io.shape[-1],
+        cos_row.shape[-1],
+        cos_col.shape[-1],
+    )
+    q_pair, q_io, q_row, q_col = torch.split(q, axis_dims, dim=-1)
+    k_pair, k_io, k_row, k_col = torch.split(k, axis_dims, dim=-1)
+
+    cos_p = cos_pair.unsqueeze(-2)
+    sin_p = sin_pair.unsqueeze(-2)
+    cos_i = cos_io.unsqueeze(-2)
+    sin_i = sin_io.unsqueeze(-2)
+    cos_r = cos_row.unsqueeze(-2)
+    sin_r = sin_row.unsqueeze(-2)
+    cos_c = cos_col.unsqueeze(-2)
+    sin_c = sin_col.unsqueeze(-2)
+
+    q_pair = q_pair * cos_p + rotate_half(q_pair) * sin_p
+    k_pair = k_pair * cos_p + rotate_half(k_pair) * sin_p
+    q_io = q_io * cos_i + rotate_half(q_io) * sin_i
+    k_io = k_io * cos_i + rotate_half(k_io) * sin_i
+    q_row = q_row * cos_r + rotate_half(q_row) * sin_r
+    k_row = k_row * cos_r + rotate_half(k_row) * sin_r
+    q_col = q_col * cos_c + rotate_half(q_col) * sin_c
+    k_col = k_col * cos_c + rotate_half(k_col) * sin_c
+
+    q_embed = torch.cat([q_pair, q_io, q_row, q_col], dim=-1)
+    k_embed = torch.cat([k_pair, k_io, k_row, k_col], dim=-1)
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+
 class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
@@ -324,6 +374,92 @@ class RotaryEmbedding3D(nn.Module):
     def forward(self, position_ids: Optional[torch.Tensor] = None, prefix_seq_len: Optional[int] = None):
         if position_ids is None:
             raise ValueError("RotaryEmbedding3D requires explicit position_ids.")
+
+        cos_sin = self.lookup(position_ids)
+        prefix_len = 0 if prefix_seq_len is None else prefix_seq_len
+        if prefix_len <= 0:
+            return cos_sin
+
+        batch_size = position_ids.shape[0]
+        with_prefix = []
+        for cos, sin in zip(cos_sin[::2], cos_sin[1::2]):
+            prefix_cos = cos.new_ones((batch_size, prefix_len, cos.shape[-1]))
+            prefix_sin = sin.new_zeros((batch_size, prefix_len, sin.shape[-1]))
+            with_prefix.extend(
+                [
+                    torch.cat([prefix_cos, cos], dim=1),
+                    torch.cat([prefix_sin, sin], dim=1),
+                ]
+            )
+        return tuple(with_prefix)
+
+
+class RotaryEmbedding4D(nn.Module):
+    """4D Rotary Position Embeddings for [pair, io, row, col] ARC inputs."""
+
+    def __init__(
+        self,
+        dim: int,
+        grid_depth: int,
+        grid_io: int,
+        grid_height: int,
+        grid_width: int,
+        puzzle_emb_len: int,
+        base: float,
+        device=None,
+    ):
+        super().__init__()
+        self.grid_depth = grid_depth
+        self.grid_io = grid_io
+        self.grid_height = grid_height
+        self.grid_width = grid_width
+        self.puzzle_emb_len = puzzle_emb_len
+        self.axis_dims = _split_rotary_axis_dims(dim, 4)
+
+        self.cos_depth, self.sin_depth = RotaryEmbedding3D._build_axis_cache(
+            dim=self.axis_dims[0],
+            max_position_embeddings=grid_depth,
+            base=base,
+            device=device,
+        )
+        self.cos_io, self.sin_io = RotaryEmbedding3D._build_axis_cache(
+            dim=self.axis_dims[1],
+            max_position_embeddings=grid_io,
+            base=base,
+            device=device,
+        )
+        self.cos_row, self.sin_row = RotaryEmbedding3D._build_axis_cache(
+            dim=self.axis_dims[2],
+            max_position_embeddings=grid_height,
+            base=base,
+            device=device,
+        )
+        self.cos_col, self.sin_col = RotaryEmbedding3D._build_axis_cache(
+            dim=self.axis_dims[3],
+            max_position_embeddings=grid_width,
+            base=base,
+            device=device,
+        )
+
+    def lookup(self, position_ids: torch.Tensor) -> CosSin:
+        pair_ids = position_ids[..., 0].to(torch.long)
+        io_ids = position_ids[..., 1].to(torch.long)
+        row_ids = position_ids[..., 2].to(torch.long)
+        col_ids = position_ids[..., 3].to(torch.long)
+        return (
+            self.cos_depth[pair_ids],
+            self.sin_depth[pair_ids],
+            self.cos_io[io_ids],
+            self.sin_io[io_ids],
+            self.cos_row[row_ids],
+            self.sin_row[row_ids],
+            self.cos_col[col_ids],
+            self.sin_col[col_ids],
+        )
+
+    def forward(self, position_ids: Optional[torch.Tensor] = None, prefix_seq_len: Optional[int] = None):
+        if position_ids is None:
+            raise ValueError("RotaryEmbedding4D requires explicit position_ids.")
 
         cos_sin = self.lookup(position_ids)
         prefix_len = 0 if prefix_seq_len is None else prefix_seq_len
@@ -561,10 +697,12 @@ class Attention(nn.Module):
         key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
         value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
 
-        # RoPE (1D, 2D, or 3D)
+        # RoPE (1D, 2D, 3D, or 4D)
         cos_sin = self._slice_cos_sin(cos_sin, seq_len)
         if cos_sin is not None:
-            if len(cos_sin) == 6:
+            if len(cos_sin) == 8:
+                query, key = apply_rotary_pos_emb_4d(query, key, *cos_sin)
+            elif len(cos_sin) == 6:
                 query, key = apply_rotary_pos_emb_3d(query, key, *cos_sin)
             elif len(cos_sin) == 4:
                 # 2D RoPE: (cos_row, sin_row, cos_col, sin_col)
@@ -665,7 +803,9 @@ class Attention(nn.Module):
         value = qkv[:, self.num_heads + self.num_key_value_heads:]
 
         if cos_sin is not None:
-            if len(cos_sin) == 6:
+            if len(cos_sin) == 8:
+                query, key = apply_rotary_pos_emb_4d(query, key, *cos_sin)
+            elif len(cos_sin) == 6:
                 query, key = apply_rotary_pos_emb_3d(query, key, *cos_sin)
             elif len(cos_sin) == 4:
                 query, key = apply_rotary_pos_emb_2d(query, key, *cos_sin)
