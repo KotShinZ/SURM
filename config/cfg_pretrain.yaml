@@ -69,3 +69,7 @@ masked_input:
   mask_token_id: 1
   # Keep the original dataset input in batch["source_inputs"] for evaluators/debugging.
   preserve_source_inputs: true
+
+arc_output_mask:
+  enabled: true
+  fill_mode: "zero" # Literal["zero", "random_color"] 

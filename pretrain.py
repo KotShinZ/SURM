@@ -27,7 +27,13 @@ from omegaconf import DictConfig, OmegaConf
 #from adam_atan2 import AdamATan2
 from adam_atan2_pytorch import AdamAtan2
 from models.muon import Muon
-from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from puzzle_dataset import (
+    ARCOutputMaskConfig,
+    MaskedInputConfig,
+    PuzzleDataset,
+    PuzzleDatasetConfig,
+    PuzzleDatasetMetadata,
+)
 from data.online_aug import OnlineAugConfig
 from utils import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
@@ -151,6 +157,9 @@ class PretrainConfig(pydantic.BaseModel):
     # Replace model inputs with a randomly masked version of the labels.
     masked_input: Optional[MaskedInputConfig] = None
 
+    # ARC full-context training: pick one solved output pair per sample and mask it on the fly.
+    arc_output_mask: Optional[ARCOutputMaskConfig] = None
+
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
     benchmark_warmup_steps: int = 1
@@ -209,7 +218,11 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            data_fraction=data_fraction, online_aug=online_aug, masked_input=config.masked_input, **kwargs
+            data_fraction=data_fraction,
+            online_aug=online_aug,
+            masked_input=config.masked_input,
+            arc_output_mask=config.arc_output_mask,
+            **kwargs,
         ),
         split=split,
     )

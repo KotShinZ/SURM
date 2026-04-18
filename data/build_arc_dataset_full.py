@@ -472,6 +472,17 @@ def _make_pair_canvases(
     )
 
 
+def _make_expanded_answer_label_canvas(out_canvas: np.ndarray):
+    expanded = np.zeros((ARCMaxGridSize, ARCMaxGridSize), dtype=np.uint8)
+    out_h, out_w = out_canvas.shape
+    expanded[:out_h, :out_w] = out_canvas
+    return expanded
+
+
+def _make_masked_answer_input_canvas(fill_token: int = 2):
+    return np.full((ARCMaxGridSize, ARCMaxGridSize), fill_token, dtype=np.uint8)
+
+
 def _make_sample_position_ids(num_pair_slots: int, canvas_shape: Tuple[int, int]):
     # position id は [例題/問題 index, input/output index, 行, 列] の 4 軸で持つ。
     # no_padding=True では pair 軸も実際に使う数だけに詰める。
@@ -560,7 +571,9 @@ def _print_terminal_friendly_arc_sample(
 
 def _pack_pair_slots_without_sample_padding(
     pair_slots: List[Tuple[int, np.ndarray, np.ndarray, Tuple[int, int]]],
-    target_idx: int,
+    target_idx: Optional[int] = None,
+    target_output_input: Optional[np.ndarray] = None,
+    target_output_label: Optional[np.ndarray] = None,
 ):
     input_chunks = []
     label_chunks = []
@@ -580,12 +593,19 @@ def _pack_pair_slots_without_sample_padding(
             _make_pair_canvas_position_ids(pair_pos, 0, pair_shape).reshape(-1, 4).astype(np.uint8, copy=False)
         )
 
-        second_input = inp_canvas if pair_idx == target_idx else out_canvas
-        second_label = out_canvas if pair_idx == target_idx else np.zeros_like(out_canvas)
+        if pair_idx == target_idx:
+            second_input = target_output_input if target_output_input is not None else out_canvas
+            second_label = target_output_label if target_output_label is not None else np.zeros_like(second_input)
+        else:
+            second_input = out_canvas
+            second_label = np.zeros_like(out_canvas)
+        second_shape = second_input.shape
+        max_pair_h = max(max_pair_h, second_shape[0])
+        max_pair_w = max(max_pair_w, second_shape[1])
         input_chunks.append(second_input.reshape(-1).astype(np.uint8, copy=False))
         label_chunks.append(second_label.reshape(-1).astype(np.uint8, copy=False))
         position_chunks.append(
-            _make_pair_canvas_position_ids(pair_pos, 1, pair_shape).reshape(-1, 4).astype(np.uint8, copy=False)
+            _make_pair_canvas_position_ids(pair_pos, 1, second_shape).reshape(-1, 4).astype(np.uint8, copy=False)
         )
 
     flat_inputs = (
@@ -607,7 +627,60 @@ def _pack_pair_slots_without_sample_padding(
     return flat_inputs, flat_labels, seq_shape, flat_position_ids
 
 
-def _build_full_context_example(
+def _build_training_full_context_example(
+    puzzle: ARCFullPuzzle,
+    enable_translational_augment: bool,
+    no_padding: bool,
+    no_padding_mode: Literal["sample", "pair_eos", "pair_no_eos"] = "sample",
+):
+    ordered_indices = list(range(len(puzzle.pairs)))
+    assert len(ordered_indices) <= ARCMaxPairSlots
+    no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
+
+    pair_slots: List[Tuple[int, np.ndarray, np.ndarray, Tuple[int, int]]] = []
+    sample_h = 0
+    sample_w = 0
+    include_eos = no_padding_mode != "pair_no_eos"
+
+    for pair_pos, pair_idx in enumerate(ordered_indices):
+        inp, out = puzzle.pairs[pair_idx]
+        do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
+        inp_canvas, out_canvas, pair_shape = _make_pair_canvases(
+            inp,
+            out,
+            do_translation,
+            no_padding,
+            include_eos=include_eos,
+        )
+        pair_slots.append((pair_idx, inp_canvas, out_canvas, pair_shape))
+        sample_h = max(sample_h, pair_shape[0])
+        sample_w = max(sample_w, pair_shape[1])
+
+    if no_padding and no_padding_mode in {"pair_eos", "pair_no_eos"}:
+        return _pack_pair_slots_without_sample_padding(pair_slots)
+
+    num_pair_slots = len(pair_slots) if no_padding else ARCMaxPairSlots
+    sample_input = np.zeros((num_pair_slots, ARCIOPairSlots, sample_h, sample_w), dtype=np.uint8)
+    sample_label = np.zeros_like(sample_input)
+
+    for pair_pos, (_pair_idx, inp_canvas, out_canvas, pair_shape) in enumerate(pair_slots):
+        pair_h, pair_w = pair_shape
+        sample_input[pair_pos, 0, :pair_h, :pair_w] = inp_canvas
+        sample_input[pair_pos, 1, :pair_h, :pair_w] = out_canvas
+
+    sample_position_ids = _make_sample_position_ids(num_pair_slots, (sample_h, sample_w)).astype(np.uint8, copy=False)
+    seq_shape = tuple(int(x) for x in sample_input.shape)
+    if no_padding:
+        return (
+            sample_input.reshape(-1).astype(np.uint8, copy=False),
+            sample_label.reshape(-1).astype(np.uint8, copy=False),
+            seq_shape,
+            sample_position_ids.reshape(-1, 4).astype(np.uint8, copy=False),
+        )
+    return sample_input, sample_label, seq_shape, sample_position_ids
+
+
+def _build_eval_full_context_example(
     puzzle: ARCFullPuzzle,
     target_idx: int,
     min_context_pairs: int,
@@ -647,8 +720,18 @@ def _build_full_context_example(
         sample_h = max(sample_h, pair_shape[0])
         sample_w = max(sample_w, pair_shape[1])
 
+    target_output_input = _make_masked_answer_input_canvas()
+    target_output_label = _make_expanded_answer_label_canvas(pair_slots[-1][2])
+    sample_h = max(sample_h, target_output_input.shape[0])
+    sample_w = max(sample_w, target_output_input.shape[1])
+
     if no_padding and no_padding_mode in {"pair_eos", "pair_no_eos"}:
-        return _pack_pair_slots_without_sample_padding(pair_slots, target_idx)
+        return _pack_pair_slots_without_sample_padding(
+            pair_slots,
+            target_idx=target_idx,
+            target_output_input=target_output_input,
+            target_output_label=target_output_label,
+        )
 
     num_pair_slots = len(pair_slots) if no_padding else ARCMaxPairSlots
 
@@ -660,10 +743,10 @@ def _build_full_context_example(
         pair_h, pair_w = pair_shape
         sample_input[pair_pos, 0, :pair_h, :pair_w] = inp_canvas
         if pair_idx == target_idx:
-            # ターゲット問題は [問題, 問題コピー] を入力へ置き、
-            # [問題, 解答] の 2 枚目だけ loss を計算する。
-            sample_input[pair_pos, 1, :pair_h, :pair_w] = inp_canvas
-            sample_label[pair_pos, 1, :pair_h, :pair_w] = out_canvas
+            # 評価時は query input はそのまま見せつつ、答え記入欄だけ 30x30 へ広げる。
+            target_h, target_w = target_output_input.shape
+            sample_input[pair_pos, 1, :target_h, :target_w] = target_output_input
+            sample_label[pair_pos, 1, :target_h, :target_w] = target_output_label
         else:
             # 文脈問題は [入力, 出力] をそのまま入力へ置く。
             sample_input[pair_pos, 1, :pair_h, :pair_w] = out_canvas
@@ -693,12 +776,14 @@ def convert_dataset(config: DataProcessConfig):
     print("train data:", len(data.get("train", {}).get("all", [])))
     print("test data:", len(data.get("test", {}).get("all", [])))
     print("Test puzzles:", len(test_puzzles))
-    
-    data0 = data.get("train", {}).get("all", [])[0]
-    print("  aug_count 0:", len(data0))
-    print("     puzzle id:", data0[0].id)
-    print("     num pairs:", len(data0[0].pairs))  # input of first pair
-    print("     target_indices:", data0[0].target_indices)
+
+    train_examples = data.get("train", {}).get("all", [])
+    if train_examples:
+        data0 = train_examples[0]
+        print("  aug_count 0:", len(data0))
+        print("     puzzle id:", data0[0].id)
+        print("     num pairs:", len(data0[0].pairs))  # input of first pair
+        print("     target_indices:", data0[0].target_indices)
 
     # 実際の puzzle id を埋め込むと問題そのものを暗記できてしまうので、
     # 全問題共通のダミー識別子だけを使う。
@@ -720,14 +805,16 @@ def convert_dataset(config: DataProcessConfig):
 
         for subset_name, subset in split.items():
             print(f"  subset: {subset_name}, groups: {len(subset)}") # all
+            save_labels = split_name != "train"
             results = {
                 "inputs": [],
-                "labels": [],
                 "position_ids": [],
                 "puzzle_identifiers": [],
                 "puzzle_indices": [0],
                 "group_indices": [0],
             }
+            if save_labels:
+                results["labels"] = []
             if config.no_padding:
                 results["seq_shapes"] = []
 
@@ -736,16 +823,30 @@ def convert_dataset(config: DataProcessConfig):
 
             for group in tqdm(subset, desc=f"Processing {split_name}/{subset_name}"): # puzzle id
                 for puzzle in group: # ARCFullPuzzle
-                    # 1つの puzzle からは、target 候補ごとに別サンプルを作る。
-                    for target_idx in puzzle.target_indices:
-                        built = _build_full_context_example(
-                            puzzle=puzzle,
-                            target_idx=target_idx,
-                            min_context_pairs=config.min_context_pairs,
-                            enable_translational_augment=enable_translational_augment,
-                            no_padding=config.no_padding,
-                            no_padding_mode=config.no_padding_mode,
-                        )
+                    if split_name == "train":
+                        built_examples = [
+                            _build_training_full_context_example(
+                                puzzle=puzzle,
+                                enable_translational_augment=enable_translational_augment,
+                                no_padding=config.no_padding,
+                                no_padding_mode=config.no_padding_mode,
+                            )
+                        ]
+                    else:
+                        # test は従来どおり target 候補ごとに 1 サンプルずつ作る。
+                        built_examples = [
+                            _build_eval_full_context_example(
+                                puzzle=puzzle,
+                                target_idx=target_idx,
+                                min_context_pairs=config.min_context_pairs,
+                                enable_translational_augment=enable_translational_augment,
+                                no_padding=config.no_padding,
+                                no_padding_mode=config.no_padding_mode,
+                            )
+                            for target_idx in puzzle.target_indices
+                        ]
+
+                    for built in built_examples:
                         if built is None:
                             continue
 
@@ -753,9 +854,36 @@ def convert_dataset(config: DataProcessConfig):
                         # 可変長保存では各サンプルをいったん Python list に積み、
                         # 後でフラット化して offsets 付きで保存する。
                         results["inputs"].append(inp)
-                        results["labels"].append(out)
+                        if save_labels:
+                            results["labels"].append(out)
                         results["position_ids"].append(position_ids)
-                        split_max_seq_len = max(split_max_seq_len, int(inp.shape[0]) if config.no_padding else int(np.prod(seq_shape)))
+                        effective_seq_len = int(inp.shape[0]) if config.no_padding else int(np.prod(seq_shape))
+                        if split_name == "train":
+                            if config.no_padding:
+                                if config.no_padding_mode in {"pair_eos", "pair_no_eos"}:
+                                    pair_ids = np.unique(position_ids[:, 0]).astype(np.int32, copy=False)
+                                    output_lengths = [
+                                        int(np.sum((position_ids[:, 0] == pair_id) & (position_ids[:, 1] == 1)))
+                                        for pair_id in pair_ids
+                                    ]
+                                    if output_lengths:
+                                        effective_seq_len = int(inp.shape[0] + (ARCMaxGridSize * ARCMaxGridSize) - min(output_lengths))
+                                else:
+                                    effective_seq_len = int(seq_shape[0] * ARCIOPairSlots * max(seq_shape[2], ARCMaxGridSize) * max(seq_shape[3], ARCMaxGridSize))
+                            if split_max_position_id.shape[0] == 4:
+                                split_max_position_id = np.maximum(
+                                    split_max_position_id,
+                                    np.array(
+                                        [
+                                            int(seq_shape[0]),
+                                            ARCIOPairSlots,
+                                            ARCMaxGridSize,
+                                            ARCMaxGridSize,
+                                        ],
+                                        dtype=np.int32,
+                                    ),
+                                )
+                        split_max_seq_len = max(split_max_seq_len, effective_seq_len)
                         split_max_position_id = np.maximum(
                             split_max_position_id,
                             position_ids.reshape(-1, position_ids.shape[-1]).max(axis=0).astype(np.int32) + 1,
@@ -791,8 +919,7 @@ def convert_dataset(config: DataProcessConfig):
                             else np.empty((0,), dtype=np.uint8)
                         )
                         if value:
-                            target_idx = 50
-                            print(value[target_idx])
+                            target_idx = 0
                             _print_terminal_friendly_arc_sample(
                                 flat_tokens=value[target_idx],
                                 position_ids=results["position_ids"][target_idx],
@@ -870,6 +997,8 @@ def convert_dataset(config: DataProcessConfig):
             variable_seq_lengths=config.no_padding,
             position_id_shape=split_max_position_id.tolist() if total_examples > 0 else None,
             sequence_layout=config.no_padding_mode if config.no_padding else "fixed",
+            train_target_mode="random_output_pair" if split_name == "train" else None,
+            answer_slot_max_grid_size=ARCMaxGridSize,
         )
         print(f"  Total puzzles: {total_puzzles}")
         print(f"  Total examples: {total_examples}")
