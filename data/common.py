@@ -21,6 +21,7 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     sets: List[str]
     variable_seq_lengths: bool = False
     position_id_shape: Optional[List[int]] = None
+    sequence_layout: Optional[str] = None
     # total_puzzles=876404
 
 

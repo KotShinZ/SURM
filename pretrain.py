@@ -1226,10 +1226,14 @@ def launch(hydra_config: DictConfig):
         if train_state.step > 0:
             progress_bar.update(train_state.step)
 
+        wandb_mode = os.getenv("WANDB_MODE")
+        if wandb_mode:
+            print(f"W&B mode: {wandb_mode}")
         wandb.init(
             project=config.project_name,
             name=config.run_name,
             config=config.model_dump(),
+            mode=wandb_mode,
             settings=wandb.Settings(_disable_stats=True),
         )
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
