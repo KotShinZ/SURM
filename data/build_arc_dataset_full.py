@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 from dataclasses import dataclass
 import os
 import json
@@ -8,6 +8,7 @@ import numpy as np
 
 from argdantic import ArgParser
 from pydantic import BaseModel, model_validator
+from tqdm import tqdm
 
 from data.common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
@@ -39,7 +40,7 @@ class DataProcessConfig(BaseModel):
     # - "sample": sample 内では [pair, io, H, W] の長方形へ揃える従来方式
     # - "pair_eos": pair ごとの最小キャンバスで詰め、EOS は残す
     # - "pair_no_eos": pair ごとの最小キャンバスで詰め、EOS も入れない
-    no_padding_mode: Literal["sample", "pair_eos", "pair_no_eos"] = "sample"
+    no_padding_mode: Literal["sample", "pair_eos", "pair_no_eos"] = "pair_eos"
     # 1つのターゲットを予測するのに最低限必要な文脈ペア数。
     min_context_pairs: int = 2
 
@@ -365,11 +366,11 @@ def load_puzzles_arcagi(config: DataProcessConfig):
 
         # 問題順に偏りが出ないようシャッフルしてから split を割り振る。
         puzzles = list(puzzles.items())
-        print(f"Shuffling {len(puzzles)} puzzles...")
+        # print(f"Shuffling {len(puzzles)} puzzles...")
         np.random.shuffle(puzzles)
 
         # インデックス比率を使って、問題ごとに出力先 split を決める。
-        for idx, (name, puzzle) in enumerate(puzzles):
+        for idx, (name, puzzle) in tqdm(enumerate(puzzles), total=len(puzzles)):
             fraction = idx / len(puzzles)
             test_examples_dest = None
             for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
@@ -488,6 +489,73 @@ def _make_pair_canvas_position_ids(pair_pos: int, io_idx: int, canvas_shape: Tup
     pair_ids = np.full((canvas_h, canvas_w, 1), pair_pos, dtype=np.uint8)
     io_ids = np.full((canvas_h, canvas_w, 1), io_idx, dtype=np.uint8)
     return np.concatenate([pair_ids, io_ids, row_col_ids], axis=-1)
+
+
+def _arc_token_to_debug_symbol(token: int):
+    token = int(token)
+    if token == 0:
+        return "."
+    if token == 1:
+        return "#"
+    if 2 <= token <= 11:
+        return str(token - 2)
+    return "?"
+
+
+def _format_arc_debug_grid(grid: np.ndarray):
+    return "\n".join(
+        " ".join(_arc_token_to_debug_symbol(token) for token in row)
+        for row in grid
+    )
+
+
+def _print_terminal_friendly_arc_sample(
+    flat_tokens: np.ndarray,
+    position_ids: np.ndarray,
+    sample_name: str,
+    seq_shape: Optional[Tuple[int, ...]] = None,
+):
+    # packed token 列を pair / io ごとのグリッドへ戻し、ターミナルで読める形にする。
+    print(f"{sample_name}:")
+
+    if flat_tokens.size == 0:
+        print("  empty sample")
+        return
+
+    if flat_tokens.ndim != 1:
+        print(f"  unexpected token shape={flat_tokens.shape}; falling back to raw print")
+        print(flat_tokens)
+        return
+
+    if position_ids.ndim != 2 or position_ids.shape != (flat_tokens.shape[0], 4):
+        print(
+            f"  unexpected position_ids shape={position_ids.shape}; "
+            f"expected ({flat_tokens.shape[0]}, 4), falling back to raw print"
+        )
+        print(flat_tokens)
+        return
+
+    pair_ids = np.unique(position_ids[:, 0]).astype(np.int32, copy=False)
+    seq_shape_repr = seq_shape if seq_shape is not None else "unknown"
+    print(f"  packed_len={flat_tokens.shape[0]}, seq_shape={seq_shape_repr}, pair_slots={len(pair_ids)}")
+    print("  legend: .=PAD  #=EOS  0-9=ARC color")
+
+    for pair_pos in pair_ids:
+        print(f"  pair {int(pair_pos)}:")
+        for io_idx, io_name in enumerate(("input", "output")):
+            mask = (position_ids[:, 0] == pair_pos) & (position_ids[:, 1] == io_idx)
+            if not np.any(mask):
+                continue
+
+            coords = position_ids[mask][:, 2:].astype(np.int32, copy=False)
+            grid_h = int(coords[:, 0].max()) + 1
+            grid_w = int(coords[:, 1].max()) + 1
+            grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+            grid[coords[:, 0], coords[:, 1]] = flat_tokens[mask]
+
+            print(f"    {io_name} shape=({grid_h}, {grid_w})")
+            for line in _format_arc_debug_grid(grid).splitlines():
+                print(f"      {line}")
 
 
 def _pack_pair_slots_without_sample_padding(
@@ -625,13 +693,19 @@ def convert_dataset(config: DataProcessConfig):
     print("train data:", len(data.get("train", {}).get("all", [])))
     print("test data:", len(data.get("test", {}).get("all", [])))
     print("Test puzzles:", len(test_puzzles))
+    
+    data0 = data.get("train", {}).get("all", [])[0]
+    print("  aug_count 0:", len(data0))
+    print("     puzzle id:", data0[0].id)
+    print("     num pairs:", len(data0[0].pairs))  # input of first pair
+    print("     target_indices:", data0[0].target_indices)
 
     # 実際の puzzle id を埋め込むと問題そのものを暗記できてしまうので、
     # 全問題共通のダミー識別子だけを使う。
     num_identifiers = 2  # 0 is blank, 1 is shared dummy
 
     # split ごとに実サンプルを生成し、そのまま numpy 配列として保存する。
-    for split_name, split in data.items():
+    for split_name, split in data.items(): # train, test
         print("split: ", split_name)
         os.makedirs(os.path.join(config.output_dir, split_name), exist_ok=True)
 
@@ -645,6 +719,7 @@ def convert_dataset(config: DataProcessConfig):
         split_max_position_id = np.zeros((4,), dtype=np.int32)
 
         for subset_name, subset in split.items():
+            print(f"  subset: {subset_name}, groups: {len(subset)}") # all
             results = {
                 "inputs": [],
                 "labels": [],
@@ -659,8 +734,8 @@ def convert_dataset(config: DataProcessConfig):
             example_id = 0
             puzzle_id = 0
 
-            for group in subset:
-                for puzzle in group:
+            for group in tqdm(subset, desc=f"Processing {split_name}/{subset_name}"): # puzzle id
+                for puzzle in group: # ARCFullPuzzle
                     # 1つの puzzle からは、target 候補ごとに別サンプルを作る。
                     for target_idx in puzzle.target_indices:
                         built = _build_full_context_example(
@@ -715,6 +790,15 @@ def convert_dataset(config: DataProcessConfig):
                             if value
                             else np.empty((0,), dtype=np.uint8)
                         )
+                        if value:
+                            target_idx = 50
+                            print(value[target_idx])
+                            _print_terminal_friendly_arc_sample(
+                                flat_tokens=value[target_idx],
+                                position_ids=results["position_ids"][target_idx],
+                                sample_name=f"{split_name}/{subset_name}/{key}[{target_idx}]",
+                                seq_shape=results.get("seq_shapes", [None])[target_idx],
+                            )
                         np.save(
                             os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
                             flat_tokens,
