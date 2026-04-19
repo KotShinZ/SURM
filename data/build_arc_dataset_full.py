@@ -207,6 +207,7 @@ def convert_single_arc_puzzle(
         (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
         for example in puzzle.get("test", [])
     ]
+    # print(f"Puzzle {name}: {len(train_pairs)} train pairs, {len(test_pairs)} test pairs")
 
     train_dest = dest_mapping["train"]
     test_dest = dest_mapping["test"]
@@ -221,11 +222,12 @@ def convert_single_arc_puzzle(
         )
     else:
         converted[train_dest] = _build_train_template(name, train_pairs)
+        test_target_indices = [len(train_pairs) + len(test_pairs) - 1] if test_pairs else []
         converted[test_dest] = _build_joint_template(
             name,
             train_pairs=train_pairs,
             test_pairs=test_pairs,
-            target_indices=list(range(len(train_pairs), len(train_pairs) + len(test_pairs))),
+            target_indices=test_target_indices,
         )
 
     # Keep only templates that can actually emit at least one full-context sample.
@@ -428,13 +430,22 @@ def _build_full_context_example(
     min_context_pairs: int,
     enable_translational_augment: bool,
     no_padding: bool,
+    use_all_pairs_in_order: bool = False,
 ):
-    context_indices = _sample_context_indices(len(puzzle.pairs), target_idx, min_context_pairs)
-    if context_indices is None:
-        return None
+    if use_all_pairs_in_order:
+        if target_idx != len(puzzle.pairs) - 1:
+            raise ValueError(
+                "Full-context evaluation requires the target pair to be the final pair."
+            )
+        ordered_indices = list(range(len(puzzle.pairs)))
+    else:
+        context_indices = _sample_context_indices(len(puzzle.pairs), target_idx, min_context_pairs)
+        if context_indices is None:
+            return None
 
-    ordered_indices = [*context_indices, target_idx]
-    np.random.shuffle(ordered_indices)
+        ordered_indices = [*context_indices, target_idx]
+        np.random.shuffle(ordered_indices)
+
     no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
 
     input_parts = []
@@ -614,6 +625,7 @@ def convert_dataset(config: DataProcessConfig):
         os.makedirs(os.path.join(config.output_dir, split_name), exist_ok=True)
 
         enable_translational_augment = split_name == "train"
+        use_all_pairs_in_order = split_name == "test"
 
         total_examples = 0
         total_puzzles = 0
@@ -644,6 +656,7 @@ def convert_dataset(config: DataProcessConfig):
                             min_context_pairs=config.min_context_pairs,
                             enable_translational_augment=enable_translational_augment,
                             no_padding=config.no_padding,
+                            use_all_pairs_in_order=use_all_pairs_in_order,
                         )
                         if built is None:
                             continue
@@ -675,7 +688,7 @@ def convert_dataset(config: DataProcessConfig):
                 if key in {"inputs", "labels"}:
                     if config.no_padding:
                         if value:
-                            target_id = 1300
+                            target_id = 20
                             print_data(
                                 value[target_id],
                                 results["position_ids"][target_id],
