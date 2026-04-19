@@ -466,6 +466,128 @@ def _build_full_context_example(
     return sample_input, sample_label, seq_shape, sample_position_ids
 
 
+def _display_window(length: int, max_items: int):
+    if length <= max_items:
+        return list(range(length))
+
+    head = max_items // 2
+    tail = max_items - head
+    return [*range(head), None, *range(length - tail, length)]
+
+
+def _format_arc_token(token: int):
+    if token == 0:
+        return "."
+    if token == 1:
+        return "E"
+    if 2 <= token <= 11:
+        return str(token - 2)
+    return f"?{token}"
+
+
+def _extract_pair_grid(
+    data: np.ndarray,
+    pos_id: np.ndarray,
+    pair_idx: int,
+    is_output: bool,
+):
+    pair_mask = pos_id[:, 0] == pair_idx
+    if is_output:
+        part_mask = pair_mask & (pos_id[:, 1] >= ARCOutputRowOffset)
+        rows = pos_id[part_mask, 1] - ARCOutputRowOffset
+    else:
+        part_mask = pair_mask & (pos_id[:, 1] < ARCOutputRowOffset)
+        rows = pos_id[part_mask, 1]
+
+    cols = pos_id[part_mask, 2]
+    tokens = data[part_mask]
+
+    if tokens.size == 0:
+        return np.empty((0, 0), dtype=np.uint8)
+
+    height = int(rows.max()) + 1
+    width = int(cols.max()) + 1
+    expected_size = height * width
+    if tokens.size != expected_size:
+        raise ValueError(
+            f"Failed to reconstruct pair {pair_idx}: expected {expected_size} tokens, got {tokens.size}"
+        )
+
+    return tokens.reshape(height, width)
+
+
+def _format_grid_lines(grid: np.ndarray, max_rows: int, max_cols: int):
+    if grid.size == 0:
+        return ["<empty>"]
+
+    row_window = _display_window(grid.shape[0], max_rows)
+    col_window = _display_window(grid.shape[1], max_cols)
+    lines = []
+
+    for row_idx in row_window:
+        if row_idx is None:
+            lines.append("... | ...")
+            continue
+
+        cells = []
+        for col_idx in col_window:
+            if col_idx is None:
+                cells.append("...")
+            else:
+                cells.append(f"{_format_arc_token(int(grid[row_idx, col_idx])):>3}")
+        lines.append(f"r{row_idx:02d} |{''.join(cells)}")
+
+    return lines
+
+
+def print_data(
+    data: np.ndarray,
+    pos_id: np.ndarray,
+    title: str = "",
+    max_rows: int = 12,
+    max_cols: int = 12,
+):
+    if data.ndim != 1:
+        raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
+    if pos_id.ndim != 2 or pos_id.shape[1] != 3:
+        raise ValueError(f"Expected position_ids with shape (N, 3), got shape={pos_id.shape}")
+    if data.shape[0] != pos_id.shape[0]:
+        raise ValueError(
+            f"Token length and position_ids length must match, got {data.shape[0]} and {pos_id.shape[0]}"
+        )
+    if data.size == 0:
+        print(f"{title or 'sample'}: <empty>")
+        return
+
+    num_pairs = int(pos_id[:, 0].max()) + 1
+    sample_name = title or "sample"
+    print(f"{sample_name}: tokens={data.shape[0]}, pairs={num_pairs}")
+    print("legend: . = blank/pad, E = eos, 0-9 = ARC colors")
+
+    for pair_idx in range(num_pairs):
+        input_grid = _extract_pair_grid(data, pos_id, pair_idx, is_output=False)
+        output_grid = _extract_pair_grid(data, pos_id, pair_idx, is_output=True)
+        if input_grid.shape != output_grid.shape:
+            raise ValueError(
+                f"Input/output canvas mismatch at pair {pair_idx}: {input_grid.shape} vs {output_grid.shape}"
+            )
+
+        input_lines = _format_grid_lines(input_grid, max_rows=max_rows, max_cols=max_cols)
+        output_lines = _format_grid_lines(output_grid, max_rows=max_rows, max_cols=max_cols)
+        left_width = max(len(line) for line in input_lines)
+        pair_shape = f"{input_grid.shape[0]}x{input_grid.shape[1]}"
+        cropped = input_grid.shape[0] > max_rows or input_grid.shape[1] > max_cols
+        crop_suffix = " (cropped)" if cropped else ""
+
+        print(f"  Pair {pair_idx} | canvas={pair_shape}{crop_suffix}")
+        print(f"    {'input':<{left_width}}    output")
+        for line_idx in range(max(len(input_lines), len(output_lines))):
+            left = input_lines[line_idx] if line_idx < len(input_lines) else ""
+            right = output_lines[line_idx] if line_idx < len(output_lines) else ""
+            print(f"    {left:<{left_width}}    {right}")
+        print()
+
+
 def convert_dataset(config: DataProcessConfig):
     np.random.seed(config.seed)
     os.makedirs(config.output_dir, exist_ok=True)
@@ -552,6 +674,13 @@ def convert_dataset(config: DataProcessConfig):
             for key, value in results.items():
                 if key in {"inputs", "labels"}:
                     if config.no_padding:
+                        if value:
+                            target_id = 1300
+                            print_data(
+                                value[target_id],
+                                results["position_ids"][target_id],
+                                title=f"{split_name}/{subset_name} {key}[{target_id}]",
+                            )
                         seq_lengths = np.array([seq.shape[0] for seq in value], dtype=np.int64)
                         seq_offsets = np.concatenate(
                             [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
