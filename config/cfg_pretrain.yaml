@@ -57,6 +57,36 @@ online_aug:
   # Sudoku: random transpose (swap rows ↔ columns)
   sudoku_transpose: true
 
+# Online NCA2D data generation: when enabled, regenerate the train split every epoch
+# and keep the first generated test split fixed for evaluation.
+# `output_dir` is used as the active dataset path while this mode is enabled.
+online_nca_training:
+  enabled: true
+  output_dir: data/nca2d-1M
+  train_size: 1000000
+  test_size: 10000
+  seed: 0
+  state_height: 12
+  state_height_min: 6
+  state_height_max: 18
+  state_width: 12
+  state_width_min: 6
+  state_width_max: 18
+  num_colors: 4
+  patch_size: 1
+  answer_steps: 1
+  counts: 3
+  counts_min: 2
+  counts_max: 4
+  time_start: 24
+  time_span: 2
+  batch_candidate_size: 2048
+  max_sampling_rounds: 200
+  max_cells_per_candidate_batch: 4000000
+  save_dtype: int32
+  gzip_threshold_low: 0.03
+  gzip_threshold_high: 0.12
+
 # Replace model inputs with a randomly masked version of the label sequence.
 # The model still predicts the full label sequence.
 masked_input:

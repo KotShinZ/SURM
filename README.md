@@ -126,8 +126,8 @@ python data/build_nca2d_dataset.py \
   --counts-max 4 \
   --time-start 24 \
   --time-span 2 \
-  --batch-candidate-size 256 \
-  --max-sampling-rounds 20 \
+  --batch-candidate-size 2048 \
+  --max-sampling-rounds 200 \
   --max-cells-per-candidate-batch 4000000 \
   --save-dtype int32 \
   --gzip-threshold-low 0.025 \

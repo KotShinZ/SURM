@@ -1,5 +1,6 @@
 from typing import Optional, Any, Sequence, List, Tuple
 from dataclasses import dataclass
+import gc
 import os
 import math
 import json
@@ -33,6 +34,12 @@ from puzzle_dataset import (
     PuzzleDataset,
     PuzzleDatasetConfig,
     PuzzleDatasetMetadata,
+)
+from data.build_nca2d_dataset import (
+    NCA2DDataConfig,
+    generate_split as generate_nca2d_split,
+    save_dataset_config as save_nca2d_dataset_config,
+    save_split as save_nca2d_split,
 )
 from data.online_aug import OnlineAugConfig
 from utils import load_model_class, get_model_source_path
@@ -97,6 +104,10 @@ class EvaluatorConfig(pydantic.BaseModel):
     name: str
 
 
+class OnlineNCATrainingConfig(NCA2DDataConfig):
+    enabled: bool = False
+
+
 class PretrainConfig(pydantic.BaseModel):
     # Config
     arch: ArchConfig
@@ -154,6 +165,9 @@ class PretrainConfig(pydantic.BaseModel):
     # Online augmentation (applied per batch during training only)
     online_aug: Optional[OnlineAugConfig] = None
 
+    # Regenerate NCA2D train data every epoch while keeping the initial test split fixed.
+    online_nca_training: Optional[OnlineNCATrainingConfig] = None
+
     # Replace model inputs with a randomly masked version of the labels.
     masked_input: Optional[MaskedInputConfig] = None
 
@@ -175,6 +189,7 @@ class TrainState:
 
     step: int
     total_steps: int
+    epoch: int = 0
     accum_step: int = 0
 
 
@@ -229,11 +244,162 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
     if is_test:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
+    persistent_workers = not (_online_nca_training_enabled(config) and not is_test)
     dataloader = DataLoader(
-        dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True
+        dataset,
+        batch_size=None,
+        num_workers=1,
+        prefetch_factor=8,
+        pin_memory=True,
+        persistent_workers=persistent_workers,
     )
     print(f"Created dataloader for split '{split}'.")
     return dataloader, dataset.metadata
+
+
+def _online_nca_training_enabled(config: PretrainConfig) -> bool:
+    return bool(config.online_nca_training is not None and config.online_nca_training.enabled)
+
+
+def _sync_online_nca_data_path(config: PretrainConfig) -> None:
+    if _online_nca_training_enabled(config):
+        assert config.online_nca_training is not None
+        config.data_path = config.online_nca_training.output_dir
+
+
+def _online_nca_generation_config(
+    online_cfg: OnlineNCATrainingConfig,
+    *,
+    output_dir: Optional[str] = None,
+) -> NCA2DDataConfig:
+    config_dict = online_cfg.model_dump()
+    config_dict.pop("enabled", None)
+    if output_dir is not None:
+        config_dict["output_dir"] = output_dir
+    return NCA2DDataConfig(**config_dict)
+
+
+def _online_nca_train_seed(online_cfg: OnlineNCATrainingConfig, epoch: int) -> int:
+    return int(online_cfg.seed + 2 * epoch)
+
+
+def _online_nca_test_seed(online_cfg: OnlineNCATrainingConfig) -> int:
+    return int(online_cfg.seed + 1)
+
+
+def _load_split_metadata(dataset_path: str, split: str) -> PuzzleDatasetMetadata:
+    metadata_path = Path(dataset_path) / split / "dataset.json"
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        return PuzzleDatasetMetadata(**json.load(f))
+
+
+def _assert_metadata_compatible(
+    expected: PuzzleDatasetMetadata,
+    actual: PuzzleDatasetMetadata,
+    *,
+    split: str,
+) -> None:
+    compared_fields = (
+        "seq_len",
+        "vocab_size",
+        "num_puzzle_identifiers",
+        "variable_seq_lengths",
+        "position_id_shape",
+        "sequence_layout",
+        "train_target_mode",
+        "answer_slot_max_grid_size",
+    )
+    mismatches = [
+        f"{field}: expected={getattr(expected, field)!r}, got={getattr(actual, field)!r}"
+        for field in compared_fields
+        if getattr(expected, field) != getattr(actual, field)
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Online NCA {split} metadata changed in an incompatible way:\n" + "\n".join(mismatches)
+        )
+
+
+def _cleanup_dataloader(dataloader: Optional[torch.utils.data.DataLoader]) -> None:
+    if dataloader is None:
+        return
+
+    iterator = getattr(dataloader, "_iterator", None)
+    shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown_workers):
+        shutdown_workers()
+
+    gc.collect()
+
+
+def _generate_online_nca_test_split(online_cfg: OnlineNCATrainingConfig, rank: int) -> None:
+    root_cfg = _online_nca_generation_config(online_cfg, output_dir=online_cfg.output_dir)
+    save_nca2d_dataset_config(root_cfg)
+    test_seed = _online_nca_test_seed(online_cfg)
+    if rank == 0:
+        print(
+            "Generating fixed online NCA test split "
+            f"at {online_cfg.output_dir} with seed {test_seed}"
+        )
+    test_arrays, test_stats = generate_nca2d_split("test", root_cfg.test_size, test_seed, root_cfg)
+    save_nca2d_split("test", test_arrays, test_stats, root_cfg)
+
+
+def _generate_online_nca_train_split(
+    online_cfg: OnlineNCATrainingConfig,
+    *,
+    epoch: int,
+    rank: int,
+) -> None:
+    output_root = Path(online_cfg.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    save_nca2d_dataset_config(_online_nca_generation_config(online_cfg, output_dir=str(output_root)))
+
+    train_seed = _online_nca_train_seed(online_cfg, epoch)
+    temp_root = output_root.parent / f".{output_root.name}.epoch{epoch:06d}.tmp"
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+
+    temp_cfg = _online_nca_generation_config(online_cfg, output_dir=str(temp_root))
+    if rank == 0:
+        print(
+            f"Generating online NCA train split for epoch {epoch} "
+            f"at {output_root} with seed {train_seed}"
+        )
+
+    train_arrays, train_stats = generate_nca2d_split("train", temp_cfg.train_size, train_seed, temp_cfg)
+    save_nca2d_split("train", train_arrays, train_stats, temp_cfg)
+
+    final_train_dir = output_root / "train"
+    temp_train_dir = temp_root / "train"
+    if final_train_dir.exists():
+        shutil.rmtree(final_train_dir)
+    os.replace(temp_train_dir, final_train_dir)
+    shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def prepare_online_nca_dataset(
+    config: PretrainConfig,
+    *,
+    epoch: int,
+    regenerate_test: bool,
+    rank: int,
+    world_size: int,
+) -> None:
+    if not _online_nca_training_enabled(config):
+        return
+
+    assert config.online_nca_training is not None
+    if world_size > 1:
+        dist.barrier()
+
+    if rank == 0:
+        if regenerate_test:
+            _generate_online_nca_test_split(config.online_nca_training, rank=rank)
+        _generate_online_nca_train_split(config.online_nca_training, epoch=epoch, rank=rank)
+
+    if world_size > 1:
+        dist.barrier()
 
 
 def _apply_position_id_shape_to_model_cfg(model_cfg: dict, position_id_shape: Optional[Sequence[int]]) -> dict:
@@ -369,6 +535,7 @@ def init_train_state(
     train_state = TrainState(
         step=0,
         total_steps=total_steps,
+        epoch=0,
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
@@ -387,6 +554,7 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     os.makedirs(config.checkpoint_path, exist_ok=True)
     state = {
         "step": train_state.step,
+        "epoch": train_state.epoch,
         "model_state_dict": train_state.model.state_dict(),
         "optimizer_states": [optim.state_dict() for optim in train_state.optimizers],
     }
@@ -532,6 +700,7 @@ def _load_checkpoint_payload(load_path: str, checkpoint_path: Optional[str], ran
         state_dict = checkpoint["model_state_dict"]
         optimizer_states = checkpoint.get("optimizer_states")
         step = checkpoint.get("step")
+        epoch = checkpoint.get("epoch")
         rng_state = checkpoint.get("rng_state")
         cuda_rng_state = checkpoint.get("cuda_rng_state")
     else:
@@ -539,10 +708,11 @@ def _load_checkpoint_payload(load_path: str, checkpoint_path: Optional[str], ran
         state_dict = checkpoint
         optimizer_states = None
         step = None
+        epoch = None
         rng_state = None
         cuda_rng_state = None
 
-    return state_dict, optimizer_states, step, rng_state, cuda_rng_state
+    return state_dict, optimizer_states, step, epoch, rng_state, cuda_rng_state
 
 
 def _load_model_state(train_state: TrainState, config: PretrainConfig, state_dict: dict, rank: int):
@@ -568,7 +738,7 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
     if load_path is None:
         return
 
-    state_dict, optimizer_states, step, rng_state, cuda_rng_state = _load_checkpoint_payload(
+    state_dict, optimizer_states, step, epoch, rng_state, cuda_rng_state = _load_checkpoint_payload(
         load_path, checkpoint_path=config.checkpoint_path, rank=rank
     )
     _load_model_state(train_state, config, state_dict, rank)
@@ -588,6 +758,8 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
 
     if step is not None:
         train_state.step = int(step)
+    if epoch is not None:
+        train_state.epoch = int(epoch)
 
     # Reset carry since we do not serialize it
     train_state.carry = None
@@ -625,7 +797,7 @@ def load_checkpoint_file(train_state: TrainState, config: PretrainConfig, rank: 
     if load_path is None:
         return
 
-    state_dict, _, _, _, _ = _load_checkpoint_payload(
+    state_dict, _, _, _, _, _ = _load_checkpoint_payload(
         load_path, checkpoint_path=config.checkpoint_path, rank=rank
     )
     _load_model_state(train_state, config, state_dict, rank)
@@ -1055,6 +1227,75 @@ def _prefix_metrics(metrics: Any, prefix: str):
     return prefixed
 
 
+def _run_eval_phase(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_loader: Optional[torch.utils.data.DataLoader],
+    eval_metadata: Optional[PuzzleDatasetMetadata],
+    evaluators: List[Any],
+    ema_helper: Optional[EMAHelper],
+    *,
+    rank: int,
+    world_size: int,
+    cpu_group: Optional[dist.ProcessGroup],
+) -> None:
+    if eval_loader is None or eval_metadata is None:
+        return
+
+    if config.ema and ema_helper is not None:
+        train_state_eval = copy.deepcopy(train_state)
+        train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+    else:
+        train_state_eval = train_state
+
+    train_state_eval.model.eval()
+    loop_config = _get_loop_config(train_state_eval.model)
+    original_loops = None
+    if loop_config is not None:
+        original_loops = loop_config.loops
+        if len(config.loop_deltas) == 0:
+            config.loop_deltas = [0, 8]
+        else:
+            config.loop_deltas = [0]
+
+    for delta in config.loop_deltas:
+        if loop_config is not None and original_loops is not None:
+            loop_config.loops = original_loops + delta
+
+        metrics = evaluate(
+            config,
+            train_state_eval,
+            eval_loader,
+            eval_metadata,
+            evaluators,
+            rank=rank,
+            world_size=world_size,
+            cpu_group=cpu_group,
+        )
+        if rank == 0 and metrics is not None:
+            wandb.log(metrics, step=train_state.step)
+
+    if loop_config is not None and original_loops is not None:
+        loop_config.loops = original_loops
+
+    if config.ema and ema_helper is not None and train_state_eval is not train_state:
+        del train_state_eval
+
+
+def _save_checkpoint_snapshot(
+    config: PretrainConfig,
+    train_state: TrainState,
+    ema_helper: Optional[EMAHelper],
+) -> None:
+    if config.ema and ema_helper is not None:
+        ts_to_save = copy.deepcopy(train_state)
+        ts_to_save.model = ema_helper.ema_copy(ts_to_save.model)
+        save_train_state(config, ts_to_save)
+        del ts_to_save
+    else:
+        save_train_state(config, train_state)
+
+
 def _build_pretrain_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
     config_dict = OmegaConf.to_container(hydra_config, resolve=True)
     if not isinstance(config_dict, dict):
@@ -1167,29 +1408,46 @@ def launch(hydra_config: DictConfig):
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    _sync_online_nca_data_path(config)
+    if config.eval_interval is None or config.eval_interval <= 0:
+        raise ValueError("eval_interval must be a positive integer.")
+
+    online_nca_enabled = _online_nca_training_enabled(config)
+    if online_nca_enabled:
+        prepare_online_nca_dataset(
+            config,
+            epoch=0,
+            regenerate_test=True,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+
     if RANK == 0:
         print("Config:")
         print(config.model_dump_json(indent=2))
+
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
-    # Dataset
-    # Train loader
-    train_epochs_per_iter = config.eval_interval
-    total_iters = config.epochs // train_epochs_per_iter
+    train_loader = None
+    if online_nca_enabled:
+        train_epochs_per_iter = 1
+        total_iters = config.epochs
+        train_metadata = _load_split_metadata(config.data_path, "train")
+    else:
+        train_epochs_per_iter = config.eval_interval
+        total_iters = config.epochs // train_epochs_per_iter
+        assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
+        train_loader, train_metadata = create_dataloader(
+            config,
+            "train",
+            test_set_mode=False,
+            epochs_per_iter=train_epochs_per_iter,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
 
-    assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
-
-    train_loader, train_metadata = create_dataloader(
-        config,
-        "train",
-        test_set_mode=False,
-        epochs_per_iter=train_epochs_per_iter,
-        global_batch_size=config.global_batch_size,
-        rank=RANK,
-        world_size=WORLD_SIZE,
-    )
-    
     # Eval loader
     if config.benchmark_steps > 0:
         eval_loader = eval_metadata = None
@@ -1208,19 +1466,49 @@ def launch(hydra_config: DictConfig):
             print("len(eval_loader) =", len(eval_loader))
             print("eval_problem_counts =", len(eval_loader) * config.global_batch_size)
             print("eval_metadata =", eval_metadata)
-            # Evaluators
             evaluators = create_evaluators(config, eval_metadata)
         except FileNotFoundError as e:
-            print(f"eval metadata FileNotFoundError")
+            print("eval metadata FileNotFoundError")
             print(e)
             eval_loader = eval_metadata = None
             evaluators = []
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    if not online_nca_enabled and train_state.epoch % train_epochs_per_iter != 0:
+        raise ValueError(
+            "Checkpoint epoch is not aligned with eval_interval. "
+            "Resume expects checkpoints saved after a full evaluation interval."
+        )
+
+    online_train_epoch_ready = 0 if online_nca_enabled and train_state.epoch == 0 else None
 
     if config.benchmark_steps > 0:
+        if online_nca_enabled:
+            target_epoch = train_state.epoch
+            if online_train_epoch_ready != target_epoch:
+                prepare_online_nca_dataset(
+                    config,
+                    epoch=target_epoch,
+                    regenerate_test=False,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                )
+                online_train_epoch_ready = target_epoch
+            train_loader, benchmark_metadata = create_dataloader(
+                config,
+                "train",
+                test_set_mode=False,
+                epochs_per_iter=1,
+                global_batch_size=config.global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
+            _assert_metadata_compatible(train_metadata, benchmark_metadata, split="train")
+
+        assert train_loader is not None
         benchmark_training_steps(config, train_state, train_loader, rank=RANK, world_size=WORLD_SIZE)
+        _cleanup_dataloader(train_loader)
         if dist.is_initialized():
             dist.destroy_process_group()
         return
@@ -1260,19 +1548,41 @@ def launch(hydra_config: DictConfig):
         print(f"Parameter: {name}, Shape: {param.shape}, Size: {param.numel()}")
     print(eval_loader, eval_metadata, evaluators)
 
+    start_iter = train_state.epoch if online_nca_enabled else train_state.epoch // train_epochs_per_iter
+
     # Training Loop
-    for _iter_id in range(total_iters):
+    for _iter_id in range(start_iter, total_iters):
         if RANK == 0:
-            count = 0
-            # for set_name, batch, global_batch_size in train_loader:
-            #     count += 1
             print(f"_iter_id: {_iter_id}")
             print(f"train_epochs_per_iter: {train_epochs_per_iter}")
             print(f"total_iters: {total_iters}")
-            #print(f"train_loader len: {count}")
             print(f"Epoch {_iter_id * train_epochs_per_iter}")
 
-        ############ Train Iter
+        if online_nca_enabled:
+            if online_train_epoch_ready != _iter_id:
+                prepare_online_nca_dataset(
+                    config,
+                    epoch=_iter_id,
+                    regenerate_test=False,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                )
+                online_train_epoch_ready = _iter_id
+
+            train_loader, epoch_train_metadata = create_dataloader(
+                config,
+                "train",
+                test_set_mode=False,
+                epochs_per_iter=1,
+                global_batch_size=config.global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
+            _assert_metadata_compatible(train_metadata, epoch_train_metadata, split="train")
+
+        assert train_loader is not None
+
+        # Train iteration
         train_state.model.train()
 
         for set_name, batch, global_batch_size in train_loader:
@@ -1288,56 +1598,33 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)
 
-        ############ Evaluation
-        if eval_loader is not None and eval_metadata is not None:
-            # 选择用于评估的 train_state（EMA 或原始）
-            if config.ema and ema_helper is not None:
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-            else:
-                train_state_eval = train_state
+        train_state.epoch = _iter_id + train_epochs_per_iter
 
-            train_state_eval.model.eval()
-            loop_config = _get_loop_config(train_state_eval.model)
-            if loop_config is not None:
-                original_loops = loop_config.loops
-                if len(config.loop_deltas) == 0:
-                    config.loop_deltas = [0, 8]
-                else:
-                    config.loop_deltas = [0]
-            for delta in config.loop_deltas:
-                if loop_config is not None:
-                    loop_config.loops = original_loops + delta
+        if online_nca_enabled:
+            _cleanup_dataloader(train_loader)
+            train_loader = None
 
-                metrics = evaluate(
-                    config,
-                    train_state_eval,
-                    eval_loader,
-                    eval_metadata,
-                    evaluators,
-                    rank=RANK,
-                    world_size=WORLD_SIZE,
-                    cpu_group=CPU_PROCESS_GROUP,
-                )
-                if RANK == 0 and metrics is not None:
-                    wandb.log(metrics, step=train_state.step)
+        is_last_iter = _iter_id == total_iters - 1
+        should_run_eval = (
+            eval_loader is not None
+            and eval_metadata is not None
+            and ((train_state.epoch % config.eval_interval == 0) or is_last_iter)
+        )
+        if should_run_eval:
+            _run_eval_phase(
+                config,
+                train_state,
+                eval_loader,
+                eval_metadata,
+                evaluators,
+                ema_helper,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+                cpu_group=CPU_PROCESS_GROUP,
+            )
 
-            if loop_config is not None:
-                loop_config.loops = original_loops
-
-            # 用完临时的 eval state 后可以丢掉，节省显存/内存
-            if config.ema and ema_helper is not None and train_state_eval is not train_state:
-                del train_state_eval
-
-        if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-            if config.ema and ema_helper is not None:
-                # 临时拷贝一个带 EMA 权重的 state 来保存
-                ts_to_save = copy.deepcopy(train_state)
-                ts_to_save.model = ema_helper.ema_copy(ts_to_save.model)
-                save_train_state(config, ts_to_save)
-                del ts_to_save
-            else:
-                save_train_state(config, train_state)
+        if RANK == 0 and (is_last_iter or (config.checkpoint_every_eval and should_run_eval)):
+            _save_checkpoint_snapshot(config, train_state, ema_helper)
 
 
     # finalize
