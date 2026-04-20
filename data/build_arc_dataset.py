@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 import os
 import json
@@ -24,6 +24,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     num_aug: int = 1000
     no_padding: bool = False
+    arc_gen_dir: Optional[str] = "data/arc-gen"
     
     
 ARCMaxGridSize = 30
@@ -127,6 +128,68 @@ def puzzle_hash(puzzle: dict):
     return hashlib.sha256("|".join(hashes).encode()).hexdigest()
 
 
+def load_arc_gen_puzzles(arc_gen_dir: str):
+    arc_gen_puzzles = {}
+    total_examples = 0
+
+    for file_name in sorted(os.listdir(arc_gen_dir)):
+        if not file_name.endswith(".json"):
+            continue
+
+        puzzle_id = os.path.splitext(file_name)[0]
+        with open(os.path.join(arc_gen_dir, file_name), "r") as f:
+            examples = json.load(f)
+
+        assert isinstance(examples, list), f"{file_name} must contain a list of examples"
+
+        normalized_examples = []
+        for idx, example in enumerate(examples):
+            assert isinstance(example, dict), f"{file_name}[{idx}] must be an object"
+            assert "input" in example and "output" in example, (
+                f"{file_name}[{idx}] must contain both 'input' and 'output'"
+            )
+            normalized_examples.append(
+                {
+                    "input": example["input"],
+                    "output": example["output"],
+                }
+            )
+
+        arc_gen_puzzles[puzzle_id] = normalized_examples
+        total_examples += len(normalized_examples)
+
+    print(
+        f"Loaded {len(arc_gen_puzzles)} arc-gen puzzles with "
+        f"{total_examples} generated train examples from {arc_gen_dir}"
+    )
+    return arc_gen_puzzles
+
+
+def merge_arc_gen_into_training_puzzles(
+    puzzles: Dict[str, dict],
+    arc_gen_puzzles: Dict[str, List[dict]],
+):
+    matched_puzzles = 0
+    missing_puzzles = 0
+    added_examples = 0
+
+    for puzzle_id, generated_examples in arc_gen_puzzles.items():
+        if puzzle_id not in puzzles:
+            missing_puzzles += 1
+            continue
+
+        puzzles[puzzle_id].setdefault("train", [])
+        puzzles[puzzle_id]["train"].extend(generated_examples)
+        matched_puzzles += 1
+        added_examples += len(generated_examples)
+
+    print(
+        f"Merged arc-gen into {matched_puzzles} training puzzles "
+        f"(+{added_examples} train examples, {missing_puzzles} unmatched puzzles)"
+    )
+    return matched_puzzles, added_examples, missing_puzzles
+
+
 def aug(name: str):
     # Augment plan
     trans_id = np.random.randint(0, 8)
@@ -207,6 +270,14 @@ def load_puzzles_arcagi(config: DataProcessConfig):
     results = {}
 
     total_puzzles = 0
+
+    arc_gen_puzzles = {}
+    if "training" in config.subsets and config.arc_gen_dir:
+        if os.path.isdir(config.arc_gen_dir):
+            arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
+        else:
+            print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
+
     for subset_name in config.subsets:
         # Load all puzzles in this subset
         with open(f"{config.input_file_prefix}_{subset_name}-challenges.json", "r") as f:
@@ -229,6 +300,14 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             for puzzle_id, puzzle in puzzles.items():
                 for example in puzzle["test"]:
                     example.setdefault("output", [[0]])
+
+        if subset_name == "training" and arc_gen_puzzles:
+            train_examples_before = sum(len(puzzle.get("train", [])) for puzzle in puzzles.values())
+            _, added_examples, _ = merge_arc_gen_into_training_puzzles(puzzles, arc_gen_puzzles)
+            print(
+                f"Training subset train examples: "
+                f"{train_examples_before} -> {train_examples_before + added_examples}"
+            )
 
         # Shuffle puzzles
         puzzles = list(puzzles.items())
