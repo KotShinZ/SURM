@@ -25,6 +25,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     num_aug: int = 1000
     no_padding: bool = False
+    include_arc_gen: bool = False
     arc_gen_dir: Optional[str] = "data/arc-gen"
     
     
@@ -366,11 +367,16 @@ def load_puzzles_arcagi(config: DataProcessConfig):
     total_puzzles = 0
 
     arc_gen_puzzles = {}
-    if "training" in config.subsets and config.arc_gen_dir:
-        if os.path.isdir(config.arc_gen_dir):
-            arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
+    if "training" in config.subsets:
+        if not config.include_arc_gen:
+            print("ARC-GEN integration disabled by config, skipping")
+        elif config.arc_gen_dir:
+            if os.path.isdir(config.arc_gen_dir):
+                arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
+            else:
+                print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
         else:
-            print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
+            print("ARC-GEN integration enabled but no arc_gen_dir was provided, skipping")
 
     for subset_name in config.subsets:
         # Load all puzzles in this subset
