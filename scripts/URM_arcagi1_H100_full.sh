@@ -1,5 +1,5 @@
 # Example: WANDB_MODE=offline bash scripts/URM_arcagi1_H100_full.sh
-run_name="URM-arcagi1-full-RoPE3D"
+run_name="URM-arcagi1-full-RoPE4D"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
