@@ -136,6 +136,7 @@ class PretrainConfig(pydantic.BaseModel):
     load_checkpoint_file: Optional[str] = None
     load_strict: bool = True
     load_optimizer_state: bool = True
+    torch_compile: bool = True
 
     seed: int = 0
     checkpoint_every_eval: bool = False
@@ -275,7 +276,15 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        model = torch.compile(model, dynamic=train_metadata.variable_seq_lengths)  # type: ignore
+        if config.torch_compile:
+            if rank == 0:
+                print(
+                    "torch.compile enabled "
+                    f"(dynamic={train_metadata.variable_seq_lengths})"
+                )
+            model = torch.compile(model, dynamic=train_metadata.variable_seq_lengths)  # type: ignore
+        elif rank == 0:
+            print("torch.compile disabled")
 
         # Broadcast parameters from rank 0
         if world_size > 1:

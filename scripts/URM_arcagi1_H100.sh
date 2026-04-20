@@ -10,7 +10,8 @@ arch.grid_height=30 arch.grid_width=30 \
 global_batch_size=768 \
 grad_accum_steps=1 \
 epochs=2000 \
-eval_interval=20 \
+eval_interval=50 \
+torch_compile=False \
 puzzle_emb_lr=1e-2 \
 weight_decay=0.1 \
 +run_name=$run_name \
