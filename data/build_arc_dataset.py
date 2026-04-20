@@ -7,6 +7,7 @@ import numpy as np
 
 from argdantic import ArgParser
 from pydantic import BaseModel
+from tqdm import tqdm
 
 from data.common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
@@ -49,6 +50,73 @@ def arc_grid_to_np(grid: List[List[int]]):
     # Element check
     assert np.all((arr >= 0) & (arr <= 9))
     return arr.astype(np.uint8)
+
+
+def arc_grid_shape(grid: List[List[int]]):
+    return len(grid), max((len(row) for row in grid), default=0)
+
+
+def is_supported_arc_grid(grid: List[List[int]]):
+    height, width = arc_grid_shape(grid)
+    return height <= ARCMaxGridSize and width <= ARCMaxGridSize
+
+
+def filter_arc_examples_by_size(examples: List[dict]):
+    filtered_examples = []
+    removed_examples = 0
+
+    for example in examples:
+        if is_supported_arc_grid(example["input"]) and is_supported_arc_grid(example["output"]):
+            filtered_examples.append(example)
+        else:
+            removed_examples += 1
+
+    return filtered_examples, removed_examples
+
+
+def filter_puzzles_by_size(
+    puzzles: Dict[str, dict],
+    *,
+    source_name: str,
+):
+    filtered_puzzles = {}
+    removed_by_example_type = {}
+    removed_puzzles = 0
+
+    for puzzle_id, puzzle in puzzles.items():
+        filtered_puzzle = {}
+        kept_any_examples = False
+
+        for example_type, examples in puzzle.items():
+            filtered_examples, removed_examples = filter_arc_examples_by_size(examples)
+            filtered_puzzle[example_type] = filtered_examples
+            kept_any_examples = kept_any_examples or bool(filtered_examples)
+            removed_by_example_type[example_type] = (
+                removed_by_example_type.get(example_type, 0) + removed_examples
+            )
+
+        if kept_any_examples:
+            filtered_puzzles[puzzle_id] = filtered_puzzle
+        else:
+            removed_puzzles += 1
+
+    removed_summary = ", ".join(
+        f"{example_type}={count}"
+        for example_type, count in sorted(removed_by_example_type.items())
+        if count > 0
+    )
+    if removed_summary:
+        print(
+            f"Filtered out {source_name} examples with size >= {ARCMaxGridSize}x{ARCMaxGridSize}: "
+            f"{removed_summary}"
+        )
+    if removed_puzzles > 0:
+        print(
+            f"Dropped {removed_puzzles} {source_name} puzzles after size filtering because "
+            f"no examples remained"
+        )
+
+    return filtered_puzzles
 
 
 def np_grid_to_fixed_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_translation: bool):
@@ -131,8 +199,12 @@ def puzzle_hash(puzzle: dict):
 def load_arc_gen_puzzles(arc_gen_dir: str):
     arc_gen_puzzles = {}
     total_examples = 0
+    removed_examples = 0
 
-    for file_name in sorted(os.listdir(arc_gen_dir)):
+    for file_name in tqdm(
+        sorted(os.listdir(arc_gen_dir)),
+        desc="Loading arc-gen puzzles",
+    ):
         if not file_name.endswith(".json"):
             continue
 
@@ -155,13 +227,21 @@ def load_arc_gen_puzzles(arc_gen_dir: str):
                 }
             )
 
+        normalized_examples, removed = filter_arc_examples_by_size(normalized_examples)
+
         arc_gen_puzzles[puzzle_id] = normalized_examples
         total_examples += len(normalized_examples)
+        removed_examples += removed
 
     print(
         f"Loaded {len(arc_gen_puzzles)} arc-gen puzzles with "
         f"{total_examples} generated train examples from {arc_gen_dir}"
     )
+    if removed_examples > 0:
+        print(
+            f"Filtered out {removed_examples} arc-gen examples with size >= "
+            f"{ARCMaxGridSize}x{ARCMaxGridSize}"
+        )
     return arc_gen_puzzles
 
 
@@ -173,7 +253,11 @@ def merge_arc_gen_into_training_puzzles(
     missing_puzzles = 0
     added_examples = 0
 
-    for puzzle_id, generated_examples in arc_gen_puzzles.items():
+    for puzzle_id, generated_examples in tqdm(
+        arc_gen_puzzles.items(),
+        total=len(arc_gen_puzzles),
+        desc="Merging arc-gen puzzles",
+    ):
         if puzzle_id not in puzzles:
             missing_puzzles += 1
             continue
@@ -223,9 +307,17 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
     for example_type, examples in puzzle.items():
+        if len(examples) == 0:
+            continue
         # Map to target split
         dest = dest_mapping[example_type]
         converted[dest].examples.extend([(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"])) for example in examples])
+
+    converted = {dest: converted_puzzle for dest, converted_puzzle in converted.items() if converted_puzzle.examples}
+    if not converted:
+        return set()
+
+    dests = set(converted.keys())
 
     group = [converted]
     
@@ -257,6 +349,8 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
         results.setdefault(dest_split, {})
         results[dest_split].setdefault(dest_set, [])
         results[dest_split][dest_set].append([converted[dest] for converted in group])
+
+    return dests
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
@@ -309,13 +403,19 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 f"{train_examples_before} -> {train_examples_before + added_examples}"
             )
 
+        puzzles = filter_puzzles_by_size(puzzles, source_name=subset_name)
+
         # Shuffle puzzles
         puzzles = list(puzzles.items())
         print (f"Shuffling {len(puzzles)} puzzles...")
         np.random.shuffle(puzzles)
         
         # Assign by fraction
-        for idx, (name, puzzle) in enumerate(puzzles):
+        for idx, (name, puzzle) in tqdm(
+            enumerate(puzzles),
+            total=len(puzzles),
+            desc=f"Converting {subset_name}",
+        ):
             fraction = idx / len(puzzles)
             test_examples_dest = None
             for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
@@ -325,11 +425,18 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                     
             assert test_examples_dest is not None
             
-            if test_examples_dest[0] == "test":
+            if test_examples_dest[0] == "test" and len(puzzle.get("test", [])) > 0:
                 test_puzzles[name] = puzzle
-                
-            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest})
-            total_puzzles += 1
+
+            used_dests = convert_single_arc_puzzle(
+                results,
+                name,
+                puzzle,
+                config.num_aug,
+                {"train": train_examples_dest, "test": test_examples_dest},
+            )
+            if used_dests:
+                total_puzzles += 1
 
     print (f"Total puzzles: {total_puzzles}")
     print (f"Total test puzzles: {len(test_puzzles)}")
@@ -354,8 +461,11 @@ def convert_dataset(config: DataProcessConfig):
         for subset_name, subset in split.items():
             print(" subset: ", subset_name)
             print("  group_len: ", len(subset))
-            for group in subset:
-                print(len(group),end=",")
+            for group in tqdm(
+                subset,
+                desc=f"Mapping IDs {split_name}/{subset_name}",
+                leave=False,
+            ):
                 for puzzle in group:
                     if puzzle.id not in identifier_map:
                         identifier_map[puzzle.id] = num_identifiers
@@ -385,7 +495,7 @@ def convert_dataset(config: DataProcessConfig):
             example_id = 0
             puzzle_id = 0
             
-            for group in subset:
+            for group in tqdm(subset, desc=f"Processing {split_name}/{subset_name}"):
                 for puzzle in group:
                     # Push puzzle
                     no_aug_id = np.random.randint(0, len(puzzle.examples))
