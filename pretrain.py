@@ -215,6 +215,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
+    # Keep dynamic ARC masking strictly on the training path.
+    arc_output_mask = config.arc_output_mask if not is_test else None
     dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
     dataset = dataset_cls(
         PuzzleDatasetConfig(
@@ -222,7 +224,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             data_fraction=data_fraction,
             online_aug=online_aug,
             masked_input=config.masked_input,
-            arc_output_mask=config.arc_output_mask,
+            arc_output_mask=arc_output_mask,
             **kwargs,
         ),
         split=split,
@@ -230,6 +232,18 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
     if is_test:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
+    elif dataset.metadata.train_target_mode == "random_output_pair":
+        min_context_pairs = dataset.metadata.min_context_pairs
+        if min_context_pairs is None and config.arc_output_mask is not None:
+            min_context_pairs = config.arc_output_mask.min_context_pairs
+        print(
+            "Training split uses dynamic ARC output masking"
+            + (
+                f" with min_context_pairs={min_context_pairs}."
+                if min_context_pairs is not None
+                else "."
+            )
+        )
     dataloader = DataLoader(
         dataset, batch_size=None, num_workers=1, prefetch_factor=8, pin_memory=True, persistent_workers=True
     )

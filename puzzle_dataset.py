@@ -43,6 +43,7 @@ class ARCOutputMaskConfig(pydantic.BaseModel):
     fill_mode: Literal["zero", "random_color"] = "zero"
     preserve_source_inputs: bool = True
     answer_slot_max_grid_size: Optional[int] = None
+    min_context_pairs: Optional[int] = None
 
     @pydantic.model_validator(mode="after")
     def _validate_answer_slot_size(self):
@@ -50,6 +51,11 @@ class ARCOutputMaskConfig(pydantic.BaseModel):
             raise ValueError(
                 "answer_slot_max_grid_size must be a positive integer when provided, "
                 f"got {self.answer_slot_max_grid_size}"
+            )
+        if self.min_context_pairs is not None and self.min_context_pairs < 0:
+            raise ValueError(
+                "min_context_pairs must be >= 0 when provided, "
+                f"got {self.min_context_pairs}"
             )
         return self
 
@@ -286,6 +292,14 @@ class PuzzleDataset(IterableDataset):
             return int(self.metadata.answer_slot_max_grid_size)
         return None
 
+    def _arc_min_context_pairs(self) -> Optional[int]:
+        cfg = self._arc_output_mask_cfg()
+        if cfg is not None and cfg.min_context_pairs is not None:
+            return int(cfg.min_context_pairs)
+        if self.metadata.min_context_pairs is not None:
+            return int(self.metadata.min_context_pairs)
+        return None
+
     def _arc_mask_fill_token(self, rng: np.random.Generator) -> int:
         cfg = self._arc_output_mask_cfg()
         assert cfg is not None
@@ -305,7 +319,6 @@ class PuzzleDataset(IterableDataset):
         self,
         sample_tokens: np.ndarray,
         sample_position_ids: np.ndarray,
-        rng: Optional[np.random.Generator] = None,
     ) -> List[Tuple[int, np.ndarray, np.ndarray]]:
         if sample_position_ids.ndim != 2 or sample_position_ids.shape[1] != 4:
             raise ValueError(
@@ -335,15 +348,45 @@ class PuzzleDataset(IterableDataset):
             if 0 in canvases and 1 in canvases:
                 pair_entries.append((pair_id, canvases[0], canvases[1]))
 
-        if rng is not None and len(pair_entries) > 1:
-            rng.shuffle(pair_entries)
-
         return pair_entries
+
+    def _sample_arc_training_pair_entries(
+        self,
+        pair_entries: List[Tuple[int, np.ndarray, np.ndarray]],
+        rng: np.random.Generator,
+    ) -> Tuple[List[Tuple[int, np.ndarray, np.ndarray]], int]:
+        if not pair_entries:
+            raise ValueError("ARC output masking found an empty sample with no valid pair entries.")
+
+        min_context_pairs = self._arc_min_context_pairs()
+        if min_context_pairs is None:
+            selected_indices = list(range(len(pair_entries)))
+            if len(selected_indices) > 1:
+                rng.shuffle(selected_indices)
+            target_selected_index = int(rng.integers(len(selected_indices)))
+            return [pair_entries[idx] for idx in selected_indices], target_selected_index
+
+        if len(pair_entries) < min_context_pairs + 1:
+            raise ValueError(
+                "ARC output masking requires at least min_context_pairs + 1 pair entries, "
+                f"got {len(pair_entries)} pairs for min_context_pairs={min_context_pairs}."
+            )
+
+        target_index = int(rng.integers(len(pair_entries)))
+        candidate_indices = [idx for idx in range(len(pair_entries)) if idx != target_index]
+        num_context = int(rng.integers(min_context_pairs, len(candidate_indices) + 1))
+        context_indices = rng.choice(candidate_indices, size=num_context, replace=False).tolist()
+        selected_indices = [*context_indices, target_index]
+        if len(selected_indices) > 1:
+            rng.shuffle(selected_indices)
+
+        target_selected_index = selected_indices.index(target_index)
+        return [pair_entries[idx] for idx in selected_indices], target_selected_index
 
     def _build_arc_masked_variable_sample(
         self,
         pair_entries: List[Tuple[int, np.ndarray, np.ndarray]],
-        target_pair_id: int,
+        target_pair_index: int,
         fill_token: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
         answer_slot_size = self._arc_answer_slot_size()
@@ -355,15 +398,15 @@ class PuzzleDataset(IterableDataset):
         max_pair_h = 0
         max_pair_w = 0
 
-        for pair_id, inp_canvas, out_canvas in pair_entries:
+        for pair_pos, (_pair_id, inp_canvas, out_canvas) in enumerate(pair_entries):
             masked_chunks.append(inp_canvas.reshape(-1).astype(np.int32, copy=False))
             label_chunks.append(np.zeros((inp_canvas.size,), dtype=np.int32))
             source_chunks.append(inp_canvas.reshape(-1).astype(np.int32, copy=False))
-            position_chunks.append(self._make_arc_position_ids(pair_id, 0, inp_canvas.shape))
+            position_chunks.append(self._make_arc_position_ids(pair_pos, 0, inp_canvas.shape))
             max_pair_h = max(max_pair_h, inp_canvas.shape[0])
             max_pair_w = max(max_pair_w, inp_canvas.shape[1])
 
-            if pair_id == target_pair_id:
+            if pair_pos == target_pair_index:
                 if answer_slot_size is None:
                     masked_out = np.full(out_canvas.shape, fill_token, dtype=np.int32)
                     label_out = out_canvas.astype(np.int32, copy=False)
@@ -381,7 +424,7 @@ class PuzzleDataset(IterableDataset):
             masked_chunks.append(masked_out.reshape(-1).astype(np.int32, copy=False))
             label_chunks.append(label_out.reshape(-1).astype(np.int32, copy=False))
             source_chunks.append(source_out.reshape(-1).astype(np.int32, copy=False))
-            position_chunks.append(self._make_arc_position_ids(pair_id, 1, masked_out.shape))
+            position_chunks.append(self._make_arc_position_ids(pair_pos, 1, masked_out.shape))
             max_pair_h = max(max_pair_h, masked_out.shape[0])
             max_pair_w = max(max_pair_w, masked_out.shape[1])
 
@@ -414,12 +457,8 @@ class PuzzleDataset(IterableDataset):
             pair_entries = self._extract_arc_pair_entries(
                 batch["inputs"][start:end],
                 batch["position_ids"][start:end],
-                rng=rng,
             )
-            if not pair_entries:
-                raise ValueError("ARC output masking found an empty sample with no valid pair entries.")
-
-            target_pair_id = int(pair_entries[int(rng.integers(len(pair_entries)))][0])
+            selected_pair_entries, target_pair_index = self._sample_arc_training_pair_entries(pair_entries, rng)
             fill_token = self._arc_mask_fill_token(rng)
             (
                 sample_inputs,
@@ -428,8 +467,8 @@ class PuzzleDataset(IterableDataset):
                 sample_position_ids,
                 seq_shape,
             ) = self._build_arc_masked_variable_sample(
-                pair_entries=pair_entries,
-                target_pair_id=target_pair_id,
+                pair_entries=selected_pair_entries,
+                target_pair_index=target_pair_index,
                 fill_token=fill_token,
             )
             masked_samples.append(sample_inputs)
@@ -466,7 +505,7 @@ class PuzzleDataset(IterableDataset):
         for sample_idx in range(batch["inputs"].shape[0]):
             sample_tokens = source_inputs[sample_idx]
             sample_position_ids = batch["position_ids"][sample_idx]
-            pair_entries = self._extract_arc_pair_entries(sample_tokens, sample_position_ids, rng=rng)
+            pair_entries = self._extract_arc_pair_entries(sample_tokens, sample_position_ids)
             if not pair_entries:
                 continue
 
