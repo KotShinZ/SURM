@@ -74,3 +74,5 @@ masked_input:
 arc_output_mask:
   enabled: true
   fill_mode: "zero" # Literal["zero", "random_color"] 
+  min_context_pairs: 2
+  max_context_pairs: 6

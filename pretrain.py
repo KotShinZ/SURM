@@ -233,14 +233,26 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     if is_test:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
     elif dataset.metadata.train_target_mode == "random_output_pair":
-        min_context_pairs = dataset.metadata.min_context_pairs
-        if min_context_pairs is None and config.arc_output_mask is not None:
-            min_context_pairs = config.arc_output_mask.min_context_pairs
+        min_context_pairs = config.arc_output_mask.min_context_pairs
+        max_context_pairs = config.arc_output_mask.max_context_pairs
+
+        if min_context_pairs is not None or max_context_pairs is not None:
+            if min_context_pairs is None:
+                range_text = f"up to max_context_pairs={max_context_pairs}"
+            elif max_context_pairs is None:
+                range_text = f"min_context_pairs={min_context_pairs}+"
+            else:
+                range_text = (
+                    f"min_context_pairs={min_context_pairs}, "
+                    f"max_context_pairs={max_context_pairs}"
+                )
+        else:
+            range_text = None
         print(
             "Training split uses dynamic ARC output masking"
             + (
-                f" with min_context_pairs={min_context_pairs}."
-                if min_context_pairs is not None
+                f" with {range_text}."
+                if range_text is not None
                 else "."
             )
         )

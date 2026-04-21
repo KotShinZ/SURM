@@ -44,6 +44,7 @@ class ARCOutputMaskConfig(pydantic.BaseModel):
     preserve_source_inputs: bool = True
     answer_slot_max_grid_size: Optional[int] = None
     min_context_pairs: Optional[int] = None
+    max_context_pairs: Optional[int] = None
 
     @pydantic.model_validator(mode="after")
     def _validate_answer_slot_size(self):
@@ -56,6 +57,21 @@ class ARCOutputMaskConfig(pydantic.BaseModel):
             raise ValueError(
                 "min_context_pairs must be >= 0 when provided, "
                 f"got {self.min_context_pairs}"
+            )
+        if self.max_context_pairs is not None and self.max_context_pairs < 0:
+            raise ValueError(
+                "max_context_pairs must be >= 0 when provided, "
+                f"got {self.max_context_pairs}"
+            )
+        if (
+            self.min_context_pairs is not None
+            and self.max_context_pairs is not None
+            and self.max_context_pairs < self.min_context_pairs
+        ):
+            raise ValueError(
+                "max_context_pairs must be >= min_context_pairs when both are provided, "
+                f"got min_context_pairs={self.min_context_pairs}, "
+                f"max_context_pairs={self.max_context_pairs}"
             )
         return self
 
@@ -319,6 +335,15 @@ class PuzzleDataset(IterableDataset):
             return int(self.metadata.min_context_pairs)
         return None
 
+    def _arc_max_context_pairs(self) -> Optional[int]:
+        cfg = self._arc_output_mask_cfg()
+        if cfg is not None and cfg.max_context_pairs is not None:
+            return int(cfg.max_context_pairs)
+        metadata_max_context_pairs = getattr(self.metadata, "max_context_pairs", None)
+        if metadata_max_context_pairs is not None:
+            return int(metadata_max_context_pairs)
+        return None
+
     def _arc_mask_fill_token(self, rng: np.random.Generator) -> int:
         cfg = self._arc_output_mask_cfg()
         assert cfg is not None
@@ -378,13 +403,15 @@ class PuzzleDataset(IterableDataset):
             raise ValueError("ARC output masking found an empty sample with no valid pair entries.")
 
         min_context_pairs = self._arc_min_context_pairs()
-        if min_context_pairs is None:
+        max_context_pairs = self._arc_max_context_pairs()
+        if min_context_pairs is None and max_context_pairs is None:
             selected_indices = list(range(len(pair_entries)))
             if len(selected_indices) > 1:
                 rng.shuffle(selected_indices)
             target_selected_index = int(rng.integers(len(selected_indices)))
             return [pair_entries[idx] for idx in selected_indices], target_selected_index
 
+        min_context_pairs = 0 if min_context_pairs is None else min_context_pairs
         if len(pair_entries) < min_context_pairs + 1:
             raise ValueError(
                 "ARC output masking requires at least min_context_pairs + 1 pair entries, "
@@ -393,7 +420,21 @@ class PuzzleDataset(IterableDataset):
 
         target_index = int(rng.integers(len(pair_entries)))
         candidate_indices = [idx for idx in range(len(pair_entries)) if idx != target_index]
-        num_context = int(rng.integers(min_context_pairs, len(candidate_indices) + 1))
+        max_available_context_pairs = len(candidate_indices)
+        max_context_pairs = (
+            max_available_context_pairs
+            if max_context_pairs is None
+            else min(max_context_pairs, max_available_context_pairs)
+        )
+        if max_context_pairs < min_context_pairs:
+            raise ValueError(
+                "ARC output masking resolved max_context_pairs smaller than min_context_pairs "
+                f"after accounting for the sample size: min_context_pairs={min_context_pairs}, "
+                f"max_context_pairs={max_context_pairs}, "
+                f"available_context_pairs={max_available_context_pairs}."
+            )
+
+        num_context = int(rng.integers(min_context_pairs, max_context_pairs + 1))
         context_indices = rng.choice(candidate_indices, size=num_context, replace=False).tolist()
         selected_indices = [*context_indices, target_index]
         if len(selected_indices) > 1:

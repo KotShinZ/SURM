@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import os
 import json
@@ -27,10 +27,13 @@ class DataProcessConfig(BaseModel):
     num_aug: int = 1000
     no_padding: bool = True
     min_context_pairs: int = 2
+    include_arc_gen: bool = False
+    arc_gen_dir: Optional[str] = "data/arc-gen"
 
 
 ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
+PositionIdsDType = np.uint16
 
 PuzzleIdSeparator = "|||"
 DummyPuzzleIdentifier = 1
@@ -52,6 +55,73 @@ def arc_grid_to_np(grid: List[List[int]]):
     # Element check
     assert np.all((arr >= 0) & (arr <= 9))
     return arr.astype(np.uint8)
+
+
+def arc_grid_shape(grid: List[List[int]]):
+    return len(grid), max((len(row) for row in grid), default=0)
+
+
+def is_supported_arc_grid(grid: List[List[int]]):
+    height, width = arc_grid_shape(grid)
+    return height <= ARCMaxGridSize and width <= ARCMaxGridSize
+
+
+def filter_arc_examples_by_size(examples: List[dict]):
+    filtered_examples = []
+    removed_examples = 0
+
+    for example in examples:
+        if is_supported_arc_grid(example["input"]) and is_supported_arc_grid(example["output"]):
+            filtered_examples.append(example)
+        else:
+            removed_examples += 1
+
+    return filtered_examples, removed_examples
+
+
+def filter_puzzles_by_size(
+    puzzles: Dict[str, dict],
+    *,
+    source_name: str,
+):
+    filtered_puzzles = {}
+    removed_by_example_type = {}
+    removed_puzzles = 0
+
+    for puzzle_id, puzzle in puzzles.items():
+        filtered_puzzle = {}
+        kept_any_examples = False
+
+        for example_type, examples in puzzle.items():
+            filtered_examples, removed_examples = filter_arc_examples_by_size(examples)
+            filtered_puzzle[example_type] = filtered_examples
+            kept_any_examples = kept_any_examples or bool(filtered_examples)
+            removed_by_example_type[example_type] = (
+                removed_by_example_type.get(example_type, 0) + removed_examples
+            )
+
+        if kept_any_examples:
+            filtered_puzzles[puzzle_id] = filtered_puzzle
+        else:
+            removed_puzzles += 1
+
+    removed_summary = ", ".join(
+        f"{example_type}={count}"
+        for example_type, count in sorted(removed_by_example_type.items())
+        if count > 0
+    )
+    if removed_summary:
+        print(
+            f"Filtered out {source_name} examples with size >= {ARCMaxGridSize}x{ARCMaxGridSize}: "
+            f"{removed_summary}"
+        )
+    if removed_puzzles > 0:
+        print(
+            f"Dropped {removed_puzzles} {source_name} puzzles after size filtering because "
+            f"no examples remained"
+        )
+
+    return filtered_puzzles
 
 
 def np_grid_to_fixed_seq_translational_augment(
@@ -138,6 +208,57 @@ def puzzle_hash(puzzle: ARCFullPuzzle):
     return hashlib.sha256(f"{target_repr}|{'|'.join(hashes)}".encode()).hexdigest()
 
 
+def load_arc_gen_puzzles(arc_gen_dir: str):
+    arc_gen_puzzles: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
+    total_examples = 0
+    removed_examples = 0
+
+    for file_name in tqdm(
+        sorted(os.listdir(arc_gen_dir)),
+        desc="Loading arc-gen puzzles",
+    ):
+        if not file_name.endswith(".json"):
+            continue
+
+        puzzle_id = os.path.splitext(file_name)[0]
+        with open(os.path.join(arc_gen_dir, file_name), "r") as f:
+            examples = json.load(f)
+
+        assert isinstance(examples, list), f"{file_name} must contain a list of examples"
+
+        normalized_examples = []
+        for idx, example in enumerate(examples):
+            assert isinstance(example, dict), f"{file_name}[{idx}] must be an object"
+            assert "input" in example and "output" in example, (
+                f"{file_name}[{idx}] must contain both 'input' and 'output'"
+            )
+            normalized_examples.append(
+                {
+                    "input": example["input"],
+                    "output": example["output"],
+                }
+            )
+
+        normalized_examples, removed = filter_arc_examples_by_size(normalized_examples)
+        arc_gen_puzzles[puzzle_id] = [
+            (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+            for example in normalized_examples
+        ]
+        total_examples += len(arc_gen_puzzles[puzzle_id])
+        removed_examples += removed
+
+    print(
+        f"Loaded {len(arc_gen_puzzles)} arc-gen puzzles with "
+        f"{total_examples} generated train examples from {arc_gen_dir}"
+    )
+    if removed_examples > 0:
+        print(
+            f"Filtered out {removed_examples} arc-gen examples with size >= "
+            f"{ARCMaxGridSize}x{ARCMaxGridSize}"
+        )
+    return arc_gen_puzzles
+
+
 def aug(name: str):
     # Augment plan
     trans_id = np.random.randint(0, 8)
@@ -198,6 +319,7 @@ def convert_single_arc_puzzle(
     aug_count: int,
     min_context_pairs: int,
     dest_mapping: Dict[str, Tuple[str, str]],
+    arc_gen_pairs: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
 ):
     train_pairs = [
         (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
@@ -207,21 +329,23 @@ def convert_single_arc_puzzle(
         (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
         for example in puzzle.get("test", [])
     ]
-    # print(f"Puzzle {name}: {len(train_pairs)} train pairs, {len(test_pairs)} test pairs")
+    # ARC-GEN augments the train-only template. Keep evaluation layouts based on
+    # the original solved ARC pairs so held-out test contexts stay unchanged.
+    train_pairs_for_train = [*train_pairs, *(arc_gen_pairs or [])]
 
     train_dest = dest_mapping["train"]
     test_dest = dest_mapping["test"]
 
     converted: Dict[Tuple[str, str], ARCFullPuzzle] = {}
     if train_dest == test_dest:
-        all_pairs = [*train_pairs, *test_pairs]
+        all_pairs = [*train_pairs_for_train, *test_pairs]
         converted[train_dest] = ARCFullPuzzle(
             id=name,
             pairs=all_pairs,
             target_indices=list(range(len(all_pairs))),
         )
     else:
-        converted[train_dest] = _build_train_template(name, train_pairs)
+        converted[train_dest] = _build_train_template(name, train_pairs_for_train)
         test_target_indices = [len(train_pairs) + len(test_pairs) - 1] if test_pairs else []
         converted[test_dest] = _build_joint_template(
             name,
@@ -290,6 +414,19 @@ def load_puzzles_arcagi(config: DataProcessConfig):
 
     total_puzzles = 0
     skipped_puzzles = 0
+
+    arc_gen_puzzles: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
+    if "training" in config.subsets:
+        if not config.include_arc_gen:
+            print("ARC-GEN integration disabled by config, skipping")
+        elif config.arc_gen_dir:
+            if os.path.isdir(config.arc_gen_dir):
+                arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
+            else:
+                print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
+        else:
+            print("ARC-GEN integration enabled but no arc_gen_dir was provided, skipping")
+
     for subset_name in config.subsets:
         # Load all puzzles in this subset
         with open(f"{config.input_file_prefix}_{subset_name}-challenges.json", "r") as f:
@@ -310,6 +447,28 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             for puzzle_id, puzzle in puzzles.items():
                 for example in puzzle["test"]:
                     example.setdefault("output", [[0]])
+
+        puzzles = filter_puzzles_by_size(puzzles, source_name=subset_name)
+
+        subset_arc_gen_puzzles = {}
+        if subset_name == "training" and arc_gen_puzzles:
+            subset_arc_gen_puzzles = {
+                puzzle_id: arc_gen_puzzles[puzzle_id]
+                for puzzle_id in arc_gen_puzzles
+                if puzzle_id in puzzles
+            }
+            matched_puzzles = len(subset_arc_gen_puzzles)
+            missing_puzzles = len(arc_gen_puzzles) - matched_puzzles
+            added_examples = sum(len(pairs) for pairs in subset_arc_gen_puzzles.values())
+            train_examples_before = sum(len(puzzle.get("train", [])) for puzzle in puzzles.values())
+            print(
+                f"Merged arc-gen into {matched_puzzles} training puzzles "
+                f"(+{added_examples} train examples, {missing_puzzles} unmatched puzzles)"
+            )
+            print(
+                f"Training subset train examples: "
+                f"{train_examples_before} -> {train_examples_before + added_examples}"
+            )
 
         # Shuffle puzzles
         puzzles = list(puzzles.items())
@@ -338,6 +497,7 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 config.num_aug,
                 config.min_context_pairs,
                 {"train": train_examples_dest, "test": test_examples_dest},
+                arc_gen_pairs=subset_arc_gen_puzzles.get(name),
             )
             if not converted:
                 skipped_puzzles += 1
@@ -419,11 +579,11 @@ def _make_pair_sequences(
 
 def _make_pair_position_ids(pair_shape: Tuple[int, int], example_index: int):
     pair_h, pair_w = pair_shape
-    rows = np.repeat(np.arange(pair_h, dtype=np.uint8), pair_w)
-    cols = np.tile(np.arange(pair_w, dtype=np.uint8), pair_h)
-    depth = np.full((pair_h * pair_w,), example_index, dtype=np.uint8)
-    input_io = np.zeros((pair_h * pair_w,), dtype=np.uint8)
-    output_io = np.ones((pair_h * pair_w,), dtype=np.uint8)
+    rows = np.repeat(np.arange(pair_h, dtype=PositionIdsDType), pair_w)
+    cols = np.tile(np.arange(pair_w, dtype=PositionIdsDType), pair_h)
+    depth = np.full((pair_h * pair_w,), example_index, dtype=PositionIdsDType)
+    input_io = np.zeros((pair_h * pair_w,), dtype=PositionIdsDType)
+    output_io = np.ones((pair_h * pair_w,), dtype=PositionIdsDType)
 
     input_position_ids = np.stack([depth, input_io, rows, cols], axis=-1)
     output_position_ids = np.stack([depth, output_io, rows, cols], axis=-1)
@@ -451,7 +611,7 @@ def _build_training_full_context_example(
         position_parts.extend([inp_pos_ids, out_pos_ids])
 
     sample_input = np.concatenate(input_parts).astype(np.uint8, copy=False)
-    sample_position_ids = np.concatenate(position_parts, axis=0).astype(np.uint8, copy=False)
+    sample_position_ids = np.concatenate(position_parts, axis=0).astype(PositionIdsDType, copy=False)
     seq_shape = (1, int(sample_input.shape[0]))
     return sample_input, seq_shape, sample_position_ids
 
@@ -505,7 +665,7 @@ def _build_full_context_example(
 
     sample_input = np.concatenate(input_parts).astype(np.uint8, copy=False)
     sample_label = np.concatenate(label_parts).astype(np.uint8, copy=False)
-    sample_position_ids = np.concatenate(position_parts, axis=0).astype(np.uint8, copy=False)
+    sample_position_ids = np.concatenate(position_parts, axis=0).astype(PositionIdsDType, copy=False)
     seq_shape = (1, int(sample_input.shape[0]))
     return sample_input, sample_label, seq_shape, sample_position_ids
 
@@ -588,6 +748,7 @@ def print_data(
     data: np.ndarray,
     pos_id: np.ndarray,
     title: str = "",
+    max_pairs: int = 8,
     max_rows: int = 12,
     max_cols: int = 12,
 ):
@@ -608,7 +769,13 @@ def print_data(
     print(f"{sample_name}: tokens={data.shape[0]}, pairs={num_pairs}")
     print("legend: . = blank/pad, E = eos, 0-9 = ARC colors")
 
-    for pair_idx in range(num_pairs):
+    pair_window = _display_window(num_pairs, max_pairs)
+    for pair_idx in pair_window:
+        if pair_idx is None:
+            print("  ...")
+            print()
+            continue
+
         input_grid = _extract_pair_grid(data, pos_id, pair_idx, is_output=False)
         output_grid = _extract_pair_grid(data, pos_id, pair_idx, is_output=True)
         if input_grid.shape != output_grid.shape:
@@ -784,9 +951,9 @@ def convert_dataset(config: DataProcessConfig):
                         )
                 elif key == "position_ids":
                     flat_positions = (
-                        np.concatenate(value, axis=0).astype(np.uint8, copy=False)
+                        np.concatenate(value, axis=0).astype(PositionIdsDType, copy=False)
                         if value
-                        else np.empty((0, 4), dtype=np.uint8)
+                        else np.empty((0, 4), dtype=PositionIdsDType)
                     )
                     np.save(
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),

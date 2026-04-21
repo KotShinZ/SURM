@@ -32,7 +32,7 @@ if "argdantic" not in sys.modules:
 
 from data.build_arc_dataset_full_2 import DataProcessConfig, convert_dataset  # noqa: E402
 from models.losses import IGNORE_LABEL_ID  # noqa: E402
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig  # noqa: E402
+from puzzle_dataset import ARCOutputMaskConfig, PuzzleDataset, PuzzleDatasetConfig  # noqa: E402
 
 
 ARC_MAX_GRID_SIZE = 30
@@ -210,7 +210,7 @@ class BuildARCDatasetFull2Tests(unittest.TestCase):
 
             target_source_canvas = _reconstruct_pair_canvas(
                 source_inputs.astype(np.uint8),
-                position_ids.astype(np.uint8),
+                position_ids.astype(np.int32),
                 target_pair_id,
                 1,
             )
@@ -318,7 +318,7 @@ class BuildARCDatasetFull2Tests(unittest.TestCase):
             )
             np.testing.assert_array_equal(
                 _reconstruct_pair_canvas(test_inputs, test_position_ids, 2, 1),
-                np.zeros(query_canvas_shape, dtype=np.uint8),
+                np.full(query_canvas_shape, 2, dtype=np.uint8),
             )
             np.testing.assert_array_equal(
                 _reconstruct_pair_canvas(test_labels, test_position_ids, 2, 1),
@@ -350,6 +350,191 @@ class BuildARCDatasetFull2Tests(unittest.TestCase):
             )
             np.testing.assert_array_equal(batch["labels"].numpy(), expected_batch_labels)
             np.testing.assert_array_equal(batch["position_ids"].numpy(), test_position_ids.astype(np.int32))
+
+    def test_arc_gen_can_expand_training_pairs_without_changing_eval_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+            arc_gen_dir = tmp_path / "arc-gen"
+            arc_gen_dir.mkdir()
+
+            training_puzzle = {
+                "p_train": {
+                    "train": [
+                        {"input": [[1]], "output": [[2]]},
+                        {"input": [[3]], "output": [[4]]},
+                        {"input": [[5]], "output": [[6]]},
+                    ],
+                    "test": [
+                        {"input": [[7]]},
+                    ],
+                }
+            }
+
+            self._write_subset(
+                input_prefix,
+                "training",
+                training_puzzle,
+                {"p_train": [[[8]]]},
+            )
+
+            generated_examples = [
+                {"input": [[idx % 10]], "output": [[(idx + 1) % 10]]}
+                for idx in range(260)
+            ]
+            with open(arc_gen_dir / "p_train.json", "w", encoding="utf-8") as f:
+                json.dump(generated_examples, f)
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["training"],
+                    test_set_name="training",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=True,
+                    min_context_pairs=2,
+                    include_arc_gen=True,
+                    arc_gen_dir=str(arc_gen_dir),
+                )
+            )
+
+            train_position_ids = np.load(output_dir / "train" / "all__position_ids.npy")
+            test_position_ids = np.load(output_dir / "test" / "all__position_ids.npy")
+            with open(output_dir / "train" / "dataset.json", encoding="utf-8") as f:
+                train_metadata = json.load(f)
+
+            self.assertEqual(train_position_ids.dtype, np.uint16)
+            self.assertEqual(int(train_position_ids[:, 0].max()), 262)
+            self.assertEqual(np.unique(train_position_ids[:, 0]).size, 263)
+            self.assertEqual(np.unique(test_position_ids[:, 0]).size, 4)
+            self.assertEqual(train_metadata["position_id_shape"][0], 263)
+
+    def test_arc_gen_can_be_disabled_for_full_context_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+            arc_gen_dir = tmp_path / "arc-gen"
+            arc_gen_dir.mkdir()
+
+            training_puzzle = {
+                "p_train": {
+                    "train": [
+                        {"input": [[1]], "output": [[2]]},
+                        {"input": [[3]], "output": [[4]]},
+                        {"input": [[5]], "output": [[6]]},
+                    ],
+                    "test": [
+                        {"input": [[7]]},
+                    ],
+                }
+            }
+
+            self._write_subset(
+                input_prefix,
+                "training",
+                training_puzzle,
+                {"p_train": [[[8]]]},
+            )
+
+            with open(arc_gen_dir / "p_train.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    [{"input": [[idx % 10]], "output": [[(idx + 1) % 10]]} for idx in range(260)],
+                    f,
+                )
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["training"],
+                    test_set_name="training",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=True,
+                    min_context_pairs=2,
+                    include_arc_gen=False,
+                    arc_gen_dir=str(arc_gen_dir),
+                )
+            )
+
+            train_position_ids = np.load(output_dir / "train" / "all__position_ids.npy")
+            test_position_ids = np.load(output_dir / "test" / "all__position_ids.npy")
+
+            self.assertEqual(np.unique(train_position_ids[:, 0]).size, 3)
+            self.assertEqual(np.unique(test_position_ids[:, 0]).size, 4)
+
+    def test_train_dataset_can_cap_sampled_context_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+
+            train_puzzle = {
+                "p_train": {
+                    "train": [
+                        {"input": [[1]], "output": [[2]]},
+                        {"input": [[3, 3]], "output": [[4, 4]]},
+                        {"input": [[5], [5]], "output": [[6], [6]]},
+                        {"input": [[7, 0], [7, 7]], "output": [[8, 8], [0, 8]]},
+                    ],
+                    "test": [
+                        {"input": [[9, 9, 9]], "output": [[1, 1, 1]]},
+                    ],
+                }
+            }
+
+            self._write_subset(
+                input_prefix,
+                "aux",
+                train_puzzle,
+                {"p_train": [[[1, 1, 1]]]},
+            )
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["aux"],
+                    test_set_name="heldout",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=True,
+                    min_context_pairs=2,
+                )
+            )
+
+            dataset = PuzzleDataset(
+                PuzzleDatasetConfig(
+                    seed=7,
+                    dataset_path=str(output_dir),
+                    global_batch_size=1,
+                    test_set_mode=False,
+                    epochs_per_iter=1,
+                    rank=0,
+                    num_replicas=1,
+                    arc_output_mask=ARCOutputMaskConfig(
+                        enabled=True,
+                        min_context_pairs=2,
+                        max_context_pairs=3,
+                    ),
+                ),
+                split="train",
+            )
+            _set_name, batch, effective_batch_size = next(iter(dataset))
+
+            self.assertEqual(effective_batch_size, 1)
+            position_ids = batch["position_ids"].numpy()
+            selected_pair_ids = np.unique(position_ids[:, 0]).astype(np.int32)
+            self.assertGreaterEqual(selected_pair_ids.size, 3)
+            self.assertLessEqual(selected_pair_ids.size, 4)
+
+    def test_arc_output_mask_rejects_max_below_min(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_context_pairs must be >= min_context_pairs"):
+            ARCOutputMaskConfig(min_context_pairs=3, max_context_pairs=2)
 
 
 if __name__ == "__main__":
