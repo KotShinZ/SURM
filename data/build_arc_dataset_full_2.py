@@ -8,6 +8,7 @@ import numpy as np
 
 from argdantic import ArgParser
 from pydantic import BaseModel
+from tqdm import tqdm
 
 from data.common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
@@ -316,7 +317,11 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         np.random.shuffle(puzzles)
 
         # Assign by fraction
-        for idx, (name, puzzle) in enumerate(puzzles):
+        for idx, (name, puzzle) in tqdm(
+            enumerate(puzzles),
+            total=len(puzzles),
+            desc=f"Converting {subset_name}",
+        ):
             fraction = idx / len(puzzles)
             test_examples_dest = None
             for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
@@ -423,6 +428,32 @@ def _make_pair_position_ids(pair_shape: Tuple[int, int], example_index: int):
     input_position_ids = np.stack([depth, input_io, rows, cols], axis=-1)
     output_position_ids = np.stack([depth, output_io, rows, cols], axis=-1)
     return input_position_ids, output_position_ids
+
+
+def _build_training_full_context_example(
+    puzzle: ARCFullPuzzle,
+    enable_translational_augment: bool,
+    no_padding: bool,
+):
+    ordered_indices = list(range(len(puzzle.pairs)))
+    no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
+
+    input_parts = []
+    position_parts = []
+
+    for pair_pos, pair_idx in enumerate(ordered_indices):
+        inp, out = puzzle.pairs[pair_idx]
+        do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
+        inp_seq, out_seq, pair_shape = _make_pair_sequences(inp, out, do_translation, no_padding)
+        inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
+
+        input_parts.extend([inp_seq, out_seq])
+        position_parts.extend([inp_pos_ids, out_pos_ids])
+
+    sample_input = np.concatenate(input_parts).astype(np.uint8, copy=False)
+    sample_position_ids = np.concatenate(position_parts, axis=0).astype(np.uint8, copy=False)
+    seq_shape = (1, int(sample_input.shape[0]))
+    return sample_input, seq_shape, sample_position_ids
 
 
 def _build_full_context_example(
@@ -604,6 +635,12 @@ def convert_dataset(config: DataProcessConfig):
     np.random.seed(config.seed)
     os.makedirs(config.output_dir, exist_ok=True)
 
+    if not config.no_padding:
+        raise ValueError(
+            "build_arc_dataset_full_2.py currently requires no_padding=True when "
+            "training labels are generated dynamically in the dataloader."
+        )
+
     # Read dataset
     data, test_puzzles = load_puzzles_arcagi(config)
 
@@ -626,7 +663,6 @@ def convert_dataset(config: DataProcessConfig):
         os.makedirs(os.path.join(config.output_dir, split_name), exist_ok=True)
 
         enable_translational_augment = split_name == "train"
-        use_all_pairs_in_order = split_name == "test"
 
         total_examples = 0
         total_puzzles = 0
@@ -636,7 +672,6 @@ def convert_dataset(config: DataProcessConfig):
         for subset_name, subset in split.items():
             results = {
                 "inputs": [],
-                "labels": [],
                 "puzzle_identifiers": [],
                 "puzzle_indices": [0],
                 "group_indices": [0],
@@ -644,27 +679,46 @@ def convert_dataset(config: DataProcessConfig):
             if config.no_padding:
                 results["seq_shapes"] = []
                 results["position_ids"] = []
+            if split_name != "train":
+                results["labels"] = []
 
             example_id = 0
             puzzle_id = 0
 
-            for group in subset:
+            for group in tqdm(subset, desc=f"Processing {split_name}/{subset_name}"):
                 for puzzle in group:
-                    for target_idx in puzzle.target_indices:
-                        built = _build_full_context_example(
-                            puzzle=puzzle,
-                            target_idx=target_idx,
-                            min_context_pairs=config.min_context_pairs,
-                            enable_translational_augment=enable_translational_augment,
-                            no_padding=config.no_padding,
-                            use_all_pairs_in_order=use_all_pairs_in_order,
-                        )
+                    if split_name == "train":
+                        built_examples = [
+                            _build_training_full_context_example(
+                                puzzle=puzzle,
+                                enable_translational_augment=enable_translational_augment,
+                                no_padding=config.no_padding,
+                            )
+                        ]
+                    else:
+                        built_examples = [
+                            _build_full_context_example(
+                                puzzle=puzzle,
+                                target_idx=target_idx,
+                                min_context_pairs=config.min_context_pairs,
+                                enable_translational_augment=enable_translational_augment,
+                                no_padding=config.no_padding,
+                                use_all_pairs_in_order=True,
+                            )
+                            for target_idx in puzzle.target_indices
+                        ]
+
+                    for built in built_examples:
                         if built is None:
                             continue
 
-                        inp, out, seq_shape, position_ids = built
+                        if split_name == "train":
+                            inp, seq_shape, position_ids = built
+                        else:
+                            inp, out, seq_shape, position_ids = built
                         results["inputs"].append(inp)
-                        results["labels"].append(out)
+                        if split_name != "train":
+                            results["labels"].append(out)
                         if config.no_padding:
                             results["seq_shapes"].append(seq_shape)
                             results["position_ids"].append(position_ids)
@@ -689,7 +743,7 @@ def convert_dataset(config: DataProcessConfig):
                 if key in {"inputs", "labels"}:
                     if config.no_padding:
                         if value:
-                            target_id = 20
+                            target_id = min(15, len(value) - 1)
                             print_data(
                                 value[target_id],
                                 results["position_ids"][target_id],
@@ -760,6 +814,8 @@ def convert_dataset(config: DataProcessConfig):
             sets=list(split.keys()),
             variable_seq_lengths=config.no_padding,
             position_id_shape=split_max_position_id.tolist() if config.no_padding and total_examples > 0 else None,
+            train_target_mode="random_output_pair" if split_name == "train" else None,
+            min_context_pairs=config.min_context_pairs if split_name == "train" else None,
         )
         print(f"  Total puzzles: {total_puzzles}")
         print(f"  Total examples: {total_examples}")
