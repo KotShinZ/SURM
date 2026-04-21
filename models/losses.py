@@ -112,6 +112,25 @@ from torch import nn
 IGNORE_LABEL_ID = -100
 
 
+def _packed_segment_ids(lengths: torch.Tensor, device: torch.device) -> torch.Tensor:
+    lengths = lengths.to(device=device, dtype=torch.long)
+    return torch.repeat_interleave(
+        torch.arange(lengths.shape[0], device=device, dtype=torch.long),
+        lengths,
+    )
+
+
+def _packed_segment_sum(
+    values: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    totals = torch.zeros((num_segments,), device=values.device, dtype=dtype)
+    totals.scatter_add_(0, segment_ids, values.to(dtype))
+    return totals
+
+
 def s(x, epsilon=1e-30):
     return torch.where(
         x<0,
@@ -184,21 +203,9 @@ class ACTLossHead(nn.Module):
                 is_correct = mask & (outputs["preds"] == labels)
 
                 lengths = new_carry.current_data["seq_lengths"].to(device=labels.device, dtype=torch.long)
-                loss_counts_list = []
-                correct_counts_list = []
-                offset = 0
-                for length in lengths.detach().cpu().tolist():
-                    next_offset = offset + int(length)
-                    loss_counts_list.append(mask[offset:next_offset].sum())
-                    correct_counts_list.append(is_correct[offset:next_offset].sum())
-                    offset = next_offset
-
-                if loss_counts_list:
-                    loss_counts = torch.stack(loss_counts_list)
-                    correct_counts = torch.stack(correct_counts_list)
-                else:
-                    loss_counts = torch.empty((0,), device=labels.device, dtype=torch.long)
-                    correct_counts = torch.empty((0,), device=labels.device, dtype=torch.long)
+                segment_ids = _packed_segment_ids(lengths, labels.device)
+                loss_counts = _packed_segment_sum(mask, segment_ids, lengths.shape[0], torch.long)
+                correct_counts = _packed_segment_sum(is_correct, segment_ids, lengths.shape[0], torch.long)
 
                 seq_is_correct = correct_counts == loss_counts
                 loss_divisor = loss_counts.clamp_min(1)
@@ -214,7 +221,7 @@ class ACTLossHead(nn.Module):
                     metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
 
             loss_values = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID)
-            token_divisor = torch.repeat_interleave(loss_divisor.to(loss_values.dtype), lengths)
+            token_divisor = loss_divisor.to(loss_values.dtype)[segment_ids]
             lm_loss = (loss_values / token_divisor).sum()
         else:
             with torch.no_grad():

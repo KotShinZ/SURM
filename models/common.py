@@ -30,3 +30,28 @@ def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2
             tensor.clip_(lower * comp_std, upper * comp_std)
 
     return tensor
+
+
+def packed_norm_ratio_from_lengths(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    lengths: torch.Tensor,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Compute per-segment ||x1 - x2|| / (eps + ||x1 + x2|| / 2) for packed sequences."""
+    lengths = lengths.to(device=x1.device, dtype=torch.long)
+    num_segments = lengths.shape[0]
+    segment_ids = torch.repeat_interleave(
+        torch.arange(num_segments, device=x1.device, dtype=torch.long),
+        lengths,
+    )
+
+    diff_sq_per_token = (x1 - x2).to(torch.float32).square().sum(dim=-1)
+    sum_sq_per_token = (x1 + x2).to(torch.float32).square().sum(dim=-1)
+
+    diff_norm_sq = torch.zeros((num_segments,), device=x1.device, dtype=torch.float32)
+    sum_norm_sq = torch.zeros((num_segments,), device=x1.device, dtype=torch.float32)
+    diff_norm_sq.scatter_add_(0, segment_ids, diff_sq_per_token)
+    sum_norm_sq.scatter_add_(0, segment_ids, sum_sq_per_token)
+
+    return diff_norm_sq.sqrt() / (eps + sum_norm_sq.sqrt() / 2)
