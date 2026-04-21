@@ -176,6 +176,69 @@ def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
     return result, (canvas_h, canvas_w)
 
 
+def _display_window(length: int, max_items: int):
+    if length <= max_items:
+        return list(range(length))
+
+    head = max_items // 2
+    tail = max_items - head
+    return [*range(head), None, *range(length - tail, length)]
+
+
+def _format_arc_token(token: int):
+    if token == 0:
+        return "."
+    if token == 1:
+        return "E"
+    if 2 <= token <= 11:
+        return str(token - 2)
+    return f"?{token}"
+
+
+def print_data(
+    data: np.ndarray,
+    seq_shape: Tuple[int, int],
+    title: str = "",
+    max_rows: int = 12,
+    max_cols: int = 12,
+):
+    if data.ndim != 1:
+        raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
+
+    height, width = int(seq_shape[0]), int(seq_shape[1])
+    expected_size = height * width
+    if data.shape[0] != expected_size:
+        raise ValueError(
+            f"Token length and seq_shape must match, got {data.shape[0]} and {seq_shape}"
+        )
+
+    if data.size == 0:
+        print(f"{title or 'sample'}: <empty>")
+        return
+
+    grid = data.reshape(height, width)
+    row_window = _display_window(grid.shape[0], max_rows)
+    col_window = _display_window(grid.shape[1], max_cols)
+    cropped = grid.shape[0] > max_rows or grid.shape[1] > max_cols
+    crop_suffix = " (cropped)" if cropped else ""
+
+    print(f"{title or 'sample'}: canvas={height}x{width}{crop_suffix}")
+    print("legend: . = blank/pad, E = eos, 0-9 = ARC colors")
+    for row_idx in row_window:
+        if row_idx is None:
+            print("... | ...")
+            continue
+
+        cells = []
+        for col_idx in col_window:
+            if col_idx is None:
+                cells.append("...")
+            else:
+                cells.append(f"{_format_arc_token(int(grid[row_idx, col_idx])):>3}")
+        print(f"r{row_idx:02d} |{''.join(cells)}")
+    print()
+
+
 def grid_hash(grid: np.ndarray):
     assert grid.ndim == 2
     assert grid.dtype == np.uint8
@@ -535,6 +598,13 @@ def convert_dataset(config: DataProcessConfig):
             
             for k, v in results.items():
                 if config.no_padding and k in {"inputs", "labels"}:
+                    if v:
+                        target_id = min(15, len(v) - 1)
+                        print_data(
+                            v[target_id],
+                            results["seq_shapes"][target_id],
+                            title=f"{split_name}/{subset_name} {k}[{target_id}]",
+                        )
                     seq_lengths = np.array([seq.shape[0] for seq in v], dtype=np.int64)
                     seq_offsets = np.concatenate(
                         [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
