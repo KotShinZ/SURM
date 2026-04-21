@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
-from models.common import trunc_normal_init_
+from models.common import packed_norm_ratio_from_lengths, trunc_normal_init_
 from models.layers import (
     rms_norm,
     ConvSwiGLU,
@@ -896,18 +896,8 @@ class URM(nn.Module):
     def norm_func(self, x1, x2, seq_lengths: Optional[torch.Tensor] = None):
         #return torch.norm(x1 - x2, dim=(1,2))
         if seq_lengths is not None and x1.ndim == 2:
-            lengths = (seq_lengths + self.inner.puzzle_emb_len).detach().cpu().tolist()
-            values = []
-            offset = 0
-            for length in lengths:
-                next_offset = offset + int(length)
-                left = x1[offset:next_offset]
-                right = x2[offset:next_offset]
-                values.append(torch.norm(left - right) / (1e-7 + torch.norm(left + right) / 2))
-                offset = next_offset
-            if values:
-                return torch.stack(values)
-            return torch.empty((0,), device=x1.device, dtype=torch.float32)
+            lengths = seq_lengths.to(x1.device) + self.inner.puzzle_emb_len
+            return packed_norm_ratio_from_lengths(x1, x2, lengths)
 
         if seq_lengths is not None:
             lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
