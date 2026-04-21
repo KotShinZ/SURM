@@ -60,6 +60,25 @@ class ARCOutputMaskConfig(pydantic.BaseModel):
         return self
 
 
+def _debug_print_arc_variable_batch(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    position_ids: np.ndarray,
+    seq_offsets: np.ndarray,
+) -> None:
+    # Reuse the dataset builder's ARC pretty-printer so debug output stays consistent.
+    from data.build_arc_dataset_full_2 import print_data
+
+    num_samples = max(int(seq_offsets.shape[0]) - 1, 0)
+    for sample_idx in range(num_samples):
+        start = int(seq_offsets[sample_idx])
+        end = int(seq_offsets[sample_idx + 1])
+        sample_position_ids = position_ids[start:end]
+
+        print_data(inputs[start:end], sample_position_ids, title=f"batch[{sample_idx}] inputs")
+        print_data(labels[start:end], sample_position_ids, title=f"batch[{sample_idx}] labels")
+
+
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int, data_fraction: float = 1.0):
     # Pack examples into a full batch
     batch = []
@@ -489,6 +508,12 @@ class PuzzleDataset(IterableDataset):
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
         batch["seq_shapes"] = np.array(seq_shapes, dtype=np.int32)
+        # _debug_print_arc_variable_batch(
+        #     inputs=batch["inputs"],
+        #     labels=batch["labels"],
+        #     position_ids=batch["position_ids"],
+        #     seq_offsets=batch["seq_offsets"],
+        # )
         return batch
 
     def _apply_arc_output_mask_fixed(

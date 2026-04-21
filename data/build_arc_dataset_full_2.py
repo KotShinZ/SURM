@@ -491,10 +491,11 @@ def _build_full_context_example(
 
         zero_inp = np.zeros_like(inp_seq, dtype=np.uint8)
         zero_out = np.zeros_like(out_seq, dtype=np.uint8)
+        two_seq = np.full_like(out_seq, 2, dtype=np.uint8)  # "0" color as default label for non-target pairs
         inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
 
         if pair_idx == target_idx:
-            input_parts.extend([inp_seq, zero_out])
+            input_parts.extend([inp_seq, two_seq])
             label_parts.extend([zero_inp, out_seq])
             position_parts.extend([inp_pos_ids, out_pos_ids])
         else:
