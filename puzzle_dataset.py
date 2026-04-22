@@ -577,8 +577,12 @@ class PuzzleDataset(IterableDataset):
     def _collate_batch(self, batch, rng: np.random.Generator, make_masked_inputs: bool = True):
         batch = self._flatten_fixed_example_fields(batch)
 
-        # Convert dtype
-        batch = {k: v.astype(np.int32, copy=True) for k, v in batch.items()}
+        # Most batch fields are int32 tokens/positions, but puzzle identifiers need
+        # int64 so compiled sparse embedding gathers use 64-bit indices.
+        batch = {
+            k: v.astype(np.int64 if k == "puzzle_identifiers" else np.int32, copy=True)
+            for k, v in batch.items()
+        }
 
         arc_output_mask_enabled = self._should_apply_arc_output_mask(make_masked_inputs)
         if arc_output_mask_enabled:

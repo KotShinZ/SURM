@@ -904,7 +904,6 @@ def convert_dataset(config: DataProcessConfig):
                 # `group_indices` は元問題 + その拡張群のまとまり境界を示す。
                 results["group_indices"].append(puzzle_id)
                 total_groups += 1
-
             for key, value in results.items():
                 if key in {"inputs", "labels"}:
                     if config.no_padding:
@@ -982,6 +981,10 @@ def convert_dataset(config: DataProcessConfig):
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{key}.npy"),
                         np.array(value, dtype=np.int32),
                     )
+
+        # 例単位シャッフル後は、各例が独立した puzzle/group になる。
+        total_puzzles = total_examples
+        total_groups = total_examples
 
         # split 単位のメタデータをまとめ、学習コード側が復元しやすいようにする。
         metadata = PuzzleDatasetMetadata(

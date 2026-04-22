@@ -28,6 +28,8 @@ class CastedSparseEmbedding(nn.Module):
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int64), persistent=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = inputs.to(torch.int64)
+
         if torch.any((inputs < 0) | (inputs >= self.num_embeddings)):
             min_id = int(inputs.min().item())
             max_id = int(inputs.max().item())

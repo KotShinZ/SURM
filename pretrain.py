@@ -1325,7 +1325,7 @@ def launch(hydra_config: DictConfig):
             if loop_config is not None:
                 original_loops = loop_config.loops
                 if len(config.loop_deltas) == 0:
-                    config.loop_deltas = [0, 8]
+                    config.loop_deltas = [0]
                 else:
                     config.loop_deltas = [0]
             for delta in config.loop_deltas:

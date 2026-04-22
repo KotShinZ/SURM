@@ -226,6 +226,7 @@ class BuildNCA2DDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(batch["labels"].shape), (2, config.seq_len))
             self.assertEqual(tuple(batch["position_ids"].shape), (2, config.seq_len, 4))
             self.assertEqual(tuple(batch["puzzle_identifiers"].shape), (2,))
+            self.assertEqual(batch["puzzle_identifiers"].dtype, torch.int64)
             self.assertIn("source_inputs", batch)
             self.assertTrue(torch.any(batch["labels"] != IGNORE_LABEL_ID).item())
 

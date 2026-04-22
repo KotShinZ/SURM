@@ -79,6 +79,7 @@ def filter_puzzles_by_size(
     puzzles: Dict[str, dict],
     *,
     source_name: str,
+    extra_train_examples_by_puzzle: Optional[Dict[str, List[dict]]] = None,
 ):
     filtered_puzzles = {}
     removed_by_example_type = {}
@@ -95,6 +96,12 @@ def filter_puzzles_by_size(
             removed_by_example_type[example_type] = (
                 removed_by_example_type.get(example_type, 0) + removed_examples
             )
+
+        # ARC-GEN examples are injected as additional puzzles within the same group,
+        # not merged into the source puzzle's example list. We still need them to
+        # keep the original puzzle/group alive after size filtering.
+        if extra_train_examples_by_puzzle and extra_train_examples_by_puzzle.get(puzzle_id):
+            kept_any_examples = True
 
         if kept_any_examples:
             filtered_puzzles[puzzle_id] = filtered_puzzle
@@ -309,35 +316,6 @@ def load_arc_gen_puzzles(arc_gen_dir: str):
     return arc_gen_puzzles
 
 
-def merge_arc_gen_into_training_puzzles(
-    puzzles: Dict[str, dict],
-    arc_gen_puzzles: Dict[str, List[dict]],
-):
-    matched_puzzles = 0
-    missing_puzzles = 0
-    added_examples = 0
-
-    for puzzle_id, generated_examples in tqdm(
-        arc_gen_puzzles.items(),
-        total=len(arc_gen_puzzles),
-        desc="Merging arc-gen puzzles",
-    ):
-        if puzzle_id not in puzzles:
-            missing_puzzles += 1
-            continue
-
-        puzzles[puzzle_id].setdefault("train", [])
-        puzzles[puzzle_id]["train"].extend(generated_examples)
-        matched_puzzles += 1
-        added_examples += len(generated_examples)
-
-    print(
-        f"Merged arc-gen into {matched_puzzles} training puzzles "
-        f"(+{added_examples} train examples, {missing_puzzles} unmatched puzzles)"
-    )
-    return matched_puzzles, added_examples, missing_puzzles
-
-
 def aug(name: str):
     # Augment plan
     trans_id = np.random.randint(0, 8)
@@ -366,8 +344,52 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
-def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]]):
-    # Convert
+def build_augmented_puzzle_family(
+    base_name: str,
+    converted: Dict[Tuple[str, str], ARCPuzzle],
+    aug_count: int,
+):
+    if not converted:
+        return {}
+
+    family_by_dest = {dest: [converted_puzzle] for dest, converted_puzzle in converted.items()}
+    if aug_count <= 0:
+        return family_by_dest
+
+    hashes = {puzzle_hash(converted)}
+    target_family_size = aug_count + 1
+
+    for _trial in range(ARCAugmentRetriesFactor * aug_count):
+        aug_name, map_grid = aug(base_name)
+
+        augmented = {
+            dest: ARCPuzzle(
+                aug_name,
+                [(map_grid(input), map_grid(label)) for (input, label) in puzzle.examples],
+            )
+            for dest, puzzle in converted.items()
+        }
+        h = puzzle_hash(augmented)
+        if h not in hashes:
+            hashes.add(h)
+            for dest, augmented_puzzle in augmented.items():
+                family_by_dest.setdefault(dest, []).append(augmented_puzzle)
+
+        if all(len(group) >= target_family_size for group in family_by_dest.values()):
+            break
+
+    return family_by_dest
+
+
+def convert_single_arc_puzzle(
+    results: dict,
+    name: str,
+    puzzle: dict,
+    aug_count: int,
+    dest_mapping: Dict[str, Tuple[str, str]],
+    arc_gen_examples: Optional[List[dict]] = None,
+):
+    # Convert examples already present in the source ARC puzzle.
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
     for example_type, examples in puzzle.items():
@@ -378,43 +400,47 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
         converted[dest].examples.extend([(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"])) for example in examples])
 
     converted = {dest: converted_puzzle for dest, converted_puzzle in converted.items() if converted_puzzle.examples}
-    if not converted:
-        return set()
+    groups_by_dest = build_augmented_puzzle_family(name, converted, aug_count)
 
-    dests = set(converted.keys())
+    # Append ARC-GEN as additional single-example puzzle families in the same training group.
+    added_arc_gen_seed_puzzles = 0
+    added_arc_gen_total_puzzles = 0
+    train_dest = dest_mapping.get("train")
+    if arc_gen_examples and train_dest is not None:
+        groups_by_dest.setdefault(train_dest, [])
+        for example in arc_gen_examples:
+            arc_gen_family = build_augmented_puzzle_family(
+                name,
+                {
+                    train_dest: ARCPuzzle(
+                        name,
+                        [(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))],
+                    )
+                },
+                aug_count,
+            )
+            groups_by_dest[train_dest].extend(arc_gen_family.get(train_dest, []))
+            added_arc_gen_seed_puzzles += 1
+            added_arc_gen_total_puzzles += len(arc_gen_family.get(train_dest, []))
 
-    group = [converted]
-    
-    # Augment
-    if aug_count > 0:
-        hashes = {puzzle_hash(converted)}
-
-        for _trial in range(ARCAugmentRetriesFactor * aug_count):
-            aug_name, _map_grid = aug(name)
-
-            # Check duplicate
-            augmented = {dest: ARCPuzzle(aug_name, [(_map_grid(input), _map_grid(label)) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
-            h = puzzle_hash(augmented)
-            if h not in hashes:
-                hashes.add(h)
-                group.append(augmented)
-                
-            if len(group) >= aug_count + 1:
-                break
-            
-        # if len(group) < aug_count + 1:
-        #     print (f"[Puzzle {name}] augmentation not full, only {len(group)}")
+    if not groups_by_dest:
+        return set(), 0, 0, {}
 
     # Append
-    for dest in dests:
+    for dest, group in groups_by_dest.items():
         # Convert the examples
         dest_split, dest_set = dest
 
         results.setdefault(dest_split, {})
         results[dest_split].setdefault(dest_set, [])
-        results[dest_split][dest_set].append([converted[dest] for converted in group])
+        results[dest_split][dest_set].append(group)
 
-    return dests
+    return (
+        set(groups_by_dest.keys()),
+        added_arc_gen_seed_puzzles,
+        added_arc_gen_total_puzzles,
+        {dest: len(group) for dest, group in groups_by_dest.items()},
+    )
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
@@ -427,7 +453,9 @@ def load_puzzles_arcagi(config: DataProcessConfig):
     test_puzzles = {}
     results = {}
 
-    total_puzzles = 0
+    total_source_groups = 0
+    output_group_counts = {}
+    output_puzzle_counts = {}
 
     arc_gen_puzzles = {}
     if "training" in config.subsets:
@@ -464,20 +492,37 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 for example in puzzle["test"]:
                     example.setdefault("output", [[0]])
 
-        if subset_name == "training" and arc_gen_puzzles:
-            train_examples_before = sum(len(puzzle.get("train", [])) for puzzle in puzzles.values())
-            _, added_examples, _ = merge_arc_gen_into_training_puzzles(puzzles, arc_gen_puzzles)
+        arc_gen_enabled_for_subset = subset_name == "training" and bool(arc_gen_puzzles)
+        if arc_gen_enabled_for_subset:
+            matched_arc_gen_groups = sum(
+                1 for puzzle_id in puzzles.keys() if arc_gen_puzzles.get(puzzle_id)
+            )
+            matched_arc_gen_seed_puzzles = sum(
+                len(arc_gen_puzzles[puzzle_id]) for puzzle_id in puzzles.keys() if arc_gen_puzzles.get(puzzle_id)
+            )
+            missing_arc_gen_groups = sum(
+                1 for puzzle_id in arc_gen_puzzles.keys() if puzzle_id not in puzzles
+            )
             print(
-                f"Training subset train examples: "
-                f"{train_examples_before} -> {train_examples_before + added_examples}"
+                f"ARC-GEN matched {matched_arc_gen_groups} training groups "
+                f"with {matched_arc_gen_seed_puzzles} seed puzzles before augmentation "
+                f"({missing_arc_gen_groups} unmatched puzzles)"
             )
 
-        puzzles = filter_puzzles_by_size(puzzles, source_name=subset_name)
+        puzzles = filter_puzzles_by_size(
+            puzzles,
+            source_name=subset_name,
+            extra_train_examples_by_puzzle=arc_gen_puzzles if arc_gen_enabled_for_subset else None,
+        )
 
         # Shuffle puzzles
         puzzles = list(puzzles.items())
         print (f"Shuffling {len(puzzles)} puzzles...")
         np.random.shuffle(puzzles)
+
+        added_arc_gen_groups = 0
+        added_arc_gen_seed_puzzles = 0
+        added_arc_gen_total_puzzles = 0
         
         # Assign by fraction
         for idx, (name, puzzle) in tqdm(
@@ -497,19 +542,44 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             if test_examples_dest[0] == "test" and len(puzzle.get("test", [])) > 0:
                 test_puzzles[name] = puzzle
 
-            used_dests = convert_single_arc_puzzle(
+            (
+                used_dests,
+                added_arc_gen_seed_puzzle_count,
+                added_arc_gen_total_puzzle_count,
+                puzzle_counts_by_dest,
+            ) = convert_single_arc_puzzle(
                 results,
                 name,
                 puzzle,
                 config.num_aug,
                 {"train": train_examples_dest, "test": test_examples_dest},
+                arc_gen_examples=arc_gen_puzzles.get(name) if arc_gen_enabled_for_subset else None,
             )
             if used_dests:
-                total_puzzles += 1
+                total_source_groups += 1
+            for dest, num_puzzles in puzzle_counts_by_dest.items():
+                output_group_counts[dest] = output_group_counts.get(dest, 0) + 1
+                output_puzzle_counts[dest] = output_puzzle_counts.get(dest, 0) + num_puzzles
+            if added_arc_gen_seed_puzzle_count > 0:
+                added_arc_gen_groups += 1
+                added_arc_gen_seed_puzzles += added_arc_gen_seed_puzzle_count
+                added_arc_gen_total_puzzles += added_arc_gen_total_puzzle_count
 
-    print (f"Total puzzles: {total_puzzles}")
-    print (f"Total test puzzles: {len(test_puzzles)}")
-    print (f"Total train puzzles: {total_puzzles - len(test_puzzles)}")
+        if arc_gen_enabled_for_subset:
+            print(
+                f"Added {added_arc_gen_total_puzzles} ARC-GEN-derived puzzles "
+                f"from {added_arc_gen_seed_puzzles} seed puzzles across "
+                f"{added_arc_gen_groups} training groups in subset '{subset_name}'"
+            )
+
+    print (f"Total source task groups: {total_source_groups}")
+    print (f"Source task groups with held-out test examples: {len(test_puzzles)}")
+    print (f"Source task groups routed only to train: {total_source_groups - len(test_puzzles)}")
+    for dest in sorted(output_group_counts):
+        print(
+            f"Output {dest[0]}/{dest[1]}: "
+            f"groups={output_group_counts[dest]}, puzzles={output_puzzle_counts[dest]}"
+        )
     print("results keys:", results.keys())
     return results, test_puzzles
 
@@ -528,8 +598,11 @@ def convert_dataset(config: DataProcessConfig):
         print("split: ", split_name)
         print("subset_len: ", len(split))
         for subset_name, subset in split.items():
+            subset_group_count = len(subset)
+            subset_puzzle_count = sum(len(group) for group in subset)
             print(" subset: ", subset_name)
-            print("  group_len: ", len(subset))
+            print("  num_groups: ", subset_group_count)
+            print("  num_puzzles: ", subset_puzzle_count)
             for group in tqdm(
                 subset,
                 desc=f"Mapping IDs {split_name}/{subset_name}",
@@ -595,16 +668,23 @@ def convert_dataset(config: DataProcessConfig):
                 # Push group
                 results["group_indices"].append(puzzle_id)
                 total_groups += 1
+                
+            for key, value in results.items():
+                print(f"    {key}: {len(value)} items")
+                for i in range(3):
+                    print(f"      {key}[{i}]: shape={value[i].shape if isinstance(value[i], np.ndarray) else 'list'}, dtype={value[i].dtype if isinstance(value[i], np.ndarray) else 'N/A'}")
+                    # print(f"        Value: {value[i]}")
+            # print(results["group_indices"])
             
             for k, v in results.items():
                 if config.no_padding and k in {"inputs", "labels"}:
                     if v:
                         target_id = min(15, len(v) - 1)
-                        print_data(
-                            v[target_id],
-                            results["seq_shapes"][target_id],
-                            title=f"{split_name}/{subset_name} {k}[{target_id}]",
-                        )
+                        # print_data(
+                        #     v[target_id],
+                        #     results["seq_shapes"][target_id],
+                        #     title=f"{split_name}/{subset_name} {k}[{target_id}]",
+                        # )
                     seq_lengths = np.array([seq.shape[0] for seq in v], dtype=np.int64)
                     seq_offsets = np.concatenate(
                         [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
