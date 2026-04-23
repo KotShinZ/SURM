@@ -48,6 +48,46 @@ def _make_generator():
 
 
 class BuildARCGenDatasetTests(unittest.TestCase):
+    def test_task_version_filter_splits_v1_and_v2(self) -> None:
+        registry = {
+            "v1_a": (_make_generator(), lambda: {"train": [], "test": []}),
+            "v1_b": (_make_generator(), lambda: {"train": [], "test": []}),
+            "v2_a": (_make_generator(), lambda: {"train": [], "test": []}),
+            "v2_b": (_make_generator(), lambda: {"train": [], "test": []}),
+        }
+
+        v1_ids = build_arc_gen_dataset._resolve_task_version_task_ids(
+            registry,
+            "v1",
+            v1_task_count=2,
+        )
+        v2_ids = build_arc_gen_dataset._resolve_task_version_task_ids(
+            registry,
+            "v2",
+            v1_task_count=2,
+        )
+
+        self.assertEqual(v1_ids, {"v1_a", "v1_b"})
+        self.assertEqual(v2_ids, {"v2_a", "v2_b"})
+
+    def test_task_ids_must_match_selected_task_version(self) -> None:
+        registry = {
+            "v1_a": (_make_generator(), lambda: {"train": [], "test": []}),
+            "v1_b": (_make_generator(), lambda: {"train": [], "test": []}),
+            "v2_a": (_make_generator(), lambda: {"train": [], "test": []}),
+        }
+
+        with mock.patch.object(build_arc_gen_dataset, "ARC_GEN_V1_TASK_COUNT", 2):
+            with self.assertRaisesRegex(ValueError, "task_version=v1"):
+                build_arc_gen_dataset._resolve_task_ids(
+                    build_arc_gen_dataset.DataProcessConfig(
+                        output_dir="unused",
+                        task_version="v1",
+                        task_ids=["v2_a"],
+                    ),
+                    registry,
+                )
+
     def test_generated_examples_follow_arc_dataset_output_format(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

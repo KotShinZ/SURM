@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 import hashlib
 import importlib.util
 import json
@@ -28,6 +28,8 @@ from data.common import PuzzleDatasetMetadata
 
 cli = ArgParser()
 
+ARC_GEN_V1_TASK_COUNT = 400
+
 
 class DataProcessConfig(BaseModel):
     output_dir: str
@@ -40,9 +42,10 @@ class DataProcessConfig(BaseModel):
     no_padding: bool = False
 
     arc_gen_root: str = "ARC-GEN"
-    examples_per_task: int = 250
+    examples_per_task: int = 25000
     max_generation_attempts_per_task: Optional[int] = None
     generator_timeout_sec: Optional[float] = 1.0
+    task_version: Literal["all", "v1", "v2"] = "all"
     task_ids: Optional[List[str]] = None
 
     @model_validator(mode="after")
@@ -147,7 +150,8 @@ def _normalize_arc_puzzle(puzzle: dict, *, task_id: str, source_name: str) -> di
 
 
 def _resolve_task_ids(config: DataProcessConfig, registry: TaskRegistry) -> List[str]:
-    available_task_ids = sorted(registry.keys())
+    allowed_task_ids = _resolve_task_version_task_ids(registry, config.task_version)
+    available_task_ids = [task_id for task_id in sorted(registry.keys()) if task_id in allowed_task_ids]
     if config.task_ids is None:
         return available_task_ids
 
@@ -158,7 +162,39 @@ def _resolve_task_ids(config: DataProcessConfig, registry: TaskRegistry) -> List
             "Unknown ARC-GEN task ids requested: "
             + ", ".join(sorted(missing_task_ids))
         )
+
+    disallowed_task_ids = [task_id for task_id in requested_task_ids if task_id not in allowed_task_ids]
+    if disallowed_task_ids:
+        raise ValueError(
+            f"Requested task ids are not part of task_version={config.task_version}: "
+            + ", ".join(sorted(disallowed_task_ids))
+        )
     return requested_task_ids
+
+
+def _resolve_task_version_task_ids(
+    registry: TaskRegistry,
+    task_version: Literal["all", "v1", "v2"],
+    *,
+    v1_task_count: Optional[int] = None,
+) -> set[str]:
+    if v1_task_count is None:
+        v1_task_count = ARC_GEN_V1_TASK_COUNT
+
+    ordered_task_ids = list(registry.keys())
+    if task_version == "all":
+        return set(ordered_task_ids)
+
+    if len(ordered_task_ids) < v1_task_count:
+        raise ValueError(
+            f"ARC-GEN registry has only {len(ordered_task_ids)} tasks, "
+            f"which is smaller than the expected V1 boundary {v1_task_count}"
+        )
+
+    v1_task_ids = set(ordered_task_ids[:v1_task_count])
+    if task_version == "v1":
+        return v1_task_ids
+    return set(ordered_task_ids[v1_task_count:])
 
 
 def _generate_train_examples_for_task(
@@ -175,6 +211,8 @@ def _generate_train_examples_for_task(
     attempts = 0
     failed_attempts = 0
     first_error_message: Optional[str] = None
+    
+    # print("examples_per_task:", config.examples_per_task)
 
     while len(generated_examples) < config.examples_per_task and attempts < max_attempts:
         # Seed per task/attempt so output does not depend on task iteration order.
@@ -234,7 +272,7 @@ def load_puzzles_arc_gen(config: DataProcessConfig):
     task_ids = _resolve_task_ids(config, task_registry)
 
     print(f"Loaded ARC-GEN registry with {len(task_registry)} tasks from {config.arc_gen_root}")
-    print(f"Selected {len(task_ids)} ARC-GEN tasks")
+    print(f"Selected {len(task_ids)} ARC-GEN tasks (task_version={config.task_version})")
 
     canonical_puzzles = {}
     for task_id in tqdm(task_ids, desc="Loading ARC-GEN validator puzzles"):
