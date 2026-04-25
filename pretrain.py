@@ -151,6 +151,7 @@ class PretrainConfig(pydantic.BaseModel):
     use_muon: bool = False
 
     data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
+    examples_per_puzzle: Optional[int] = 1
 
     # Online augmentation (applied per batch during training only)
     online_aug: Optional[OnlineAugConfig] = None
@@ -222,6 +223,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
             data_fraction=data_fraction,
+            examples_per_puzzle=config.examples_per_puzzle,
             online_aug=online_aug,
             masked_input=config.masked_input,
             arc_output_mask=arc_output_mask,
@@ -376,15 +378,30 @@ def cosine_schedule_with_warmup_lr_lambda(
 def init_train_state(
     config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int
 ):
-    # Estimated total training steps
+    # Estimate total optimizer steps using the same eval-interval chunking as the
+    # training loop so dropped partial batches are reflected in the count.
     effective_gbs = config.global_batch_size * max(1, config.grad_accum_steps)
-    total_steps = int(
-        config.epochs
-        * train_metadata.total_groups
-        * config.data_fraction
-        * train_metadata.mean_puzzle_examples
-        / effective_gbs
+    sampled_examples_per_group = (
+        train_metadata.mean_puzzle_examples
+        if config.examples_per_puzzle is None
+        else float(config.examples_per_puzzle)
     )
+    if config.eval_interval is None or config.eval_interval <= 0:
+        total_steps = int(
+            config.epochs
+            * train_metadata.total_groups
+            * sampled_examples_per_group
+            / effective_gbs
+        )
+    else:
+        total_iters = config.epochs // config.eval_interval
+        steps_per_iter = int(
+            config.eval_interval
+            * train_metadata.total_groups
+            * sampled_examples_per_group
+            / effective_gbs
+        )
+        total_steps = total_iters * steps_per_iter
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)

@@ -15,6 +15,7 @@ data/**
 !data/build_arc_dataset_full.py
 !data/build_arc_dataset_full_2.py
 !data/build_arc_dataset.py
+!data/build_arc_gen_dataset.py
 !data/arc_gen_utils.py
 NCA_datas/nca_dataset_colab_demo/*
 NCA_datas/continuous_nca_dataset_colab_demo/*
