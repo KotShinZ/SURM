@@ -79,7 +79,22 @@ def _debug_print_arc_variable_batch(
         print_data(labels[start:end], sample_position_ids, title=f"batch[{sample_idx}] labels")
 
 
-def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int, data_fraction: float = 1.0):
+def _sample_batch(
+    rng: np.random.Generator,
+    group_order: np.ndarray,
+    puzzle_indices: np.ndarray,
+    group_indices: np.ndarray,
+    start_index: int,
+    global_batch_size: int,
+    data_fraction: float = 1.0,
+    examples_per_puzzle: Optional[int] = 1,
+):
+    if examples_per_puzzle is not None and examples_per_puzzle <= 0:
+        raise ValueError(
+            "examples_per_puzzle must be a positive integer, or None for full-puzzle sampling; "
+            f"got {examples_per_puzzle}"
+        )
+
     # Pack examples into a full batch
     batch = []
     batch_puzzle_indices = []
@@ -99,7 +114,11 @@ def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indi
         puzzle_start = puzzle_indices[puzzle_id]
         puzzle_size = int(puzzle_indices[puzzle_id + 1] - puzzle_start)
 
-        append_size = min(puzzle_size, global_batch_size - current_size)
+        puzzle_sample_size = puzzle_size
+        if examples_per_puzzle is not None:
+            puzzle_sample_size = min(puzzle_sample_size, examples_per_puzzle)
+
+        append_size = min(puzzle_sample_size, global_batch_size - current_size)
 
         # Put into batch
         batch_puzzle_indices.append(np.full(append_size, puzzle_id, dtype=np.int32))
@@ -123,6 +142,10 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     data_fraction: float = 1.0  # Fraction of training groups to use per epoch (1.0 = all)
 
+    # Number of randomly selected examples to draw from each puzzle during training.
+    # Set to None to use the previous full-puzzle packing behavior.
+    examples_per_puzzle: Optional[int] = 1
+
     # Online augmentation applied at training time (None = disabled)
     online_aug: Optional[OnlineAugConfig] = None
 
@@ -131,6 +154,15 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     # ARC full-context training: mask one output pair on the fly and generate labels from it.
     arc_output_mask: Optional[ARCOutputMaskConfig] = None
+
+    @pydantic.model_validator(mode="after")
+    def _validate_training_sampling(self):
+        if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:
+            raise ValueError(
+                "examples_per_puzzle must be a positive integer, or None for full-puzzle sampling; "
+                f"got {self.examples_per_puzzle}"
+            )
+        return self
 
 
 class PuzzleDataset(IterableDataset):
@@ -714,6 +746,7 @@ class PuzzleDataset(IterableDataset):
                     start_index=start_index,
                     global_batch_size=self.config.global_batch_size,
                     data_fraction=self.config.data_fraction,
+                    examples_per_puzzle=self.config.examples_per_puzzle,
                 )
 
                 # Select current rank and collate

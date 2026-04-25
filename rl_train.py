@@ -100,6 +100,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False
     ema_rate: float = 0.999
     use_muon: bool = False
+    examples_per_puzzle: Optional[int] = 1
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +467,7 @@ def load_actor(
         rank=0, num_replicas=1,
         global_batch_size=config.global_batch_size,
         test_set_mode=True, epochs_per_iter=1,
+        examples_per_puzzle=getattr(config, "examples_per_puzzle", 1),
         masked_input=getattr(config, "masked_input", None),
     )
     dataset = PuzzleDataset(ds_config, split="train")
@@ -783,6 +785,7 @@ def main():
         global_batch_size=config.global_batch_size,
         test_set_mode=False,
         epochs_per_iter=max(1, args.total_steps // 100),
+        examples_per_puzzle=getattr(config, "examples_per_puzzle", 1),
         masked_input=getattr(config, "masked_input", None),
     )
     train_dataset = PuzzleDataset(ds_config, split="train")
@@ -798,6 +801,7 @@ def main():
         rank=0, num_replicas=1,
         global_batch_size=config.global_batch_size,
         test_set_mode=True, epochs_per_iter=1,
+        examples_per_puzzle=getattr(config, "examples_per_puzzle", 1),
         masked_input=getattr(config, "masked_input", None),
     )
     eval_dataset = PuzzleDataset(eval_ds_config, split="test")

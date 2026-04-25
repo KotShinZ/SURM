@@ -42,7 +42,7 @@ class DataProcessConfig(BaseModel):
     no_padding: bool = False
 
     arc_gen_root: str = "ARC-GEN"
-    examples_per_task: int = 25000
+    examples_per_task: int = 25
     max_generation_attempts_per_task: Optional[int] = None
     generator_timeout_sec: Optional[float] = 1.0
     task_version: Literal["all", "v1", "v2"] = "all"

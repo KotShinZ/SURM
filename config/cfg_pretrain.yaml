@@ -41,6 +41,9 @@ torch_compile: True
 
 # Fraction of training groups to use per epoch (1.0 = all, 0.5 = half)
 data_fraction: 1.0
+# Number of random examples sampled from each selected puzzle per training batch step.
+# Set to null to restore the previous full-puzzle packing behavior.
+examples_per_puzzle: 1
 
 # Online augmentation: applied randomly per sample at training time.
 # Detected automatically from seq_len: 900 → ARC-AGI, 81 → Sudoku.
