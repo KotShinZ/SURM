@@ -24,6 +24,7 @@ class DataProcessConfig(BaseModel):
 
     seed: int = 42
     num_aug: int = 1000
+    num_aug_gen: Optional[int] = None
     no_padding: bool = False
     include_arc_gen: bool = False
     arc_gen_dir: Optional[str] = "data/arc-gen"
@@ -40,6 +41,7 @@ class ARCPuzzle:
     id: str
 
     examples: List[Tuple[np.ndarray, np.ndarray]]
+    context_examples: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
 
     
 def arc_grid_to_np(grid: List[List[int]]):
@@ -246,6 +248,70 @@ def print_data(
     print()
 
 
+def encode_arc_example_pair(
+    inp: np.ndarray,
+    out: np.ndarray,
+    *,
+    no_padding: bool,
+    do_translation: bool,
+):
+    if no_padding:
+        return np_grids_to_unpadded_seq(inp, out)
+
+    return np_grid_to_fixed_seq_translational_augment(
+        inp,
+        out,
+        do_translation=do_translation,
+    ), None
+
+
+def encode_context_examples(
+    examples: Optional[List[Tuple[np.ndarray, np.ndarray]]],
+    *,
+    no_padding: bool,
+):
+    examples = examples or []
+    example_shapes = np.empty((len(examples), 2), dtype=np.int32)
+
+    if no_padding:
+        encoded_examples = np.empty((len(examples), 2), dtype=object)
+        for example_idx, (inp, out) in enumerate(examples):
+            (encoded_inp, encoded_out), seq_shape = encode_arc_example_pair(
+                inp,
+                out,
+                no_padding=True,
+                do_translation=False,
+            )
+            encoded_examples[example_idx, 0] = encoded_inp.astype(np.uint8, copy=False)
+            encoded_examples[example_idx, 1] = encoded_out.astype(np.uint8, copy=False)
+            example_shapes[example_idx] = seq_shape
+        return encoded_examples, example_shapes
+
+    encoded_pairs = []
+    for example_idx, (inp, out) in enumerate(examples):
+        (encoded_inp, encoded_out), _seq_shape = encode_arc_example_pair(
+            inp,
+            out,
+            no_padding=False,
+            do_translation=False,
+        )
+        encoded_pairs.append(
+            np.stack(
+                [
+                    encoded_inp.astype(np.uint8, copy=False),
+                    encoded_out.astype(np.uint8, copy=False),
+                ],
+                axis=0,
+            )
+        )
+        example_shapes[example_idx] = (ARCMaxGridSize, ARCMaxGridSize)
+
+    if not encoded_pairs:
+        return np.empty((0, 2, ARCMaxGridSize * ARCMaxGridSize), dtype=np.uint8), example_shapes
+
+    return np.stack(encoded_pairs, axis=0).astype(np.uint8, copy=False), example_shapes
+
+
 def grid_hash(grid: np.ndarray):
     assert grid.ndim == 2
     assert grid.dtype == np.uint8
@@ -366,6 +432,11 @@ def build_augmented_puzzle_family(
             dest: ARCPuzzle(
                 aug_name,
                 [(map_grid(input), map_grid(label)) for (input, label) in puzzle.examples],
+                (
+                    [(map_grid(input), map_grid(label)) for (input, label) in puzzle.context_examples]
+                    if puzzle.context_examples is not None
+                    else None
+                ),
             )
             for dest, puzzle in converted.items()
         }
@@ -388,16 +459,23 @@ def convert_single_arc_puzzle(
     aug_count: int,
     dest_mapping: Dict[str, Tuple[str, str]],
     arc_gen_examples: Optional[List[dict]] = None,
+    arc_gen_aug_count: Optional[int] = None,
 ):
     # Convert examples already present in the source ARC puzzle.
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
+    source_train_examples = [
+        (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+        for example in puzzle.get("train", [])
+    ]
     for example_type, examples in puzzle.items():
         if len(examples) == 0:
             continue
         # Map to target split
         dest = dest_mapping[example_type]
         converted[dest].examples.extend([(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"])) for example in examples])
+        if dest[0] == "test":
+            converted[dest].context_examples = list(source_train_examples)
 
     converted = {dest: converted_puzzle for dest, converted_puzzle in converted.items() if converted_puzzle.examples}
     groups_by_dest = build_augmented_puzzle_family(name, converted, aug_count)
@@ -407,6 +485,8 @@ def convert_single_arc_puzzle(
     added_arc_gen_total_puzzles = 0
     train_dest = dest_mapping.get("train")
     if arc_gen_examples and train_dest is not None:
+        if arc_gen_aug_count is None:
+            arc_gen_aug_count = aug_count
         groups_by_dest.setdefault(train_dest, [])
         for example in arc_gen_examples:
             arc_gen_family = build_augmented_puzzle_family(
@@ -417,7 +497,7 @@ def convert_single_arc_puzzle(
                         [(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))],
                     )
                 },
-                aug_count,
+                arc_gen_aug_count,
             )
             groups_by_dest[train_dest].extend(arc_gen_family.get(train_dest, []))
             added_arc_gen_seed_puzzles += 1
@@ -554,6 +634,11 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 config.num_aug,
                 {"train": train_examples_dest, "test": test_examples_dest},
                 arc_gen_examples=arc_gen_puzzles.get(name) if arc_gen_enabled_for_subset else None,
+                arc_gen_aug_count=(
+                    config.num_aug_gen
+                    if config.num_aug_gen is not None
+                    else config.num_aug
+                ),
             )
             if used_dests:
                 total_source_groups += 1
@@ -631,6 +716,9 @@ def convert_dataset(config: DataProcessConfig):
         for subset_name, subset in split.items():
             # Construct subset
             results = {k: [] for k in ["inputs", "labels", "puzzle_identifiers", "puzzle_indices", "group_indices"]}
+            if split_name == "test":
+                results["examples"] = []
+                results["example_shapes"] = []
             results["puzzle_indices"].append(0)
             results["group_indices"].append(0)
             
@@ -643,17 +731,30 @@ def convert_dataset(config: DataProcessConfig):
                     no_aug_id = np.random.randint(0, len(puzzle.examples))
                     for _idx_ex, (inp, out) in enumerate(puzzle.examples):
                         if config.no_padding:
-                            (inp, out), seq_shape = np_grids_to_unpadded_seq(inp, out)
-                            results.setdefault("seq_shapes", []).append(seq_shape)
-                        else:
-                            inp, out = np_grid_to_fixed_seq_translational_augment(
+                            (inp, out), seq_shape = encode_arc_example_pair(
                                 inp,
                                 out,
+                                no_padding=True,
+                                do_translation=False,
+                            )
+                            results.setdefault("seq_shapes", []).append(seq_shape)
+                        else:
+                            (inp, out), _seq_shape = encode_arc_example_pair(
+                                inp,
+                                out,
+                                no_padding=False,
                                 do_translation=enable_translational_augment and _idx_ex != no_aug_id,
                             )
                             
                         results["inputs"].append(inp)
                         results["labels"].append(out)
+                        if split_name == "test":
+                            context_examples, context_shapes = encode_context_examples(
+                                puzzle.context_examples,
+                                no_padding=config.no_padding,
+                            )
+                            results["examples"].append(context_examples)
+                            results["example_shapes"].append(context_shapes)
                         example_id += 1
                         
                         total_examples += 1
@@ -671,7 +772,7 @@ def convert_dataset(config: DataProcessConfig):
                 
             for key, value in results.items():
                 print(f"    {key}: {len(value)} items")
-                for i in range(3):
+                for i in range(min(3, len(value))):
                     print(f"      {key}[{i}]: shape={value[i].shape if isinstance(value[i], np.ndarray) else 'list'}, dtype={value[i].dtype if isinstance(value[i], np.ndarray) else 'N/A'}")
                     # print(f"        Value: {value[i]}")
             # print(results["group_indices"])
@@ -679,12 +780,32 @@ def convert_dataset(config: DataProcessConfig):
             for k, v in results.items():
                 if config.no_padding and k in {"inputs", "labels"}:
                     if v:
-                        target_id = min(15, len(v) - 1)
-                        # print_data(
-                        #     v[target_id],
-                        #     results["seq_shapes"][target_id],
-                        #     title=f"{split_name}/{subset_name} {k}[{target_id}]",
-                        # )
+                        target_id = np.random.randint(0, len(v))
+                        print_data(
+                            v[target_id],
+                            results["seq_shapes"][target_id],
+                            title=f"{split_name}/{subset_name} {k}[{target_id}]",
+                        )
+                        if split_name == "test" and k == "inputs" and "examples" in results:
+                            context_examples = results["examples"][target_id]
+                            context_shapes = results["example_shapes"][target_id]
+                            for example_idx in range(len(context_examples)):
+                                print_data(
+                                    np.asarray(context_examples[example_idx][0], dtype=np.uint8),
+                                    tuple(int(v) for v in context_shapes[example_idx]),
+                                    title=(
+                                        f"{split_name}/{subset_name} examples[{target_id}]"
+                                        f"[{example_idx}].input"
+                                    ),
+                                )
+                                print_data(
+                                    np.asarray(context_examples[example_idx][1], dtype=np.uint8),
+                                    tuple(int(v) for v in context_shapes[example_idx]),
+                                    title=(
+                                        f"{split_name}/{subset_name} examples[{target_id}]"
+                                        f"[{example_idx}].output"
+                                    ),
+                                )
                     seq_lengths = np.array([seq.shape[0] for seq in v], dtype=np.int64)
                     seq_offsets = np.concatenate(
                         [np.array([0], dtype=np.int64), np.cumsum(seq_lengths, dtype=np.int64)]
@@ -702,6 +823,22 @@ def convert_dataset(config: DataProcessConfig):
                     np.save(
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
                         np.array(v, dtype=np.int32),
+                    )
+                elif k == "examples":
+                    examples_array = np.empty((len(v),), dtype=object)
+                    for example_idx, context_examples in enumerate(v):
+                        examples_array[example_idx] = context_examples
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
+                        examples_array,
+                    )
+                elif k == "example_shapes":
+                    example_shapes_array = np.empty((len(v),), dtype=object)
+                    for example_idx, context_shapes in enumerate(v):
+                        example_shapes_array[example_idx] = context_shapes
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
+                        example_shapes_array,
                     )
                 else:
                     np.save(
