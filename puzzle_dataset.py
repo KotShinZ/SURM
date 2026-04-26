@@ -156,12 +156,22 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # ARC full-context training: mask one output pair on the fly and generate labels from it.
     arc_output_mask: Optional[ARCOutputMaskConfig] = None
 
+    # ARC full-context training built from one-pair examples.
+    full_min_pairs: int = 3
+    full_max_pairs: int = 8
+
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
         if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:
             raise ValueError(
                 "examples_per_puzzle must be a positive integer, or None for full-puzzle sampling; "
                 f"got {self.examples_per_puzzle}"
+            )
+        if self.full_min_pairs <= 0:
+            raise ValueError(f"full_min_pairs must be positive, got {self.full_min_pairs}")
+        if self.full_max_pairs < self.full_min_pairs:
+            raise ValueError(
+                f"full_max_pairs ({self.full_max_pairs}) must be >= full_min_pairs ({self.full_min_pairs})"
             )
         return self
 

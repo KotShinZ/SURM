@@ -34,6 +34,7 @@ from puzzle_dataset import (
     PuzzleDatasetConfig,
     PuzzleDatasetMetadata,
 )
+from puzzle_full_dataset import PuzzleFullDataset
 from data.online_aug import OnlineAugConfig
 from utils import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
@@ -162,6 +163,11 @@ class PretrainConfig(pydantic.BaseModel):
     # ARC full-context training: pick one solved output pair per sample and mask it on the fly.
     arc_output_mask: Optional[ARCOutputMaskConfig] = None
 
+    # Build full-context ARC samples on the fly from one-pair examples.
+    mask_full_training: bool = False
+    full_min_pairs: int = 2
+    full_max_pairs: int = 8
+
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
     benchmark_warmup_steps: int = 1
@@ -220,7 +226,10 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
-    dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
+    if config.mask_full_training:
+        dataset_cls = PuzzleFullDataset
+    else:
+        dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
@@ -230,13 +239,25 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             online_aug=online_aug,
             masked_input=config.masked_input,
             arc_output_mask=arc_output_mask,
+            full_min_pairs=config.full_min_pairs,
+            full_max_pairs=config.full_max_pairs,
             **kwargs,
         ),
         split=split,
     )
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
-    if is_test:
+    if is_test and not config.mask_full_training:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
+    elif is_test:
+        print(
+            "Evaluation split uses PuzzleFullDataset "
+            f"with {config.full_min_pairs}-{config.full_max_pairs} pairs per sample."
+        )
+    elif config.mask_full_training:
+        print(
+            "Training split uses PuzzleFullDataset "
+            f"with {config.full_min_pairs}-{config.full_max_pairs} pairs per sample."
+        )
     elif dataset.metadata.train_target_mode == "random_output_pair":
         min_context_pairs = dataset.metadata.min_context_pairs
         if min_context_pairs is None and config.arc_output_mask is not None:
@@ -385,11 +406,14 @@ def init_train_state(
     # Estimate total optimizer steps using the same eval-interval chunking as the
     # training loop so dropped partial batches are reflected in the count.
     effective_gbs = config.global_batch_size * max(1, config.grad_accum_steps)
-    sampled_examples_per_group = (
-        train_metadata.mean_puzzle_examples
-        if config.examples_per_puzzle is None
-        else float(config.examples_per_puzzle)
-    )
+    if config.mask_full_training:
+        sampled_examples_per_group = 1.0
+    else:
+        sampled_examples_per_group = (
+            train_metadata.mean_puzzle_examples
+            if config.examples_per_puzzle is None
+            else float(config.examples_per_puzzle)
+        )
     if config.eval_interval is None or config.eval_interval <= 0:
         total_steps = int(
             config.epochs
