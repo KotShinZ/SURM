@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List, Tuple
+from typing import Optional, Any, Sequence, List, Tuple, Dict
 from dataclasses import dataclass
 import os
 import math
@@ -178,6 +178,8 @@ class TrainState:
     step: int
     total_steps: int
     accum_step: int = 0
+    accum_carries: Optional[List[Any]] = None
+    accum_metrics: Optional[Dict[str, torch.Tensor]] = None
 
 
 class ShuffledTestPuzzleDataset(PuzzleDataset):
@@ -223,6 +225,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
             data_fraction=data_fraction,
+            grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,
             online_aug=online_aug,
             masked_input=config.masked_input,
@@ -274,9 +277,10 @@ def _apply_position_id_shape_to_model_cfg(model_cfg: dict, position_id_shape: Op
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    effective_local_batch_size = config.global_batch_size * max(1, config.grad_accum_steps) // world_size
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
-        batch_size=config.global_batch_size // world_size,
+        batch_size=effective_local_batch_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
@@ -631,6 +635,8 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
 
     # Reset carry since we do not serialize it
     train_state.carry = None
+    train_state.accum_carries = None
+    train_state.accum_metrics = None
 
     if rng_state is not None:
         normalized_rng_state = _prepare_rng_state(rng_state, device="cpu")
@@ -672,6 +678,8 @@ def load_checkpoint_file(train_state: TrainState, config: PretrainConfig, rank: 
 
     # Weight-only initialization intentionally keeps optimizer, step, and RNG state fresh.
     train_state.carry = None
+    train_state.accum_carries = None
+    train_state.accum_metrics = None
     if rank == 0:
         print("Loaded model weights only; optimizer state, step, and RNG state were not restored.")
 
@@ -711,6 +719,18 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
     return evaluators
 
 
+def _get_puzzle_embedding_module(module: nn.Module):
+    for candidate in (module, getattr(module, "_orig_mod", None)):
+        if candidate is None:
+            continue
+        wrapped_model = getattr(candidate, "model", None)
+        if wrapped_model is not None and hasattr(wrapped_model, "puzzle_emb"):
+            return wrapped_model.puzzle_emb
+        if hasattr(candidate, "puzzle_emb"):
+            return candidate.puzzle_emb
+    return None
+
+
 def train_batch(
     config: PretrainConfig,
     train_state: TrainState,
@@ -726,19 +746,58 @@ def train_batch(
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+    accum_index = train_state.accum_step % accum_steps
+    local_batch_size = int(batch["puzzle_identifiers"].shape[0] if "puzzle_identifiers" in batch else batch["inputs"].shape[0])
+    puzzle_emb = _get_puzzle_embedding_module(train_state.model)
+    if puzzle_emb is not None and hasattr(puzzle_emb, "set_local_range"):
+        puzzle_emb.set_local_range(accum_index * local_batch_size, local_batch_size)
+
+    if accum_steps == 1:
+        # Preserve the original single-carry behavior for non-accumulated training.
+        if train_state.carry is None:
+            with torch.device("cuda"):
+                train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+        carry = train_state.carry
+    else:
+        # Keep one independent recurrent carry per accumulation shard. This makes
+        # N microbatches behave like N slices of a larger concurrent batch instead
+        # of repeatedly advancing the same smaller set of recurrent slots.
+        if train_state.accum_carries is None or len(train_state.accum_carries) != accum_steps:
+            train_state.accum_carries = [None] * accum_steps
+            train_state.carry = train_state.accum_carries
+            train_state.accum_metrics = None
+
+        if train_state.accum_carries[accum_index] is None:
+            with torch.device("cuda"):
+                train_state.accum_carries[accum_index] = train_state.model.initial_carry(batch)  # type: ignore
+        carry = train_state.accum_carries[accum_index]
 
     # Forward
     compute_target_q = train_state.step % config.target_q_update_every == 0
-    train_state.carry, loss, metrics, _, _ = train_state.model(
-        carry=train_state.carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
+    carry, loss, metrics, _, _ = train_state.model(
+        carry=carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
     )
+    if accum_steps == 1:
+        train_state.carry = carry
+    else:
+        train_state.accum_carries[accum_index] = carry
 
     loss_scale = 1.0 / (global_batch_size * accum_steps)
     (loss_scale * loss).backward()
+
+    if len(metrics):
+        assert not any(v.requires_grad for v in metrics.values())
+        metric_keys = list(sorted(metrics.keys()))
+        metric_values = torch.stack([metrics[k].detach() for k in metric_keys])
+        if train_state.accum_metrics is None:
+            train_state.accum_metrics = {k: v.clone() for k, v in zip(metric_keys, metric_values)}
+        else:
+            for k, v in zip(metric_keys, metric_values):
+                if k in train_state.accum_metrics:
+                    train_state.accum_metrics[k] = train_state.accum_metrics[k] + v
+                else:
+                    train_state.accum_metrics[k] = v.clone()
+
     train_state.accum_step += 1
 
     should_step = train_state.accum_step % accum_steps == 0
@@ -771,12 +830,11 @@ def train_batch(
     train_state.accum_step = 0
 
     # Reduce metrics
-    if len(metrics):
-        assert not any(v.requires_grad for v in metrics.values())
-        
-        metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
+    if train_state.accum_metrics is not None and len(train_state.accum_metrics):
+        metric_keys = list(sorted(train_state.accum_metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
-        metric_values = torch.stack([metrics[k] for k in metric_keys])
+        metric_values = torch.stack([train_state.accum_metrics[k] for k in metric_keys])
+        train_state.accum_metrics = None
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
 
@@ -789,9 +847,9 @@ def train_batch(
 
             def _normalize_metric(key: str, value: float) -> float:
                 if key.startswith("profile/"):
-                    return value / world_size
+                    return value / (world_size * accum_steps)
                 if key.endswith("loss"):
-                    return value / global_batch_size
+                    return value / (global_batch_size * accum_steps)
                 return value / count
 
             reduced_metrics = {f"train/{k}": _normalize_metric(k, v) for k, v in reduced_metrics.items()}
@@ -1321,7 +1379,7 @@ def launch(hydra_config: DictConfig):
             )
 
             # EMA update
-            if config.ema and ema_helper is not None:
+            if metrics is not None and config.ema and ema_helper is not None:
                 ema_helper.update(train_state.model)
 
             if RANK == 0 and metrics is not None:

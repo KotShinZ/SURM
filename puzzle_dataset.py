@@ -136,6 +136,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     test_set_mode: bool
 
     epochs_per_iter: int  # Batch X epochs in an iteration to reduce overhead.
+    grad_accum_steps: int = 1
 
     rank: int
     num_replicas: int
@@ -736,6 +737,8 @@ class PuzzleDataset(IterableDataset):
             num_groups = dataset["group_indices"].size - 1
             group_order = np.concatenate([rng.permutation(num_groups) for _i in range(self.config.epochs_per_iter)])
             start_index = 0
+            grad_accum_steps = max(1, self.config.grad_accum_steps)
+            sample_global_batch_size = self.config.global_batch_size * grad_accum_steps
 
             while start_index < group_order.size:
                 start_index, batch_indices, batch_puzzle_indices = _sample_batch(
@@ -744,7 +747,7 @@ class PuzzleDataset(IterableDataset):
                     puzzle_indices=dataset["puzzle_indices"],
                     group_indices=dataset["group_indices"],
                     start_index=start_index,
-                    global_batch_size=self.config.global_batch_size,
+                    global_batch_size=sample_global_batch_size,
                     data_fraction=self.config.data_fraction,
                     examples_per_puzzle=self.config.examples_per_puzzle,
                 )
@@ -753,21 +756,26 @@ class PuzzleDataset(IterableDataset):
                 global_effective_batch_size = batch_puzzle_indices.size  # Global effective batch size, excluding pads
 
                 # Drop last batch
-                if global_effective_batch_size < self.config.global_batch_size:
+                if global_effective_batch_size < sample_global_batch_size:
                     break
 
-                batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch_fields = self._select_examples(dataset, batch_indices)
-                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][batch_puzzle_indices]
-                batch = self._collate_batch(batch_fields, rng)
+                for accum_index in range(grad_accum_steps):
+                    global_start = accum_index * self.config.global_batch_size
+                    local_start = global_start + self.config.rank * self.local_batch_size
+                    local_end = global_start + (self.config.rank + 1) * self.local_batch_size
 
-                if self.config.online_aug is not None and self.config.online_aug.enabled:
-                    if self.metadata.variable_seq_lengths:
-                        raise ValueError("online_aug is not supported for variable-length datasets.")
-                    batch = apply_online_aug(batch, self.metadata.seq_len, self.config.online_aug)
+                    local_batch_indices = batch_indices[local_start:local_end]
+                    local_batch_puzzle_indices = batch_puzzle_indices[local_start:local_end]
+                    batch_fields = self._select_examples(dataset, local_batch_indices)
+                    batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][local_batch_puzzle_indices]
+                    batch = self._collate_batch(batch_fields, rng)
 
-                yield set_name, batch, global_effective_batch_size
+                    if self.config.online_aug is not None and self.config.online_aug.enabled:
+                        if self.metadata.variable_seq_lengths:
+                            raise ValueError("online_aug is not supported for variable-length datasets.")
+                        batch = apply_online_aug(batch, self.metadata.seq_len, self.config.online_aug)
+
+                    yield set_name, batch, self.config.global_batch_size
                 
     def __iter__(self):
         worker_info = get_worker_info()

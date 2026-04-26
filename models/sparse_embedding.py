@@ -13,6 +13,9 @@ class CastedSparseEmbedding(nn.Module):
         super().__init__()
         self.cast_to = cast_to
         self.num_embeddings = num_embeddings
+        self.batch_size = batch_size
+        self._local_start = 0
+        self._local_size = batch_size
 
         # Real Weights
         # Truncated LeCun normal init
@@ -27,8 +30,18 @@ class CastedSparseEmbedding(nn.Module):
         # Keep in int64 because CUDA scatter/gather expects long indices
         self.local_ids = nn.Buffer(torch.zeros(batch_size, dtype=torch.int64), persistent=False)
 
+    def set_local_range(self, start: int, size: int) -> None:
+        if start < 0 or size < 0 or start + size > self.batch_size:
+            raise ValueError(
+                f"Invalid sparse embedding local range start={start}, size={size}, "
+                f"capacity={self.batch_size}"
+            )
+        self._local_start = start
+        self._local_size = size
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         inputs = inputs.to(torch.int64)
+        flat_inputs = inputs.reshape(-1)
 
         if torch.any((inputs < 0) | (inputs >= self.num_embeddings)):
             min_id = int(inputs.min().item())
@@ -41,13 +54,20 @@ class CastedSparseEmbedding(nn.Module):
         if not self.training:
             # Test mode, no gradient
             return self.weights[inputs].to(self.cast_to)
-            
+
+        if flat_inputs.numel() != self._local_size:
+            self.set_local_range(self._local_start, flat_inputs.numel())
+
+        local_end = self._local_start + flat_inputs.numel()
+        local_weights = self.local_weights[self._local_start:local_end]
+        local_ids = self.local_ids[self._local_start:local_end]
+
         # Training mode, fill puzzle embedding from weights
         with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
+            local_weights.copy_(self.weights[flat_inputs])
+            local_ids.copy_(flat_inputs)
 
-        return self.local_weights.to(self.cast_to)
+        return local_weights.reshape(*inputs.shape, -1).to(self.cast_to)
 
 
 class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
