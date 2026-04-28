@@ -7,10 +7,11 @@ torchrun --nproc-per-node 1 pretrain.py \
 data_path=data/arc1withgen-aug-1000 \
 arch=urm arch.loops=32 arch.H_cycles=1 arch.L_cycles=1 arch.num_layers=4 \
 arch.use_act=False arch.norm_diff_max=0.1 arch.norm_diff_min=0.001 \
-global_batch_size=128 \
-grad_accum_steps=6 \
+global_batch_size=64 \
+grad_accum_steps=12 \
 epochs=100000 \
 eval_interval=2000 \
+eval_first=False \
 puzzle_emb_lr=1e-2 \
 weight_decay=0.1 \
 +run_name=$run_name \

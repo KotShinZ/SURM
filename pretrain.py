@@ -166,7 +166,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Build full-context ARC samples on the fly from one-pair examples.
     mask_full_training: bool = False
-    full_min_pairs: int = 2
+    full_min_pairs: int = 3
     full_max_pairs: int = 8
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.

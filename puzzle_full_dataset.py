@@ -13,6 +13,33 @@ ARC_FULL_IO_COUNT = 2
 FULL_DUMMY_PUZZLE_IDENTIFIER = 0
 
 
+def _to_numpy_array(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _debug_print_first_full_batch_sample(batch: dict) -> None:
+    from data.build_arc_dataset_full_2 import print_data
+
+    seq_offsets = _to_numpy_array(batch["seq_offsets"])
+    if seq_offsets.shape[0] < 2:
+        print("batch data0: <empty>")
+        return
+
+    start = int(seq_offsets[0])
+    end = int(seq_offsets[1])
+    inputs = _to_numpy_array(batch["inputs"])[start:end]
+    labels = _to_numpy_array(batch["labels"])[start:end].copy()
+    position_ids = _to_numpy_array(batch["position_ids"])[start:end]
+
+    labels[labels == IGNORE_LABEL_ID] = 0
+
+    print("batch data0")
+    print_data(inputs, position_ids, title="batch[0] inputs")
+    print_data(labels, position_ids, title="batch[0] labels")
+
+
 def _sample_batch(
     rng: np.random.Generator,
     group_order: np.ndarray,
@@ -345,7 +372,7 @@ class PuzzleFullDataset(PuzzleDataset):
                     min_pairs=int(self.config.full_min_pairs),
                     max_pairs=int(self.config.full_max_pairs),
                 )
-
+                
                 if len(batch_example_indices) < sample_global_batch_size:
                     break
 
@@ -360,6 +387,7 @@ class PuzzleFullDataset(PuzzleDataset):
                         batch_puzzle_indices[local_start:local_end],
                         rng,
                     )
+                    #_debug_print_first_full_batch_sample(batch)
                     yield set_name, batch, self.config.global_batch_size
 
     def _iter_test(self):
@@ -380,6 +408,7 @@ class PuzzleFullDataset(PuzzleDataset):
                     samples,
                     np.full(len(samples), FULL_DUMMY_PUZZLE_IDENTIFIER, dtype=np.int64),
                 )
+                #_debug_print_first_full_batch_sample(batch)
                 yield set_name, batch, end_index - start_index
                 start_index += self.config.global_batch_size
 
