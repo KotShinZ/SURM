@@ -588,8 +588,8 @@ def print_data(
     data: np.ndarray,
     pos_id: np.ndarray,
     title: str = "",
-    max_rows: int = 12,
-    max_cols: int = 12,
+    max_rows: int = 20,
+    max_cols: int = 20,
 ):
     if data.ndim != 1:
         raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")

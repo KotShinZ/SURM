@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from data.build_arc_dataset import _print_color_data
 from models.losses import IGNORE_LABEL_ID
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
@@ -20,8 +21,6 @@ def _to_numpy_array(value):
 
 
 def _debug_print_first_full_batch_sample(batch: dict) -> None:
-    from data.build_arc_dataset_full_2 import print_data
-
     seq_offsets = _to_numpy_array(batch["seq_offsets"])
     if seq_offsets.shape[0] < 2:
         print("batch data0: <empty>")
@@ -36,8 +35,8 @@ def _debug_print_first_full_batch_sample(batch: dict) -> None:
     labels[labels == IGNORE_LABEL_ID] = 0
 
     print("batch data0")
-    print_data(inputs, position_ids, title="batch[0] inputs")
-    print_data(labels, position_ids, title="batch[0] labels")
+    _print_color_data(inputs, position_ids, title="batch[0] inputs")
+    _print_color_data(labels, position_ids, title="batch[0] labels")
 
 
 def _sample_batch(
@@ -387,7 +386,7 @@ class PuzzleFullDataset(PuzzleDataset):
                         batch_puzzle_indices[local_start:local_end],
                         rng,
                     )
-                    #_debug_print_first_full_batch_sample(batch)
+                    _debug_print_first_full_batch_sample(batch)
                     yield set_name, batch, self.config.global_batch_size
 
     def _iter_test(self):

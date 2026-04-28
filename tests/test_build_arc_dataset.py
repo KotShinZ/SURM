@@ -143,10 +143,10 @@ class BuildARCDatasetTests(unittest.TestCase):
 
             self.assertEqual(inputs.shape, (5, 900))
             self.assertEqual(labels.shape, (5, 900))
-            np.testing.assert_array_equal(puzzle_indices, np.array([0, 3, 4, 5], dtype=np.int32))
-            np.testing.assert_array_equal(group_indices, np.array([0, 3], dtype=np.int32))
+            np.testing.assert_array_equal(puzzle_indices, np.array([0, 5], dtype=np.int32))
+            np.testing.assert_array_equal(group_indices, np.array([0, 1], dtype=np.int32))
             self.assertEqual(metadata["total_groups"], 1)
-            self.assertEqual(metadata["mean_puzzle_examples"], 5 / 3)
+            self.assertEqual(metadata["mean_puzzle_examples"], 5.0)
 
     def test_arc_gen_examples_can_be_disabled_even_when_directory_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -213,7 +213,7 @@ class BuildARCDatasetTests(unittest.TestCase):
             self.assertEqual(metadata["total_groups"], 1)
             self.assertEqual(metadata["mean_puzzle_examples"], 3.0)
 
-    def test_arc_gen_uses_independent_augmentation_count(self) -> None:
+    def test_arc_gen_uses_source_augmentation_family(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             input_prefix = tmp_path / "arc"
@@ -261,9 +261,9 @@ class BuildARCDatasetTests(unittest.TestCase):
             puzzle_indices = np.load(output_dir / "train" / "all__puzzle_indices.npy")
             group_indices = np.load(output_dir / "train" / "all__group_indices.npy")
 
-            self.assertEqual(inputs.shape, (5, 900))
-            np.testing.assert_array_equal(puzzle_indices, np.array([0, 2, 3, 4, 5], dtype=np.int32))
-            np.testing.assert_array_equal(group_indices, np.array([0, 4], dtype=np.int32))
+            self.assertEqual(inputs.shape, (3, 900))
+            np.testing.assert_array_equal(puzzle_indices, np.array([0, 3], dtype=np.int32))
+            np.testing.assert_array_equal(group_indices, np.array([0, 1], dtype=np.int32))
 
     def test_test_split_writes_attached_examples_only_for_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -351,7 +351,7 @@ class BuildARCDatasetTests(unittest.TestCase):
                     subsets=["evaluation"],
                     test_set_name="evaluation",
                     seed=0,
-                    num_aug=1,
+                    num_aug=2,
                     no_padding=True,
                 )
             )

@@ -34,6 +34,19 @@ ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
 
 PuzzleIdSeparator = "|||"
+
+_ARC_TOKEN_BG_COLORS = {
+    2: 16,   # ARC color 0: black
+    3: 21,   # ARC color 1: blue
+    4: 196,  # ARC color 2: red
+    5: 46,   # ARC color 3: green
+    6: 226,  # ARC color 4: yellow
+    7: 244,  # ARC color 5: gray
+    8: 201,  # ARC color 6: magenta
+    9: 208,  # ARC color 7: orange
+    10: 51,  # ARC color 8: cyan
+    11: 88,  # ARC color 9: dark red
+}
     
 
 @dataclass
@@ -99,9 +112,9 @@ def filter_puzzles_by_size(
                 removed_by_example_type.get(example_type, 0) + removed_examples
             )
 
-        # ARC-GEN examples are injected as additional puzzles within the same group,
-        # not merged into the source puzzle's example list. We still need them to
-        # keep the original puzzle/group alive after size filtering.
+        # ARC-GEN examples are merged into the matching source task group before
+        # augmentation. They still keep the original task group alive after size
+        # filtering when all ARC-AGI examples for that task are filtered out.
         if extra_train_examples_by_puzzle and extra_train_examples_by_puzzle.get(puzzle_id):
             kept_any_examples = True
 
@@ -204,12 +217,59 @@ def _format_arc_token(token: int):
     return f"?{token}"
 
 
+def _color_cell(token: int) -> str:
+    if token == 0:
+        return "\033[48;5;235m  \033[0m"
+    if token == 1:
+        return "\033[48;5;15;30mEE\033[0m"
+    if token in _ARC_TOKEN_BG_COLORS:
+        return f"\033[48;5;{_ARC_TOKEN_BG_COLORS[token]}m  \033[0m"
+    return "\033[48;5;15;31m??\033[0m"
+
+
+def _format_color_grid_lines(grid: np.ndarray, max_rows: int, max_cols: int):
+    if grid.size == 0:
+        return ["<empty>"]
+
+    row_window = _display_window(grid.shape[0], max_rows)
+    col_window = _display_window(grid.shape[1], max_cols)
+    lines = []
+
+    for row_idx in row_window:
+        if row_idx is None:
+            lines.append("... | ...")
+            continue
+
+        cells = []
+        for col_idx in col_window:
+            if col_idx is None:
+                cells.append("...")
+            else:
+                cells.append(_color_cell(int(grid[row_idx, col_idx])))
+        lines.append(f"r{row_idx:02d} |{''.join(cells)}")
+
+    return lines
+
+
+def _visible_len(text: str) -> int:
+    visible = 0
+    in_escape = False
+    for char in text:
+        if char == "\033":
+            in_escape = True
+        elif in_escape and char == "m":
+            in_escape = False
+        elif not in_escape:
+            visible += 1
+    return visible
+
+
 def print_data(
     data: np.ndarray,
     seq_shape: Tuple[int, int],
     title: str = "",
-    max_rows: int = 12,
-    max_cols: int = 12,
+    max_rows: int = 31,
+    max_cols: int = 31,
 ):
     if data.ndim != 1:
         raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
@@ -226,26 +286,80 @@ def print_data(
         return
 
     grid = data.reshape(height, width)
-    row_window = _display_window(grid.shape[0], max_rows)
-    col_window = _display_window(grid.shape[1], max_cols)
     cropped = grid.shape[0] > max_rows or grid.shape[1] > max_cols
     crop_suffix = " (cropped)" if cropped else ""
 
     print(f"{title or 'sample'}: canvas={height}x{width}{crop_suffix}")
-    print("legend: . = blank/pad, E = eos, 0-9 = ARC colors")
-    for row_idx in row_window:
-        if row_idx is None:
-            print("... | ...")
-            continue
-
-        cells = []
-        for col_idx in col_window:
-            if col_idx is None:
-                cells.append("...")
-            else:
-                cells.append(f"{_format_arc_token(int(grid[row_idx, col_idx])):>3}")
-        print(f"r{row_idx:02d} |{''.join(cells)}")
+    print("legend: dark gray = blank/pad, EE = eos, colored blocks = ARC colors")
+    for line in _format_color_grid_lines(grid, max_rows=max_rows, max_cols=max_cols):
+        print(line)
     print()
+
+
+def _extract_pair_grid(data: np.ndarray, position_ids: np.ndarray, pair_idx: int, io_id: int) -> np.ndarray:
+    part_mask = (position_ids[:, 0] == pair_idx) & (position_ids[:, 1] == io_id)
+    rows = position_ids[part_mask, 2]
+    cols = position_ids[part_mask, 3]
+    tokens = data[part_mask]
+
+    if tokens.size == 0:
+        return np.empty((0, 0), dtype=np.int32)
+
+    height = int(rows.max()) + 1
+    width = int(cols.max()) + 1
+    expected_size = height * width
+    if tokens.size != expected_size:
+        raise ValueError(f"Failed to reconstruct pair {pair_idx}: expected {expected_size} tokens, got {tokens.size}")
+
+    return tokens.reshape(height, width)
+
+
+def _print_color_data(
+    data: np.ndarray,
+    position_ids: np.ndarray,
+    title: str,
+    max_rows: int = 21,
+    max_cols: int = 21,
+) -> None:
+    if data.ndim != 1:
+        raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
+    if position_ids.ndim != 2 or position_ids.shape[1] != 4:
+        raise ValueError(f"Expected position_ids with shape (N, 4), got shape={position_ids.shape}")
+    if data.shape[0] != position_ids.shape[0]:
+        raise ValueError(
+            f"Token length and position_ids length must match, got {data.shape[0]} and {position_ids.shape[0]}"
+        )
+    if data.size == 0:
+        print(f"{title}: <empty>")
+        return
+
+    num_pairs = int(position_ids[:, 0].max()) + 1
+    print(f"{title}: tokens={data.shape[0]}, pairs={num_pairs}")
+    print("legend: dark gray = blank/pad, EE = eos, colored blocks = ARC colors")
+
+    for pair_idx in range(num_pairs):
+        input_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=0)
+        output_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=1)
+        if input_grid.shape != output_grid.shape:
+            raise ValueError(
+                f"Input/output canvas mismatch at pair {pair_idx}: {input_grid.shape} vs {output_grid.shape}"
+            )
+
+        input_lines = _format_color_grid_lines(input_grid, max_rows=max_rows, max_cols=max_cols)
+        output_lines = _format_color_grid_lines(output_grid, max_rows=max_rows, max_cols=max_cols)
+        left_width = max(_visible_len(line) for line in input_lines)
+        pair_shape = f"{input_grid.shape[0]}x{input_grid.shape[1]}"
+        cropped = input_grid.shape[0] > max_rows or input_grid.shape[1] > max_cols
+        crop_suffix = " (cropped)" if cropped else ""
+
+        print(f"  Pair {pair_idx} | canvas={pair_shape}{crop_suffix}")
+        print(f"    {'input':<{left_width}}    output")
+        for line_idx in range(max(len(input_lines), len(output_lines))):
+            left = input_lines[line_idx] if line_idx < len(input_lines) else ""
+            right = output_lines[line_idx] if line_idx < len(output_lines) else ""
+            padding = " " * (left_width - _visible_len(left))
+            print(f"    {left}{padding}    {right}")
+        print()
 
 
 def encode_arc_example_pair(
@@ -419,13 +533,13 @@ def build_augmented_puzzle_family(
         return {}
 
     family_by_dest = {dest: [converted_puzzle] for dest, converted_puzzle in converted.items()}
-    if aug_count <= 0:
+    target_family_size = max(1, aug_count)
+    if target_family_size <= 1:
         return family_by_dest
 
     hashes = {puzzle_hash(converted)}
-    target_family_size = aug_count + 1
 
-    for _trial in range(ARCAugmentRetriesFactor * aug_count):
+    for _trial in range(ARCAugmentRetriesFactor * target_family_size):
         aug_name, map_grid = aug(base_name)
 
         augmented = {
@@ -477,31 +591,24 @@ def convert_single_arc_puzzle(
         if dest[0] == "test":
             converted[dest].context_examples = list(source_train_examples)
 
-    converted = {dest: converted_puzzle for dest, converted_puzzle in converted.items() if converted_puzzle.examples}
-    groups_by_dest = build_augmented_puzzle_family(name, converted, aug_count)
-
-    # Append ARC-GEN as additional single-example puzzle families in the same training group.
-    added_arc_gen_seed_puzzles = 0
-    added_arc_gen_total_puzzles = 0
+    # ARC-GEN examples belong to the same task id as the source ARC-AGI puzzle.
+    # Keep them in the same augmentation puzzle instead of creating additional
+    # puzzle families; this preserves group and puzzle counts and increases only
+    # the number of examples per puzzle.
+    added_arc_gen_examples = 0
     train_dest = dest_mapping.get("train")
     if arc_gen_examples and train_dest is not None:
-        if arc_gen_aug_count is None:
-            arc_gen_aug_count = aug_count
-        groups_by_dest.setdefault(train_dest, [])
-        for example in arc_gen_examples:
-            arc_gen_family = build_augmented_puzzle_family(
-                name,
-                {
-                    train_dest: ARCPuzzle(
-                        name,
-                        [(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))],
-                    )
-                },
-                arc_gen_aug_count,
-            )
-            groups_by_dest[train_dest].extend(arc_gen_family.get(train_dest, []))
-            added_arc_gen_seed_puzzles += 1
-            added_arc_gen_total_puzzles += len(arc_gen_family.get(train_dest, []))
+        converted.setdefault(train_dest, ARCPuzzle(name, []))
+        converted[train_dest].examples.extend(
+            [
+                (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+                for example in arc_gen_examples
+            ]
+        )
+        added_arc_gen_examples = len(arc_gen_examples)
+
+    converted = {dest: converted_puzzle for dest, converted_puzzle in converted.items() if converted_puzzle.examples}
+    groups_by_dest = build_augmented_puzzle_family(name, converted, aug_count)
 
     if not groups_by_dest:
         return set(), 0, 0, {}
@@ -517,8 +624,8 @@ def convert_single_arc_puzzle(
 
     return (
         set(groups_by_dest.keys()),
-        added_arc_gen_seed_puzzles,
-        added_arc_gen_total_puzzles,
+        added_arc_gen_examples,
+        0,
         {dest: len(group) for dest, group in groups_by_dest.items()},
     )
 
@@ -588,6 +695,11 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 f"with {matched_arc_gen_seed_puzzles} seed puzzles before augmentation "
                 f"({missing_arc_gen_groups} unmatched puzzles)"
             )
+            if config.num_aug_gen is not None and config.num_aug_gen != config.num_aug:
+                print(
+                    "num_aug_gen is ignored when merging ARC-GEN examples into ARC-AGI "
+                    "augmentation puzzles; using num_aug for puzzle count"
+                )
 
         puzzles = filter_puzzles_by_size(
             puzzles,
@@ -601,8 +713,7 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         np.random.shuffle(puzzles)
 
         added_arc_gen_groups = 0
-        added_arc_gen_seed_puzzles = 0
-        added_arc_gen_total_puzzles = 0
+        added_arc_gen_examples = 0
         
         # Assign by fraction
         for idx, (name, puzzle) in tqdm(
@@ -624,8 +735,8 @@ def load_puzzles_arcagi(config: DataProcessConfig):
 
             (
                 used_dests,
-                added_arc_gen_seed_puzzle_count,
-                added_arc_gen_total_puzzle_count,
+                added_arc_gen_example_count,
+                _added_arc_gen_total_puzzle_count,
                 puzzle_counts_by_dest,
             ) = convert_single_arc_puzzle(
                 results,
@@ -645,15 +756,13 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             for dest, num_puzzles in puzzle_counts_by_dest.items():
                 output_group_counts[dest] = output_group_counts.get(dest, 0) + 1
                 output_puzzle_counts[dest] = output_puzzle_counts.get(dest, 0) + num_puzzles
-            if added_arc_gen_seed_puzzle_count > 0:
+            if added_arc_gen_example_count > 0:
                 added_arc_gen_groups += 1
-                added_arc_gen_seed_puzzles += added_arc_gen_seed_puzzle_count
-                added_arc_gen_total_puzzles += added_arc_gen_total_puzzle_count
+                added_arc_gen_examples += added_arc_gen_example_count
 
         if arc_gen_enabled_for_subset:
             print(
-                f"Added {added_arc_gen_total_puzzles} ARC-GEN-derived puzzles "
-                f"from {added_arc_gen_seed_puzzles} seed puzzles across "
+                f"Merged {added_arc_gen_examples} ARC-GEN examples into "
                 f"{added_arc_gen_groups} training groups in subset '{subset_name}'"
             )
 
@@ -777,10 +886,13 @@ def convert_dataset(config: DataProcessConfig):
                     # print(f"        Value: {value[i]}")
             # print(results["group_indices"])
             
+            target_train_id = np.random.randint(0, len(results["inputs"]))
+            target_test_id = np.random.randint(0, len(results["inputs"]))
+            
             for k, v in results.items():
                 if config.no_padding and k in {"inputs", "labels"}:
                     if v:
-                        target_id = np.random.randint(0, len(v))
+                        target_id = target_test_id if split_name == "test" else target_train_id
                         print_data(
                             v[target_id],
                             results["seq_shapes"][target_id],
