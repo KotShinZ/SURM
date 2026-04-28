@@ -142,6 +142,7 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
+    eval_first: bool = False
     eval_save_outputs: List[str] = []
 
     loop_deltas: List[str] = []
@@ -1133,6 +1134,8 @@ def save_code_and_config(config: PretrainConfig, save_dir: str):
     import os, json
     import yaml
 
+    os.makedirs(save_dir, exist_ok=True)
+
     cfg_path = os.path.join(save_dir, "config.yaml")
     json_path = os.path.join(save_dir, "config.json")
 
@@ -1393,6 +1396,55 @@ def launch(hydra_config: DictConfig):
             print(f"total_iters: {total_iters}")
             #print(f"train_loader len: {count}")
             print(f"Epoch {_iter_id * train_epochs_per_iter}")
+
+        ############ Initial Evaluation
+        if (
+            _iter_id == 0
+            and config.eval_first
+            and train_state.step == 0
+            and eval_loader is not None
+            and eval_metadata is not None
+        ):
+            if RANK == 0:
+                print("Running initial evaluation at step 0")
+
+            if config.ema and ema_helper is not None:
+                train_state_eval = copy.deepcopy(train_state)
+                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+            else:
+                train_state_eval = train_state
+
+            train_state_eval.model.eval()
+            loop_config = _get_loop_config(train_state_eval.model)
+            if loop_config is not None:
+                original_loops = loop_config.loops
+                if len(config.loop_deltas) == 0:
+                    config.loop_deltas = [0]
+                else:
+                    config.loop_deltas = [0]
+
+            for delta in config.loop_deltas:
+                if loop_config is not None:
+                    loop_config.loops = original_loops + delta
+
+                metrics = evaluate(
+                    config,
+                    train_state_eval,
+                    eval_loader,
+                    eval_metadata,
+                    evaluators,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                    cpu_group=CPU_PROCESS_GROUP,
+                )
+                if RANK == 0 and metrics is not None:
+                    wandb.log(metrics, step=train_state.step)
+
+            if loop_config is not None:
+                loop_config.loops = original_loops
+
+            if config.ema and ema_helper is not None and train_state_eval is not train_state:
+                del train_state_eval
 
         ############ Train Iter
         train_state.model.train()

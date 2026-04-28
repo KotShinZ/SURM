@@ -19,6 +19,7 @@ grad_accum_steps: 1
 
 epochs: 200000
 eval_interval: 10
+eval_first: false
 checkpoint_every_eval: True
 
 lr: 1e-4
