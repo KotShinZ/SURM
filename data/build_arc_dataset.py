@@ -169,33 +169,30 @@ def np_grid_to_fixed_seq_translational_augment(inp: np.ndarray, out: np.ndarray,
     return result
 
 
-def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
+def _np_grid_to_unpadded_seq(grid: np.ndarray):
     # PAD: 0, <eos>: 1, digits: 2 ... 11
-    #
-    # The model still needs input and label sequences to have the same length.
-    # Use the smallest shared canvas that can contain both grids plus the EOS
-    # border when the ARC 30x30 limit leaves room for it.
-    canvas_h = max(inp.shape[0], out.shape[0])
-    canvas_w = max(inp.shape[1], out.shape[1])
+    canvas_h, canvas_w = grid.shape
     if canvas_h < ARCMaxGridSize:
         canvas_h += 1
     if canvas_w < ARCMaxGridSize:
         canvas_w += 1
 
-    result = []
-    for grid in [inp, out]:
-        nrow, ncol = grid.shape
-        canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-        canvas[:nrow, :ncol] = grid + 2
+    nrow, ncol = grid.shape
+    canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    canvas[:nrow, :ncol] = grid + 2
 
-        if nrow < canvas_h:
-            canvas[nrow, :ncol] = 1
-        if ncol < canvas_w:
-            canvas[:nrow, ncol] = 1
+    if nrow < canvas_h:
+        canvas[nrow, :ncol] = 1
+    if ncol < canvas_w:
+        canvas[:nrow, ncol] = 1
 
-        result.append(canvas.flatten())
+    return canvas.flatten(), (canvas_h, canvas_w)
 
-    return result, (canvas_h, canvas_w)
+
+def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
+    inp_seq, inp_shape = _np_grid_to_unpadded_seq(inp)
+    out_seq, out_shape = _np_grid_to_unpadded_seq(out)
+    return [inp_seq, out_seq], (inp_shape, out_shape)
 
 
 def _display_window(length: int, max_items: int):
@@ -340,16 +337,20 @@ def _print_color_data(
     for pair_idx in range(num_pairs):
         input_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=0)
         output_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=1)
-        if input_grid.shape != output_grid.shape:
-            raise ValueError(
-                f"Input/output canvas mismatch at pair {pair_idx}: {input_grid.shape} vs {output_grid.shape}"
-            )
 
         input_lines = _format_color_grid_lines(input_grid, max_rows=max_rows, max_cols=max_cols)
         output_lines = _format_color_grid_lines(output_grid, max_rows=max_rows, max_cols=max_cols)
         left_width = max(_visible_len(line) for line in input_lines)
-        pair_shape = f"{input_grid.shape[0]}x{input_grid.shape[1]}"
-        cropped = input_grid.shape[0] > max_rows or input_grid.shape[1] > max_cols
+        pair_shape = (
+            f"input={input_grid.shape[0]}x{input_grid.shape[1]} "
+            f"output={output_grid.shape[0]}x{output_grid.shape[1]}"
+        )
+        cropped = (
+            input_grid.shape[0] > max_rows
+            or input_grid.shape[1] > max_cols
+            or output_grid.shape[0] > max_rows
+            or output_grid.shape[1] > max_cols
+        )
         crop_suffix = " (cropped)" if cropped else ""
 
         print(f"  Pair {pair_idx} | canvas={pair_shape}{crop_suffix}")
@@ -385,7 +386,8 @@ def encode_context_examples(
     no_padding: bool,
 ):
     examples = examples or []
-    example_shapes = np.empty((len(examples), 2), dtype=np.int32)
+    shape_dims = (2, 2) if no_padding else (2,)
+    example_shapes = np.empty((len(examples), *shape_dims), dtype=np.int32)
 
     if no_padding:
         encoded_examples = np.empty((len(examples), 2), dtype=object)
@@ -398,7 +400,7 @@ def encode_context_examples(
             )
             encoded_examples[example_idx, 0] = encoded_inp.astype(np.uint8, copy=False)
             encoded_examples[example_idx, 1] = encoded_out.astype(np.uint8, copy=False)
-            example_shapes[example_idx] = seq_shape
+            example_shapes[example_idx] = np.asarray(seq_shape, dtype=np.int32)
         return encoded_examples, example_shapes
 
     encoded_pairs = []
@@ -840,13 +842,15 @@ def convert_dataset(config: DataProcessConfig):
                     no_aug_id = np.random.randint(0, len(puzzle.examples))
                     for _idx_ex, (inp, out) in enumerate(puzzle.examples):
                         if config.no_padding:
-                            (inp, out), seq_shape = encode_arc_example_pair(
+                            (inp, out), pair_seq_shape = encode_arc_example_pair(
                                 inp,
                                 out,
                                 no_padding=True,
                                 do_translation=False,
                             )
-                            results.setdefault("seq_shapes", []).append(seq_shape)
+                            input_seq_shape, label_seq_shape = pair_seq_shape
+                            results.setdefault("seq_shapes", []).append(input_seq_shape)
+                            results.setdefault("label_seq_shapes", []).append(label_seq_shape)
                         else:
                             (inp, out), _seq_shape = encode_arc_example_pair(
                                 inp,
@@ -893,9 +897,10 @@ def convert_dataset(config: DataProcessConfig):
                 if config.no_padding and k in {"inputs", "labels"}:
                     if v:
                         target_id = target_test_id if split_name == "test" else target_train_id
+                        shape_key = "seq_shapes" if k == "inputs" else "label_seq_shapes"
                         print_data(
                             v[target_id],
-                            results["seq_shapes"][target_id],
+                            results[shape_key][target_id],
                             title=f"{split_name}/{subset_name} {k}[{target_id}]",
                         )
                         if split_name == "test" and k == "inputs" and "examples" in results:
@@ -904,7 +909,7 @@ def convert_dataset(config: DataProcessConfig):
                             for example_idx in range(len(context_examples)):
                                 print_data(
                                     np.asarray(context_examples[example_idx][0], dtype=np.uint8),
-                                    tuple(int(v) for v in context_shapes[example_idx]),
+                                    tuple(int(v) for v in context_shapes[example_idx][0]),
                                     title=(
                                         f"{split_name}/{subset_name} examples[{target_id}]"
                                         f"[{example_idx}].input"
@@ -912,7 +917,7 @@ def convert_dataset(config: DataProcessConfig):
                                 )
                                 print_data(
                                     np.asarray(context_examples[example_idx][1], dtype=np.uint8),
-                                    tuple(int(v) for v in context_shapes[example_idx]),
+                                    tuple(int(v) for v in context_shapes[example_idx][1]),
                                     title=(
                                         f"{split_name}/{subset_name} examples[{target_id}]"
                                         f"[{example_idx}].output"
@@ -929,9 +934,19 @@ def convert_dataset(config: DataProcessConfig):
                             os.path.join(config.output_dir, split_name, f"{subset_name}__seq_offsets.npy"),
                             seq_offsets,
                         )
+                    else:
+                        np.save(
+                            os.path.join(config.output_dir, split_name, f"{subset_name}__label_seq_offsets.npy"),
+                            seq_offsets,
+                        )
                 elif k in {"inputs", "labels"}:
                     np.save(os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"), np.stack(v, 0))
                 elif k == "seq_shapes":
+                    np.save(
+                        os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
+                        np.array(v, dtype=np.int32),
+                    )
+                elif k == "label_seq_shapes":
                     np.save(
                         os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"),
                         np.array(v, dtype=np.int32),

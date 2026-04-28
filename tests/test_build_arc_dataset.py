@@ -56,11 +56,9 @@ def _encode_unpadded_canvas(grid: list[list[int]], canvas_shape: tuple[int, int]
     return canvas.reshape(-1)
 
 
-def _pair_canvas_shape(inp: list[list[int]], out: list[list[int]]) -> tuple[int, int]:
-    inp_arr = np.array(inp, dtype=np.uint8)
-    out_arr = np.array(out, dtype=np.uint8)
-    height = max(inp_arr.shape[0], out_arr.shape[0])
-    width = max(inp_arr.shape[1], out_arr.shape[1])
+def _grid_canvas_shape(grid: list[list[int]]) -> tuple[int, int]:
+    arr = np.array(grid, dtype=np.uint8)
+    height, width = arr.shape
     if height < 30:
         height += 1
     if width < 30:
@@ -275,7 +273,7 @@ class BuildARCDatasetTests(unittest.TestCase):
                 "p_eval": {
                     "train": [
                         {"input": [[1]], "output": [[2]]},
-                        {"input": [[3, 3]], "output": [[4, 4]]},
+                        {"input": [[3, 3]], "output": [[4], [4]]},
                     ],
                     "test": [
                         {"input": [[5]]},
@@ -287,7 +285,7 @@ class BuildARCDatasetTests(unittest.TestCase):
                 input_prefix,
                 "evaluation",
                 evaluation_puzzles,
-                {"p_eval": [[[6]]]},
+                {"p_eval": [[[6], [6]]]},
             )
 
             convert_dataset(
@@ -317,7 +315,7 @@ class BuildARCDatasetTests(unittest.TestCase):
             np.testing.assert_array_equal(examples[0][0, 0], _encode_fixed_canvas([[1]]))
             np.testing.assert_array_equal(examples[0][0, 1], _encode_fixed_canvas([[2]]))
             np.testing.assert_array_equal(examples[0][1, 0], _encode_fixed_canvas([[3, 3]]))
-            np.testing.assert_array_equal(examples[0][1, 1], _encode_fixed_canvas([[4, 4]]))
+            np.testing.assert_array_equal(examples[0][1, 1], _encode_fixed_canvas([[4], [4]]))
 
     def test_test_split_examples_support_no_padding_and_augmentation_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -329,7 +327,7 @@ class BuildARCDatasetTests(unittest.TestCase):
                 "p_eval": {
                     "train": [
                         {"input": [[1]], "output": [[2]]},
-                        {"input": [[3, 3]], "output": [[4, 4]]},
+                        {"input": [[3, 3]], "output": [[4], [4]]},
                     ],
                     "test": [
                         {"input": [[5]]},
@@ -341,7 +339,7 @@ class BuildARCDatasetTests(unittest.TestCase):
                 input_prefix,
                 "evaluation",
                 evaluation_puzzles,
-                {"p_eval": [[[6]]]},
+                {"p_eval": [[[6], [6]]]},
             )
 
             convert_dataset(
@@ -359,26 +357,42 @@ class BuildARCDatasetTests(unittest.TestCase):
             examples = np.load(output_dir / "test" / "all__examples.npy", allow_pickle=True)
             example_shapes = np.load(output_dir / "test" / "all__example_shapes.npy", allow_pickle=True)
             inputs = np.load(output_dir / "test" / "all__inputs.npy")
+            labels = np.load(output_dir / "test" / "all__labels.npy")
             seq_offsets = np.load(output_dir / "test" / "all__seq_offsets.npy")
+            label_seq_offsets = np.load(output_dir / "test" / "all__label_seq_offsets.npy")
+            seq_shapes = np.load(output_dir / "test" / "all__seq_shapes.npy")
+            label_seq_shapes = np.load(output_dir / "test" / "all__label_seq_shapes.npy")
 
             self.assertEqual(examples.shape, (2,))
             self.assertEqual(seq_offsets.shape, (3,))
+            self.assertEqual(label_seq_offsets.shape, (3,))
             self.assertGreater(inputs.shape[0], 0)
+            self.assertGreater(labels.shape[0], 0)
+            self.assertFalse(np.array_equal(seq_offsets, label_seq_offsets))
+            self.assertFalse(np.array_equal(seq_shapes, label_seq_shapes))
 
             first_examples = examples[0]
             first_example_shapes = example_shapes[0]
             self.assertEqual(first_examples.shape, (2, 2))
 
-            first_shape = _pair_canvas_shape([[1]], [[2]])
-            second_shape = _pair_canvas_shape([[3, 3]], [[4, 4]])
+            first_input_shape = _grid_canvas_shape([[1]])
+            first_label_shape = _grid_canvas_shape([[2]])
+            second_input_shape = _grid_canvas_shape([[3, 3]])
+            second_label_shape = _grid_canvas_shape([[4], [4]])
             np.testing.assert_array_equal(
                 first_example_shapes,
-                np.array([first_shape, second_shape], dtype=np.int32),
+                np.array(
+                    [
+                        [first_input_shape, first_label_shape],
+                        [second_input_shape, second_label_shape],
+                    ],
+                    dtype=np.int32,
+                ),
             )
-            np.testing.assert_array_equal(first_examples[0, 0], _encode_unpadded_canvas([[1]], first_shape))
-            np.testing.assert_array_equal(first_examples[0, 1], _encode_unpadded_canvas([[2]], first_shape))
-            np.testing.assert_array_equal(first_examples[1, 0], _encode_unpadded_canvas([[3, 3]], second_shape))
-            np.testing.assert_array_equal(first_examples[1, 1], _encode_unpadded_canvas([[4, 4]], second_shape))
+            np.testing.assert_array_equal(first_examples[0, 0], _encode_unpadded_canvas([[1]], first_input_shape))
+            np.testing.assert_array_equal(first_examples[0, 1], _encode_unpadded_canvas([[2]], first_label_shape))
+            np.testing.assert_array_equal(first_examples[1, 0], _encode_unpadded_canvas([[3, 3]], second_input_shape))
+            np.testing.assert_array_equal(first_examples[1, 1], _encode_unpadded_canvas([[4], [4]], second_label_shape))
 
 
 if __name__ == "__main__":

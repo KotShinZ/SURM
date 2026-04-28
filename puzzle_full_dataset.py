@@ -70,20 +70,27 @@ def _sample_batch(
         if available_puzzles <= 0:
             continue
 
-        pair_count = int(rng.integers(min_pairs, max_pairs + 1))
-        pair_count = min(pair_count, available_puzzles)
-        if pair_count <= 0:
+        group_puzzle_ids = np.arange(group_start, group_end_limited, dtype=np.int64)
+        puzzle_sizes = puzzle_indices[group_puzzle_ids + 1] - puzzle_indices[group_puzzle_ids]
+        eligible_puzzles = group_puzzle_ids[puzzle_sizes >= min_pairs]
+        if eligible_puzzles.size == 0:
             continue
 
-        selected_puzzles = group_start + rng.choice(available_puzzles, size=pair_count, replace=False)
-        selected_examples = []
-        for puzzle_id in selected_puzzles.astype(np.int64, copy=False):
-            puzzle_start = int(puzzle_indices[puzzle_id])
-            puzzle_end = int(puzzle_indices[puzzle_id + 1])
-            selected_examples.append(int(rng.integers(puzzle_start, puzzle_end)))
+        selected_puzzle = int(rng.choice(eligible_puzzles))
+        puzzle_start = int(puzzle_indices[selected_puzzle])
+        puzzle_end = int(puzzle_indices[selected_puzzle + 1])
+        puzzle_size = puzzle_end - puzzle_start
+        pair_count = int(rng.integers(min_pairs, min(max_pairs, puzzle_size) + 1))
+        available_examples = np.arange(puzzle_start, puzzle_end, dtype=np.int64)
+        selected_examples = np.empty((pair_count,), dtype=np.int64)
+        for pair_idx in range(pair_count):
+            selected_idx = int(rng.integers(available_examples.size))
+            selected_examples[pair_idx] = available_examples[selected_idx]
+            available_examples[selected_idx] = available_examples[-1]
+            available_examples = available_examples[:-1]
 
-        batch_example_indices.append(np.array(selected_examples, dtype=np.int64))
-        batch_puzzle_indices.append(selected_puzzles.astype(np.int64, copy=False))
+        batch_example_indices.append(selected_examples)
+        batch_puzzle_indices.append(np.array([selected_puzzle], dtype=np.int64))
 
     return start_index, batch_example_indices, batch_puzzle_indices
 
@@ -141,6 +148,13 @@ class PuzzleFullDataset(PuzzleDataset):
                 labels_path = os.path.join(split_dir, f"{set_name}__labels.npy")
                 if os.path.isfile(labels_path):
                     set_fields["labels"] = "r"
+                    if self.metadata.variable_seq_lengths:
+                        label_offsets_path = os.path.join(split_dir, f"{set_name}__label_seq_offsets.npy")
+                        label_shapes_path = os.path.join(split_dir, f"{set_name}__label_seq_shapes.npy")
+                        if os.path.isfile(label_offsets_path):
+                            set_fields["label_seq_offsets"] = None
+                        if os.path.isfile(label_shapes_path):
+                            set_fields["label_seq_shapes"] = None
                 position_ids_path = os.path.join(split_dir, f"{set_name}__position_ids.npy")
                 if os.path.isfile(position_ids_path):
                     set_fields["position_ids"] = "r"
@@ -172,7 +186,7 @@ class PuzzleFullDataset(PuzzleDataset):
         return np.concatenate([pair_ids, io_ids, row_col_ids], axis=-1)
 
     def _read_example_array(self, dataset: dict, field_name: str, example_index: int) -> np.ndarray:
-        offsets = dataset["seq_offsets"]
+        offsets = dataset.get("label_seq_offsets", dataset["seq_offsets"]) if field_name == "labels" else dataset["seq_offsets"]
         start = int(offsets[example_index])
         end = int(offsets[example_index + 1])
         return dataset[field_name][start:end].astype(np.int32, copy=False)
@@ -180,7 +194,7 @@ class PuzzleFullDataset(PuzzleDataset):
     def _build_pairs_sample(
         self,
         pairs: Sequence[Tuple[np.ndarray, np.ndarray]],
-        shapes: Sequence[Tuple[int, int]],
+        shapes: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]],
         target_pair_index: int,
     ) -> dict:
         if not pairs:
@@ -193,27 +207,29 @@ class PuzzleFullDataset(PuzzleDataset):
         source_chunks = []
         position_chunks = []
 
-        for pair_pos, ((problem, solution), shape) in enumerate(zip(pairs, shapes)):
-            shape = tuple(int(v) for v in shape)
+        for pair_pos, ((problem, solution), shape_pair) in enumerate(zip(pairs, shapes)):
+            input_shape = tuple(int(v) for v in shape_pair[0])
+            label_shape = tuple(int(v) for v in shape_pair[1])
             problem = problem.astype(np.int32, copy=False)
             solution = solution.astype(np.int32, copy=False)
 
-            if problem.size != solution.size:
+            expected_input_size = input_shape[0] * input_shape[1]
+            if problem.size != expected_input_size:
                 raise ValueError(
-                    "PuzzleFullDataset expects problem and solution sequences to have the same length, "
-                    f"got {problem.size} and {solution.size} for pair {pair_pos}."
+                    "input shape does not match pair length, "
+                    f"got shape={input_shape} length={problem.size} for pair {pair_pos}."
                 )
-            expected_size = shape[0] * shape[1]
-            if problem.size != expected_size:
+            expected_label_size = label_shape[0] * label_shape[1]
+            if solution.size != expected_label_size:
                 raise ValueError(
-                    "shape does not match pair length, "
-                    f"got shape={shape} length={problem.size} for pair {pair_pos}."
+                    "label shape does not match pair length, "
+                    f"got shape={label_shape} length={solution.size} for pair {pair_pos}."
                 )
 
             input_chunks.append(problem)
             label_chunks.append(np.zeros_like(problem))
             source_chunks.append(problem)
-            position_chunks.append(self._make_position_ids(pair_pos, 0, shape))
+            position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
                 input_solution = np.zeros_like(solution)
@@ -225,7 +241,7 @@ class PuzzleFullDataset(PuzzleDataset):
             input_chunks.append(input_solution)
             label_chunks.append(label_solution)
             source_chunks.append(solution)
-            position_chunks.append(self._make_position_ids(pair_pos, 1, shape))
+            position_chunks.append(self._make_position_ids(pair_pos, 1, label_shape))
 
         inputs = np.concatenate(input_chunks).astype(np.int32, copy=False)
         labels = np.concatenate(label_chunks).astype(np.int32, copy=False)
@@ -258,13 +274,15 @@ class PuzzleFullDataset(PuzzleDataset):
         pairs = []
         shapes = []
         seq_shapes = dataset["seq_shapes"][example_indices].astype(np.int32, copy=False)
+        label_seq_shapes = dataset.get("label_seq_shapes", dataset["seq_shapes"])[example_indices].astype(np.int32, copy=False)
 
         for pair_pos, example_index in enumerate(example_indices.astype(np.int64, copy=False)):
-            shape = tuple(int(v) for v in seq_shapes[pair_pos])
+            input_shape = tuple(int(v) for v in seq_shapes[pair_pos])
+            label_shape = tuple(int(v) for v in label_seq_shapes[pair_pos])
             problem = self._read_example_array(dataset, "inputs", int(example_index))
             solution = self._read_example_array(dataset, "labels", int(example_index))
             pairs.append((problem, solution))
-            shapes.append(shape)
+            shapes.append((input_shape, label_shape))
 
         return self._build_pairs_sample(pairs, shapes, target_pair_index)
 
@@ -277,9 +295,15 @@ class PuzzleFullDataset(PuzzleDataset):
         for pair_index in range(len(context_examples)):
             problem = np.asarray(context_examples[pair_index][0], dtype=np.int32)
             solution = np.asarray(context_examples[pair_index][1], dtype=np.int32)
-            shape = tuple(int(v) for v in np.asarray(context_shapes[pair_index], dtype=np.int32).tolist())
+            shape_array = np.asarray(context_shapes[pair_index], dtype=np.int32)
+            if shape_array.shape == (2, 2):
+                input_shape = tuple(int(v) for v in shape_array[0].tolist())
+                label_shape = tuple(int(v) for v in shape_array[1].tolist())
+            else:
+                input_shape = tuple(int(v) for v in shape_array.tolist())
+                label_shape = input_shape
             pairs.append((problem, solution))
-            shapes.append(shape)
+            shapes.append((input_shape, label_shape))
 
         return pairs, shapes
 
@@ -287,10 +311,14 @@ class PuzzleFullDataset(PuzzleDataset):
         pairs, shapes = self._context_pairs_for_test_example(dataset, example_index)
         query_problem = self._read_example_array(dataset, "inputs", example_index)
         query_solution = self._read_example_array(dataset, "labels", example_index)
-        query_shape = tuple(int(v) for v in dataset["seq_shapes"][example_index])
+        query_input_shape = tuple(int(v) for v in dataset["seq_shapes"][example_index])
+        query_label_shape = tuple(
+            int(v)
+            for v in dataset.get("label_seq_shapes", dataset["seq_shapes"])[example_index]
+        )
 
         pairs.append((query_problem, query_solution))
-        shapes.append(query_shape)
+        shapes.append((query_input_shape, query_label_shape))
         return self._build_pairs_sample(pairs, shapes, target_pair_index=len(pairs) - 1)
 
     def _collate_full_samples(
@@ -386,7 +414,7 @@ class PuzzleFullDataset(PuzzleDataset):
                         batch_puzzle_indices[local_start:local_end],
                         rng,
                     )
-                    _debug_print_first_full_batch_sample(batch)
+                    #_debug_print_first_full_batch_sample(batch)
                     yield set_name, batch, self.config.global_batch_size
 
     def _iter_test(self):

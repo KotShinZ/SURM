@@ -222,6 +222,13 @@ class PuzzleDataset(IterableDataset):
             labels_path = os.path.join(split_dir, f"{set_name}__labels.npy")
             if os.path.isfile(labels_path):
                 set_fields["labels"] = "r"
+                if self.metadata.variable_seq_lengths:
+                    label_offsets_path = os.path.join(split_dir, f"{set_name}__label_seq_offsets.npy")
+                    label_shapes_path = os.path.join(split_dir, f"{set_name}__label_seq_shapes.npy")
+                    if os.path.isfile(label_offsets_path):
+                        set_fields["label_seq_offsets"] = None
+                    if os.path.isfile(label_shapes_path):
+                        set_fields["label_seq_shapes"] = None
             position_ids_path = os.path.join(split_dir, f"{set_name}__position_ids.npy")
             if os.path.isfile(position_ids_path):
                 set_fields["position_ids"] = "r"
@@ -246,6 +253,13 @@ class PuzzleDataset(IterableDataset):
         offsets = dataset["seq_offsets"]
         shapes = dataset["seq_shapes"][indices]
         lengths = (offsets[indices + 1] - offsets[indices]).astype(np.int32, copy=False)
+        label_offsets = dataset.get("label_seq_offsets", offsets)
+        label_shapes = dataset.get("label_seq_shapes", dataset["seq_shapes"])
+        label_lengths = (
+            (label_offsets[indices + 1] - label_offsets[indices]).astype(np.int32, copy=False)
+            if "labels" in dataset
+            else None
+        )
 
         input_chunks = []
         position_chunks = []
@@ -255,7 +269,9 @@ class PuzzleDataset(IterableDataset):
             end = int(offsets[example_idx + 1])
             input_chunks.append(dataset["inputs"][start:end])
             if label_chunks is not None:
-                label_chunks.append(dataset["labels"][start:end])
+                label_start = int(label_offsets[example_idx])
+                label_end = int(label_offsets[example_idx + 1])
+                label_chunks.append(dataset["labels"][label_start:label_end])
             if "position_ids" in dataset:
                 position_chunks.append(dataset["position_ids"][start:end])
 
@@ -277,6 +293,11 @@ class PuzzleDataset(IterableDataset):
                 batch["labels"] = np.concatenate(label_chunks).astype(np.uint8, copy=False)
             else:
                 batch["labels"] = np.empty((0,), dtype=np.uint8)
+            batch["label_seq_lengths"] = label_lengths
+            batch["label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(label_lengths, dtype=np.int32)]
+            )
+            batch["label_seq_shapes"] = label_shapes[indices]
         if "position_ids" in dataset:
             if position_chunks:
                 batch["position_ids"] = np.concatenate(position_chunks, axis=0).astype(
