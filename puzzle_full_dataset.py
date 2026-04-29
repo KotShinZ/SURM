@@ -1,4 +1,5 @@
 import os
+import math
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -134,6 +135,7 @@ class PuzzleFullDataset(PuzzleDataset):
         if self._data is None:
             field_mmap_modes = {
                 "inputs": "r",
+                "puzzle_identifiers": None,
                 "puzzle_indices": None,
                 "group_indices": None,
             }
@@ -366,6 +368,7 @@ class PuzzleFullDataset(PuzzleDataset):
                 FULL_DUMMY_PUZZLE_IDENTIFIER,
                 dtype=np.int64,
             ),
+            "arc_identifiers": puzzle_identifiers.astype(np.int64, copy=False),
         }
         batch["seq_offsets"] = np.concatenate(
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
@@ -430,10 +433,11 @@ class PuzzleFullDataset(PuzzleDataset):
                     break
 
                 local_indices = np.arange(local_start, local_end, dtype=np.int64)
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
                 samples = [self._build_test_sample(dataset, int(example_index)) for example_index in local_indices]
                 batch = self._collate_built_samples(
                     samples,
-                    np.full(len(samples), FULL_DUMMY_PUZZLE_IDENTIFIER, dtype=np.int64),
+                    dataset["puzzle_identifiers"][puzzle_indices],
                 )
                 #_debug_print_first_full_batch_sample(batch)
                 yield set_name, batch, end_index - start_index
@@ -441,4 +445,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
     def __len__(self):
         self._lazy_load_dataset()
+        if self.config.test_set_mode:
+            total_examples = sum(d["seq_offsets"].size - 1 for d in self._data.values())
+            return math.ceil(total_examples / self.config.global_batch_size)
         return sum(d["group_indices"].size - 1 for d in self._data.values())

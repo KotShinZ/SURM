@@ -220,6 +220,36 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
                 start_index += self.config.global_batch_size
 
 
+class ShuffledTestPuzzleFullDataset(PuzzleFullDataset):
+    def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
+        for set_name, dataset in self._data.items():  # type: ignore
+            total_examples = dataset["seq_offsets"].size - 1
+            shuffled_indices = rng.permutation(total_examples)
+
+            start_index = 0
+            while start_index < total_examples:
+                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                global_indices = shuffled_indices[start_index:end_index]
+
+                local_start = self.config.rank * self.local_batch_size
+                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
+                if local_start >= local_end:
+                    break
+
+                local_indices = global_indices[local_start:local_end]
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
+                samples = [self._build_test_sample(dataset, int(example_index)) for example_index in local_indices]
+                batch = self._collate_built_samples(
+                    samples,
+                    dataset["puzzle_identifiers"][puzzle_indices],
+                )
+
+                yield set_name, batch, end_index - start_index
+                start_index += self.config.global_batch_size
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_test = kwargs.get("test_set_mode", False)
     data_fraction = config.data_fraction if not is_test else 1.0
@@ -228,7 +258,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
     if config.mask_full_training:
-        dataset_cls = PuzzleFullDataset
+        dataset_cls = ShuffledTestPuzzleFullDataset if is_test else PuzzleFullDataset
     else:
         dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
     dataset = dataset_cls(
@@ -251,8 +281,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
     elif is_test:
         print(
-            "Evaluation split uses PuzzleFullDataset "
-            f"with {config.full_min_pairs}-{config.full_max_pairs} pairs per sample."
+            "Evaluation split uses shuffled PuzzleFullDataset "
+            f"with {config.full_min_pairs}-{config.full_max_pairs} pairs per sample "
+            f"and seed {config.seed}."
         )
     elif config.mask_full_training:
         print(
@@ -547,7 +578,10 @@ def load_config_from_checkpoint_path(path: str) -> Optional[PretrainConfig]:
 
 def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: dict):
     puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-    expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+    puzzle_emb = _get_puzzle_embedding_module(model)
+    if puzzle_emb is None:
+        return
+    expected_shape: torch.Size = puzzle_emb.weights.shape  # type: ignore
     if puzzle_emb_name in state_dict:
         puzzle_emb = state_dict[puzzle_emb_name]
         if puzzle_emb.shape != expected_shape:
@@ -987,6 +1021,7 @@ def evaluate(
     rank: int,
     world_size: int,
     cpu_group: Optional[dist.ProcessGroup],
+    early_eval: bool = False,
 ):
     reduced_metrics = None
     original_is_log = global_logger.is_log
@@ -1011,9 +1046,9 @@ def evaluate(
             
             print("Starting evaluation... len(eval_loader) =", len(eval_loader))
             for set_name, batch, global_batch_size in eval_loader:
-                if processed_batches > 50:
+                if early_eval and processed_batches > 50:
                     break
-                
+
                 processed_batches += 1
                 if rank == 0:
                     print(f"Processing batch {processed_batches}: {set_name}")
@@ -1157,12 +1192,23 @@ def save_code_and_config(config: PretrainConfig, save_dir: str):
 
 
 def _get_loop_config(model: nn.Module):
-    inner_model = getattr(model, "model", None)
-    model_config = getattr(inner_model, "config", None)
-    if model_config is None or not hasattr(model_config, "loops"):
-        return None
+    candidates = [model, getattr(model, "_orig_mod", None)]
+    seen = set()
 
-    return model_config
+    while candidates:
+        candidate = candidates.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+
+        model_config = getattr(candidate, "config", None)
+        if model_config is not None and hasattr(model_config, "loops"):
+            return model_config
+
+        candidates.append(getattr(candidate, "model", None))
+        candidates.append(getattr(candidate, "inner", None))
+
+    return None
 
 
 def _prefix_metrics(metrics: Any, prefix: str):
@@ -1436,6 +1482,7 @@ def launch(hydra_config: DictConfig):
                     rank=RANK,
                     world_size=WORLD_SIZE,
                     cpu_group=CPU_PROCESS_GROUP,
+                    early_eval=True,
                 )
                 if RANK == 0 and metrics is not None:
                     wandb.log(metrics, step=train_state.step)
@@ -1492,6 +1539,7 @@ def launch(hydra_config: DictConfig):
                     rank=RANK,
                     world_size=WORLD_SIZE,
                     cpu_group=CPU_PROCESS_GROUP,
+                    early_eval=True,
                 )
                 if RANK == 0 and metrics is not None:
                     wandb.log(metrics, step=train_state.step)
