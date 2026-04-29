@@ -1,1380 +1,323 @@
-# python evaluate_trained_model.py --checkpoint checkpoints/URM-sudoku-base --max_problems 4096 --loops 32 --batch_size 4096 --hidden_diff_threshold 0.1
+from __future__ import annotations
 
 import argparse
 import json
 import math
-import os
 import re
-from collections import defaultdict
-from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-import time
+from typing import Dict, Iterator, Optional, Tuple
 
-import numpy as np
-import pydantic
 import torch
-import torch.nn.functional as F
-import yaml
-from omegaconf import OmegaConf
-from torch import nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from data.build_arc_dataset import ARCMaxGridSize
-from models.losses import IGNORE_LABEL_ID
-from puzzle_dataset import MaskedInputConfig, PuzzleDataset, PuzzleDatasetConfig
-from utils import load_model_class
-from evaluators.arc_majority_vote import (
-    default_arc_submission_dir,
-    maybe_create_arc_majority_vote_evaluator,
+from evaluators.arc import ARC
+from pretrain import (
+    PretrainConfig,
+    TrainState,
+    _get_loop_config,
+    _load_model_state,
+    _resolve_checkpoint_path,
+    create_dataloader,
+    create_evaluators,
+    evaluate,
+    init_train_state,
+    load_config_from_checkpoint_path,
 )
 
 
-class LossConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra="allow")
-
-    name: str
-
-
-class ArchConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra="allow")
-
-    name: str
-    loss: LossConfig
+def load_config_from_checkpoint(checkpoint: str) -> PretrainConfig:
+    config = load_config_from_checkpoint_path(checkpoint)
+    if config is None:
+        raise FileNotFoundError(f"Could not load a saved config for checkpoint: {checkpoint}")
+    return config
 
 
-class EvaluatorConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra="allow")
-
-    name: str
-
-
-class PretrainConfig(pydantic.BaseModel):
-    arch: ArchConfig
-    data_path: str
-    evaluators: List[EvaluatorConfig] = []
-    global_batch_size: int
-    epochs: int
-    lr: float
-    lr_min_ratio: float
-    lr_warmup_steps: int
-    weight_decay: float
-    beta1: float
-    beta2: float
-    target_q_update_every: int
-    puzzle_emb_lr: float
-    puzzle_emb_weight_decay: float
-    grad_accum_steps: int = 1
-    project_name: Optional[str] = None
-    run_name: Optional[str] = None
-    checkpoint_path: Optional[str] = None
-    load_checkpoint: Optional[str] = None
-    load_strict: bool = True
-    load_optimizer_state: bool = True
-    seed: int = 0
-    checkpoint_every_eval: bool = False
-    eval_interval: Optional[int] = None
-    eval_save_outputs: List[str] = []
-    loop_deltas: List[str] = []
-    ema: bool = False
-    ema_rate: float = 0.999
-    use_muon: bool = False
-    data_fraction: float = 1.0
-    masked_input: Optional[MaskedInputConfig] = None
+def _checkpoint_step(checkpoint_path: Path) -> int:
+    match = re.match(r"step_(\d+)(?:\.pt)?$", checkpoint_path.name)
+    if match is not None:
+        return int(match.group(1))
+    return 0
 
 
-class ShuffledTestPuzzleDataset(PuzzleDataset):
-    def _iter_test(self):
-        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
-
-        for set_name, dataset in self._data.items():  # type: ignore
-            total_examples = (
-                dataset["seq_offsets"].size - 1
-                if self.metadata.variable_seq_lengths
-                else len(dataset["inputs"])
-            )
-            shuffled_indices = rng.permutation(total_examples)
-
-            start_index = 0
-            while start_index < total_examples:
-                end_index = min(total_examples, start_index + self.config.global_batch_size)
-                global_indices = shuffled_indices[start_index:end_index]
-
-                local_start = self.config.rank * self.local_batch_size
-                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
-                local_indices = global_indices[local_start:local_end]
-                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
-
-                batch_fields = self._select_examples(dataset, local_indices)
-                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][puzzle_indices]
-                batch = self._collate_batch(batch_fields, rng, make_masked_inputs=False)
-
-                yield set_name, batch, end_index - start_index
-
-                start_index += self.config.global_batch_size
-
-
-def _ensure_arch_extra(config: PretrainConfig) -> Dict[str, Any]:
-    if config.arch.__pydantic_extra__ is None:
+def _set_arch_extra(config: PretrainConfig, key: str, value) -> None:
+    extra = config.arch.__pydantic_extra__
+    if extra is None:
         config.arch.__pydantic_extra__ = {}
-    return config.arch.__pydantic_extra__
+        extra = config.arch.__pydantic_extra__
+    extra[key] = value
 
 
-def _loop_count_config_key(config: PretrainConfig) -> str:
-    arch_extra = config.arch.__pydantic_extra__ or {}
-    if "halt_max_steps" in arch_extra:
-        return "halt_max_steps"
-    return "loops"
+def apply_eval_overrides(
+    config: PretrainConfig,
+    *,
+    batch_size: int,
+    loops: Optional[int],
+    hidden_diff_threshold: Optional[float],
+) -> None:
+    config.global_batch_size = batch_size
+    config.grad_accum_steps = 1
+    config.load_checkpoint = None
+    config.load_checkpoint_file = None
+    config.load_optimizer_state = False
+
+    if loops is not None:
+        _set_arch_extra(config, "loops", loops)
+
+    if hidden_diff_threshold is not None:
+        _set_arch_extra(config, "norm_diff_min", hidden_diff_threshold)
+        _set_arch_extra(config, "norm_diff_max", hidden_diff_threshold)
 
 
-def _set_effective_loop_count(config: PretrainConfig, loops: int) -> str:
-    arch_extra = _ensure_arch_extra(config)
-    loop_key = _loop_count_config_key(config)
-    arch_extra[loop_key] = loops
-    return loop_key
-
-
-def _get_effective_loop_count(config: PretrainConfig) -> Optional[int]:
-    arch_extra = config.arch.__pydantic_extra__ or {}
-    loop_key = _loop_count_config_key(config)
-    loop_value = arch_extra.get(loop_key)
-    if loop_value is None and loop_key != "loops":
-        loop_value = arch_extra.get("loops")
-    if loop_value is None and loop_key != "halt_max_steps":
-        loop_value = arch_extra.get("halt_max_steps")
-    return None if loop_value is None else int(loop_value)
-
-
-def _resolve_checkpoint_path(path: str) -> Optional[str]:
-    if os.path.isfile(path):
-        return path
-
-    if os.path.isdir(path):
-        pattern = re.compile(r"step_(\d+)(?:\.pt)?$")
-        candidates = []
-        for file_name in os.listdir(path):
-            match = pattern.match(file_name)
-            if match:
-                candidates.append((int(match.group(1)), os.path.join(path, file_name)))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[-1][1]
-
-    return None
-
-
-def load_config_from_checkpoint_path(path: str) -> PretrainConfig:
-    resolved_path = _resolve_checkpoint_path(path)
-    checkpoint_dir = Path(resolved_path if resolved_path is not None else path)
-    if checkpoint_dir.is_file():
-        checkpoint_dir = checkpoint_dir.parent
-
-    candidates = [
-        checkpoint_dir / "config.yaml",
-        checkpoint_dir / "config.json",
-        checkpoint_dir / "all_config.yaml",
-        checkpoint_dir / ".hydra" / "config.yaml",
-    ]
-
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-
-        try:
-            conf = OmegaConf.load(candidate)
-            as_dict = OmegaConf.to_container(conf, resolve=True)
-            if isinstance(as_dict, dict):
-                return PretrainConfig(**as_dict)
-        except Exception:
-            pass
-
-        try:
-            with open(candidate, "r", encoding="utf-8") as f:
-                config_dict = json.load(f) if candidate.suffix == ".json" else yaml.safe_load(f)
-            if isinstance(config_dict, dict):
-                return PretrainConfig(**config_dict)
-        except Exception:
-            pass
-
-    raise FileNotFoundError(f"Could not find a valid config next to checkpoint path: {path}")
-
-
-def create_test_dataloader(config: PretrainConfig, split: str, global_batch_size: int) -> DataLoader:
-    dataset = ShuffledTestPuzzleDataset(
-        PuzzleDatasetConfig(
-            seed=config.seed,
-            dataset_path=config.data_path,
-            global_batch_size=global_batch_size,
-            test_set_mode=True,
-            epochs_per_iter=1,
-            rank=0,
-            num_replicas=1,
-            masked_input=config.masked_input,
-        ),
-        split=split,
-    )
-    print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
-    print(f"Shuffling evaluation problems with seed {config.seed}.")
-    return DataLoader(
-        dataset,
-        batch_size=None,
-        num_workers=1,
-        prefetch_factor=8,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-    )
-
-
-def create_model_for_evaluation(config: PretrainConfig, metadata, device: torch.device) -> nn.Module:
-    arch_extra = config.arch.__pydantic_extra__ or {}
-    model_cfg = dict(
-        **arch_extra,
-        batch_size=config.global_batch_size,
-        vocab_size=metadata.vocab_size,
-        seq_len=metadata.seq_len,
-        num_puzzle_identifiers=metadata.num_puzzle_identifiers,
-        variable_seq_lengths=metadata.variable_seq_lengths,
-        causal=False,
-    )
-
-    model_cls = load_model_class(config.arch.name)
-    loss_head_cls = load_model_class(config.arch.loss.name)
-
-    model = model_cls(model_cfg)
-    model = loss_head_cls(model, **(config.arch.loss.__pydantic_extra__ or {}))
-    model = model.to(device)
-    model_config = getattr(getattr(model, "model", None), "config", None)
-    should_compile = (
-        device.type == "cuda"
-        and "DISABLE_COMPILE" not in os.environ
-        and (model_config is None or not getattr(model_config, "profile", False))
-    )
-    if should_compile:
-        model = torch.compile(model, dynamic=False)  # type: ignore[assignment]
-    return model
-
-
-def _remap_state_dict_prefix_if_needed(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    model_keys = list(model.state_dict().keys())
-    if not model_keys or not state_dict:
-        return state_dict
-
-    model_has_orig_mod = model_keys[0].startswith("_orig_mod.")
-    ckpt_has_orig_mod = next(iter(state_dict)).startswith("_orig_mod.")
-
-    if model_has_orig_mod == ckpt_has_orig_mod:
-        return state_dict
-
-    if ckpt_has_orig_mod:
-        return {
-            key[len("_orig_mod."):] if key.startswith("_orig_mod.") else key: value
-            for key, value in state_dict.items()
-        }
-
-    return {f"_orig_mod.{key}": value for key, value in state_dict.items()}
-
-
-def _resize_puzzle_embedding_if_needed(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
-    model_key = next((key for key in model.state_dict().keys() if key.endswith("puzzle_emb.weights")), None)
-    state_key = next((key for key in state_dict.keys() if key.endswith("puzzle_emb.weights")), None)
-
-    if model_key is None or state_key is None:
-        return
-
-    expected_shape = model.state_dict()[model_key].shape
-    current_shape = state_dict[state_key].shape
-    if current_shape == expected_shape:
-        return
-
-    print(
-        "Resetting puzzle embedding because the stored shape does not match "
-        f"(found {tuple(current_shape)}, expected {tuple(expected_shape)})."
-    )
-    puzzle_emb = state_dict[state_key]
-    state_dict[state_key] = torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-
-
-def load_model_weights(
-    model: nn.Module,
-    checkpoint_path: str,
-    device: torch.device,
-    strict: bool,
-) -> Optional[int]:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-    state_dict = _remap_state_dict_prefix_if_needed(model, state_dict)
-    _resize_puzzle_embedding_if_needed(model, state_dict)
-
-    load_result = model.load_state_dict(state_dict, strict=strict)
-    if not strict:
-        missing, unexpected = load_result
-        if missing:
-            print(f"Missing keys during checkpoint load: {missing}")
-        if unexpected:
-            print(f"Unexpected keys during checkpoint load: {unexpected}")
-
-    if isinstance(checkpoint, dict):
-        step = checkpoint.get("step")
-        return None if step is None else int(step)
-    return None
-
-
-def _uses_packed_examples(batch: Dict[str, torch.Tensor]) -> bool:
-    return "seq_offsets" in batch and "seq_lengths" in batch and batch["labels"].ndim == 1
-
-
-def _batch_size_from_batch(batch: Dict[str, torch.Tensor]) -> int:
-    if _uses_packed_examples(batch):
+def _sample_count(batch: Dict[str, torch.Tensor]) -> int:
+    if "puzzle_identifiers" in batch:
         return int(batch["puzzle_identifiers"].shape[0])
     return int(batch["inputs"].shape[0])
 
 
-def _packed_example_ids(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    seq_lengths = batch["seq_lengths"].to(device=batch["labels"].device, dtype=torch.long)
-    return torch.repeat_interleave(
-        torch.arange(seq_lengths.shape[0], device=batch["labels"].device, dtype=torch.long),
-        seq_lengths,
-    )
-
-
-def _valid_example_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    labels = batch["labels"]
-    if labels.ndim != 1:
-        return (labels != IGNORE_LABEL_ID).any(dim=1)
-
-    example_ids = _packed_example_ids(batch)
-    token_mask = labels != IGNORE_LABEL_ID
-    return torch.bincount(
-        example_ids[token_mask],
-        minlength=batch["puzzle_identifiers"].shape[0],
-    ) > 0
-
-
-def _finalize_metric_totals(metric_totals: Dict[str, float]) -> Dict[str, float]:
-    if not metric_totals:
-        return {}
-
-    count = max(metric_totals.get("count", 0.0), 1.0)
-    finalized: Dict[str, float] = {}
-    for key, value in metric_totals.items():
-        if key == "count":
-            finalized[key] = value
-        elif key.startswith("profile/"):
-            finalized[key] = value
-        else:
-            finalized[key] = value / count
-    return finalized
-
-
-def _concat_saved_outputs(saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
-    concatenated: Dict[str, Dict[str, torch.Tensor]] = {}
-    for set_name, per_set_outputs in saved_outputs.items():
-        concatenated[set_name] = {}
-        for key, tensors in per_set_outputs.items():
-            concatenated[set_name][key] = torch.cat(tensors, dim=0) if tensors else torch.empty(0)
-    return concatenated
-
-
-def _estimate_total_batches(dataloader: DataLoader) -> Optional[int]:
-    dataset = dataloader.dataset
-    if not isinstance(dataset, PuzzleDataset):
-        return None
-
-    try:
-        dataset._lazy_load_dataset()
-    except Exception:
-        return None
-
-    if dataset._data is None:
-        return None
-
-    return sum(
-        math.ceil(
-            (
-                per_set_data["seq_offsets"].size - 1
-                if dataset.metadata.variable_seq_lengths
-                else len(per_set_data["inputs"])
-            )
-            / dataset.config.global_batch_size
-        )
-        for per_set_data in dataset._data.values()
-    )
-
-
-def _unwrap_eval_model(model: nn.Module) -> nn.Module:
-    return getattr(model, "model", model)
-
-
-def _supports_hidden_pruning(model: nn.Module) -> bool:
-    base_model = _unwrap_eval_model(model)
-    inner = getattr(base_model, "inner", None)
-    return (
-        inner is not None
-        and hasattr(inner, "reset_carry")
-        and hasattr(inner, "lm_head")
-        and hasattr(inner, "q_head")
-        and hasattr(inner, "puzzle_emb_len")
-    )
-
-
-def _act_early_stop_enabled(model: nn.Module) -> bool:
-    base_model = _unwrap_eval_model(model)
-    config = getattr(base_model, "config", None)
-    return bool(getattr(config, "act_inference", False) or getattr(config, "eval_act_early_stop", False)) or getattr(config, "use_act", False) or getattr(config, "no_ACT_continue", True) == False
-
-
-def _hidden_diff_norm(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-    return torch.norm(x1 - x2, dim=(1, 2)) / (1e-7 + torch.norm(x1 + x2, dim=(1, 2)) / 2)
-
-
-def _index_structure(obj: Any, indices: torch.Tensor) -> Any:
-    if obj is None:
-        return None
-    if torch.is_tensor(obj):
-        return obj.index_select(0, indices)
-    if isinstance(obj, dict):
-        return {key: _index_structure(value, indices) for key, value in obj.items()}
-    if isinstance(obj, tuple):
-        return tuple(_index_structure(value, indices) for value in obj)
-    if isinstance(obj, list):
-        return [_index_structure(value, indices) for value in obj]
-    if is_dataclass(obj):
-        return type(obj)(**{field.name: _index_structure(getattr(obj, field.name), indices) for field in fields(obj)})
-    return obj
-
-
-def _run_heads_from_hidden(
-    model: nn.Module,
-    hidden_states: torch.Tensor,
-    return_keys: Set[str],
-) -> Dict[str, torch.Tensor]:
-    base_model = _unwrap_eval_model(model)
-    inner = getattr(base_model, "inner", None)
-    if inner is None:
-        raise ValueError("This model does not expose an inner module for hidden-state pruning.")
-
-    logits = inner.lm_head(hidden_states)[:, inner.puzzle_emb_len :]
-    outputs: Dict[str, torch.Tensor] = {
-        "logits": logits,
-        "preds": torch.argmax(logits, dim=-1),
-    }
-
-    if "q_halt_logits" in return_keys or "q_continue_logits" in return_keys:
-        q_logits = inner.q_head(hidden_states[:, 0]).to(torch.float32)
-        if "q_halt_logits" in return_keys:
-            outputs["q_halt_logits"] = q_logits[..., 0]
-        if "q_continue_logits" in return_keys:
-            outputs["q_continue_logits"] = q_logits[..., 1]
-
-    return outputs
-
-
-def _allocate_prediction_buffers(
-    template_outputs: Dict[str, torch.Tensor],
-    batch_size: int,
-) -> Dict[str, torch.Tensor]:
-    return {
-        key: torch.empty((batch_size, *value.shape[1:]), dtype=value.dtype, device=value.device)
-        for key, value in template_outputs.items()
-    }
-
-
-def _merge_pruned_predictions(
-    model: nn.Module,
-    batch_size: int,
-    return_keys: Set[str],
-    active_indices: torch.Tensor,
-    active_preds: Optional[Dict[str, torch.Tensor]],
-    active_steps: Optional[torch.Tensor],
-    pruned_chunks: List[Dict[str, Any]],
-) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    merged_preds: Optional[Dict[str, torch.Tensor]] = None
-    merged_steps: Optional[torch.Tensor] = None
-
-    if active_preds is not None and active_steps is not None and active_indices.numel() > 0:
-        merged_preds = _allocate_prediction_buffers(active_preds, batch_size)
-        merged_steps = torch.empty((batch_size,), dtype=active_steps.dtype, device=active_steps.device)
-        for key, value in active_preds.items():
-            merged_preds[key][active_indices] = value
-        merged_steps[active_indices] = active_steps
-
-    for chunk in pruned_chunks:
-        chunk_outputs = chunk.get("outputs")
-        if chunk_outputs is not None:
-            chunk_preds = {key: value for key, value in chunk_outputs.items() if key in return_keys}
-        else:
-            chunk_preds = _run_heads_from_hidden(model, chunk["hidden"], return_keys=return_keys)
-        chunk_indices = chunk["indices"]
-        chunk_steps = chunk["steps"]
-
-        if merged_preds is None:
-            merged_preds = _allocate_prediction_buffers(chunk_preds, batch_size)
-            merged_steps = torch.empty((batch_size,), dtype=chunk_steps.dtype, device=chunk_steps.device)
-
-        for key, value in chunk_preds.items():
-            merged_preds[key][chunk_indices] = value
-        merged_steps[chunk_indices] = chunk_steps
-
-    if merged_preds is None or merged_steps is None:
-        raise RuntimeError("Failed to collect predictions for the evaluated batch.")
-
-    return merged_preds, merged_steps
-
-
-def _append_pruned_chunk(
-    pruned_chunks: List[Dict[str, Any]],
-    model: nn.Module,
-    active_indices: torch.Tensor,
-    carry: Any,
-    preds: Optional[Dict[str, torch.Tensor]],
-    prune_mask: torch.Tensor,
-) -> None:
-    pruned_indices = torch.nonzero(prune_mask, as_tuple=False).squeeze(-1)
-    if pruned_indices.numel() == 0:
-        return
-
-    chunk: Dict[str, Any] = {
-        "indices": active_indices[pruned_indices].detach().clone(),
-        "steps": carry.steps[prune_mask].detach(),
-    }
-
-    if hasattr(carry, "current_hidden") and _supports_hidden_pruning(model):
-        chunk["hidden"] = carry.current_hidden[prune_mask].detach()
-    else:
-        if preds is None:
-            raise RuntimeError("Model evaluation did not produce predictions for the pruned examples.")
-        chunk["outputs"] = {key: value[prune_mask].detach() for key, value in preds.items()}
-
-    pruned_chunks.append(chunk)
-
-
-def _select_packed_tensor_segments(
-    tensor: torch.Tensor,
-    seq_offsets: torch.Tensor,
-    example_indices: torch.Tensor,
-) -> torch.Tensor:
-    offsets = seq_offsets.detach().cpu().tolist()
-    indices = example_indices.detach().cpu().tolist()
-    chunks = [tensor[offsets[idx] : offsets[idx + 1]] for idx in indices]
-    if chunks:
-        return torch.cat(chunks, dim=0)
-
-    empty_shape = list(tensor.shape)
-    empty_shape[0] = 0
-    return tensor.new_empty(empty_shape)
-
-
-def _select_batch_examples(batch: Dict[str, torch.Tensor], example_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
-    if not _uses_packed_examples(batch):
-        return {key: value.index_select(0, example_indices) for key, value in batch.items()}
-
-    old_seq_offsets = batch["seq_offsets"]
-    old_batch_size = batch["puzzle_identifiers"].shape[0]
-    old_token_count = int(old_seq_offsets[-1].item())
-    selected_seq_lengths = batch["seq_lengths"].index_select(0, example_indices)
-    selected_seq_offsets = F.pad(torch.cumsum(selected_seq_lengths.to(torch.int32), dim=0), (1, 0))
-
-    selected: Dict[str, torch.Tensor] = {}
-    for key, value in batch.items():
-        if key == "seq_lengths":
-            selected[key] = selected_seq_lengths
-        elif key == "seq_offsets":
-            selected[key] = selected_seq_offsets
-        elif value.ndim > 0 and value.shape[0] == old_batch_size:
-            selected[key] = value.index_select(0, example_indices)
-        elif value.ndim > 0 and value.shape[0] == old_token_count:
-            selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
-        else:
-            selected[key] = value
-
-    return selected
-
-
-def _select_prediction_examples(
-    preds: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    example_indices: torch.Tensor,
-) -> Dict[str, torch.Tensor]:
-    if not _uses_packed_examples(batch):
-        return {key: value.index_select(0, example_indices) for key, value in preds.items()}
-
-    old_seq_offsets = batch["seq_offsets"]
-    old_batch_size = batch["puzzle_identifiers"].shape[0]
-    old_token_count = int(old_seq_offsets[-1].item())
-    selected: Dict[str, torch.Tensor] = {}
-    for key, value in preds.items():
-        if value.ndim > 0 and value.shape[0] == old_batch_size:
-            selected[key] = value.index_select(0, example_indices)
-        elif value.ndim > 0 and value.shape[0] == old_token_count:
-            selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
-        else:
-            selected[key] = value
-    return selected
-
-
-def _dense_arc_grids_from_packed(tokens: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    seq_ids = _packed_example_ids(batch)
-    position_ids = batch["position_ids"].to(device=tokens.device, dtype=torch.long)
-    flat_positions = position_ids[:, 0] * ARCMaxGridSize + position_ids[:, 1]
-    dense = torch.zeros(
-        (batch["puzzle_identifiers"].shape[0], ARCMaxGridSize * ARCMaxGridSize),
-        dtype=tokens.dtype,
-        device=tokens.device,
-    )
-    dense[seq_ids, flat_positions] = tokens
-    return dense
-
-
-def _prepare_arc_batch(
-    batch: Dict[str, torch.Tensor],
-    preds: Dict[str, torch.Tensor],
-    example_indices: torch.Tensor,
-) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    selected_batch = _select_batch_examples(batch, example_indices)
-    selected_preds = _select_prediction_examples(preds, batch, example_indices)
-    if not _uses_packed_examples(selected_batch):
-        return selected_batch, selected_preds
-
-    arc_batch = {
-        "puzzle_identifiers": selected_batch["puzzle_identifiers"],
-        "inputs": _dense_arc_grids_from_packed(selected_batch["inputs"], selected_batch),
-    }
-    if "source_inputs" in selected_batch:
-        arc_batch["source_inputs"] = _dense_arc_grids_from_packed(selected_batch["source_inputs"], selected_batch)
-
-    arc_preds = {
-        key: value
-        for key, value in selected_preds.items()
-        if key == "q_halt_logits"
-    }
-    arc_preds["preds"] = _dense_arc_grids_from_packed(selected_preds["preds"], selected_batch)
-    return arc_batch, arc_preds
-
-
-def _compute_batch_metric_sums(
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    preds: Dict[str, torch.Tensor],
-    final_steps: torch.Tensor,
-    keep_mask: torch.Tensor,
-) -> Dict[str, float]:
-    labels = batch["labels"]
-    if labels.ndim == 1:
-        example_ids = _packed_example_ids(batch)
-        token_mask = labels != IGNORE_LABEL_ID
-        token_counts = torch.bincount(
-            example_ids[token_mask],
-            minlength=batch["puzzle_identifiers"].shape[0],
-        )
-        valid_examples = keep_mask & (token_counts > 0)
-        if not torch.any(valid_examples):
-            return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "lm_loss": 0.0, "steps": 0.0}
-
-        is_correct = token_mask & (preds["preds"] == labels)
-        correct_counts = torch.bincount(
-            example_ids[is_correct],
-            minlength=batch["puzzle_identifiers"].shape[0],
-        )
-        seq_token_accuracy = correct_counts.to(torch.float32) / token_counts.clamp_min(1).to(torch.float32)
-        seq_exact_accuracy = correct_counts == token_counts
-
-        logits = preds["logits"]
-        if hasattr(model, "loss_fn"):
-            token_loss = model.loss_fn(logits, labels, ignore_index=IGNORE_LABEL_ID)  # type: ignore[misc]
-        else:
-            token_loss = F.cross_entropy(
-                logits.to(torch.float32),
-                labels.to(torch.long),
-                ignore_index=IGNORE_LABEL_ID,
-                reduction="none",
-            )
-        seq_loss_sums = torch.bincount(
-            example_ids,
-            weights=token_loss.to(torch.float32),
-            minlength=batch["puzzle_identifiers"].shape[0],
-        )
-        seq_lm_loss = seq_loss_sums / token_counts.clamp_min(1).to(torch.float32)
-        selected_steps = final_steps[valid_examples]
-
+def _truncate_batch(batch: Dict[str, torch.Tensor], sample_count: int) -> Dict[str, torch.Tensor]:
+    current_count = _sample_count(batch)
+    if sample_count >= current_count:
+        return batch
+
+    if "seq_lengths" not in batch:
         return {
-            "count": float(valid_examples.sum().item()),
-            "accuracy": float(seq_token_accuracy[valid_examples].sum().item()),
-            "exact_accuracy": float(seq_exact_accuracy[valid_examples].to(torch.float32).sum().item()),
-            "lm_loss": float(seq_lm_loss[valid_examples].sum().item()),
-            "steps": float(selected_steps.to(torch.float32).sum().item()),
+            key: value[:sample_count] if value.shape[:1] == (current_count,) else value
+            for key, value in batch.items()
         }
 
-    selected_labels = labels[keep_mask]
-    selected_preds = preds["preds"][keep_mask]
-    selected_steps = final_steps[keep_mask]
+    seq_lengths = batch["seq_lengths"][:sample_count]
+    token_count = int(seq_lengths.sum().item())
+    truncated: Dict[str, torch.Tensor] = {}
+    original_token_count = int(batch["seq_lengths"].sum().item())
 
-    token_mask = selected_labels != IGNORE_LABEL_ID
-    token_counts = token_mask.sum(dim=1)
-    valid_examples = token_counts > 0
-    if not torch.any(valid_examples):
-        return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "lm_loss": 0.0, "steps": 0.0}
+    for key, value in batch.items():
+        if key == "seq_offsets":
+            offsets = torch.zeros(sample_count + 1, dtype=value.dtype, device=value.device)
+            offsets[1:] = torch.cumsum(seq_lengths.to(value.dtype), dim=0)
+            truncated[key] = offsets
+        elif value.shape[:1] == (current_count,):
+            truncated[key] = value[:sample_count]
+        elif value.shape[:1] == (original_token_count,):
+            truncated[key] = value[:token_count]
+        else:
+            truncated[key] = value
 
-    selected_labels = selected_labels[valid_examples]
-    selected_preds = selected_preds[valid_examples]
-    selected_steps = selected_steps[valid_examples]
-    token_mask = token_mask[valid_examples]
-    token_counts = token_counts[valid_examples]
-
-    is_correct = token_mask & (selected_preds == selected_labels)
-    seq_token_accuracy = is_correct.to(torch.float32).sum(dim=1) / token_counts.clamp_min(1)
-    seq_exact_accuracy = (is_correct.sum(dim=1) == token_counts).to(torch.float32)
-
-    logits = preds["logits"][keep_mask][valid_examples]
-    if hasattr(model, "loss_fn"):
-        token_loss = model.loss_fn(logits, selected_labels, ignore_index=IGNORE_LABEL_ID)  # type: ignore[misc]
-    else:
-        token_loss = F.cross_entropy(
-            logits.to(torch.float32).view(-1, logits.shape[-1]),
-            selected_labels.to(torch.long).view(-1),
-            ignore_index=IGNORE_LABEL_ID,
-            reduction="none",
-        ).view(selected_labels.shape)
-    seq_lm_loss = token_loss.sum(dim=1) / token_counts.clamp_min(1)
-
-    return {
-        "count": float(valid_examples.sum().item()),
-        "accuracy": float(seq_token_accuracy.sum().item()),
-        "exact_accuracy": float(seq_exact_accuracy.sum().item()),
-        "lm_loss": float(seq_lm_loss.sum().item()),
-        "steps": float(selected_steps.to(torch.float32).sum().item()),
-    }
+    return truncated
 
 
-def _power_of_two_loop_checkpoints(loops: Optional[int]) -> List[int]:
-    if loops is None or loops < 1:
-        return []
+class MaxProblemsDataLoader:
+    def __init__(self, dataloader, max_problems: Optional[int]):
+        self.dataloader = dataloader
+        self.max_problems = max_problems
 
-    checkpoints: List[int] = []
-    current = 1
-    while current <= loops:
-        checkpoints.append(current)
-        current *= 2
-    return checkpoints
+    def __len__(self) -> int:
+        if self.max_problems is None:
+            return len(self.dataloader)
 
+        batch_size = getattr(self.dataloader.dataset.config, "global_batch_size", None)
+        if batch_size is None or batch_size <= 0:
+            return len(self.dataloader)
+        return min(len(self.dataloader), math.ceil(self.max_problems / batch_size))
 
-def _finished_fraction_by_loop(
-    completed_step_counts: Dict[int, float],
-    total_count: float,
-    loop_steps: List[int],
-) -> Dict[int, float]:
-    if total_count <= 0:
-        return {loop_step: 0.0 for loop_step in loop_steps}
-
-    sorted_step_counts = sorted((int(step), float(count)) for step, count in completed_step_counts.items())
-    finished_fraction_by_loop: Dict[int, float] = {}
-    cumulative_finished = 0.0
-    count_index = 0
-
-    for loop_step in sorted(loop_steps):
-        while count_index < len(sorted_step_counts) and sorted_step_counts[count_index][0] <= loop_step:
-            cumulative_finished += sorted_step_counts[count_index][1]
-            count_index += 1
-        finished_fraction_by_loop[loop_step] = cumulative_finished / total_count
-
-    return finished_fraction_by_loop
-
-
-def _uniform_step_value(steps: torch.Tensor) -> Optional[int]:
-    if steps.numel() == 0:
-        return None
-
-    first_step = steps[0]
-    if bool(torch.all(steps == first_step).item()):
-        return int(first_step.item())
-    return None
-
-
-def evaluate_model(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    max_problems: Optional[int],
-    max_batches: Optional[int],
-    save_predictions: bool,
-    hidden_diff_threshold: Optional[float],
-    loop_checkpoints: Optional[List[int]] = None,
-    arc_majority_evaluator: Optional[Any] = None,
-) -> tuple[Dict[str, Dict[str, float]], Dict[int, Dict[str, Dict[str, float]]], Dict[str, Dict[str, torch.Tensor]], int, int]:
-    model.eval()
-
-    return_keys: Set[str] = {"preds", "logits"}
-    packed_variable_length_eval = bool(getattr(getattr(dataloader.dataset, "metadata", None), "variable_seq_lengths", False))
-    batch_pruning_supported = not packed_variable_length_eval
-    raw_act_early_stop_enabled = _act_early_stop_enabled(model)
-    act_early_stop_enabled = raw_act_early_stop_enabled and batch_pruning_supported
-    if act_early_stop_enabled:
-        return_keys.add("q_halt_logits")
-    if save_predictions:
-        return_keys.update({"q_halt_logits", "q_continue_logits"})
-    if arc_majority_evaluator is not None:
-        return_keys.update(arc_majority_evaluator.required_outputs)
-    metric_return_keys: Set[str] = {"preds", "logits"}
-    loop_checkpoints = sorted(set(loop_checkpoints or []))
-
-    metric_totals_by_set: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    loop_metric_totals_by_step: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(float))
-    )
-    completed_step_counts_by_set: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    completed_total_counts_by_set: Dict[str, float] = defaultdict(float)
-    saved_outputs: Dict[str, Dict[str, List[torch.Tensor]]] = defaultdict(lambda: defaultdict(list))
-    progress_metric_totals: Dict[str, float] = defaultdict(float)
-
-    processed_batches = 0
-    processed_problems = 0
-    progress_total = _estimate_total_batches(dataloader)
-    if progress_total is not None and max_batches is not None:
-        progress_total = min(progress_total, max_batches)
-    if progress_total is not None and max_problems is not None:
-        progress_total = min(progress_total, math.ceil(max_problems / dataloader.dataset.config.global_batch_size))  # type: ignore[attr-defined]
-
-    hidden_pruning_enabled = (
-        batch_pruning_supported
-        and hidden_diff_threshold is not None
-        and hidden_diff_threshold > 0
-        and _supports_hidden_pruning(model)
-    )
-    print("hidden_pruning_enabled:", hidden_pruning_enabled, ", hidden_diff_threshold:", hidden_diff_threshold)
-    print("ACT early stopping enabled:", act_early_stop_enabled)
-    if packed_variable_length_eval and raw_act_early_stop_enabled:
-        print("ACT early stopping batch pruning is not supported for packed variable-length evaluation; running without batch pruning.")
-    if packed_variable_length_eval and hidden_diff_threshold is not None and hidden_diff_threshold > 0:
-        print("Hidden-state pruning is not supported for packed variable-length evaluation; running standard evaluation.")
-    elif hidden_diff_threshold is not None and hidden_diff_threshold > 0 and not hidden_pruning_enabled:
-        print("Hidden-state pruning is not supported by this model; running standard evaluation.")
-
-    with torch.inference_mode():
-        progress_bar = tqdm(dataloader, desc="Evaluating", total=progress_total)
-        for batch_index, (set_name, batch, _global_batch_size) in enumerate(progress_bar):
-            if max_batches is not None and batch_index >= max_batches:
-                break
-            if max_problems is not None and processed_problems >= max_problems:
-                break
-
-            processed_batches += 1
-            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            batch_size = _batch_size_from_batch(batch)
-
-            valid_example_mask = _valid_example_mask(batch)
-            keep_mask = valid_example_mask.clone()
-            if max_problems is not None:
-                remaining = max_problems - processed_problems
-                valid_indices = torch.nonzero(valid_example_mask, as_tuple=False).squeeze(-1)
+    def __iter__(self) -> Iterator[Tuple[str, Dict[str, torch.Tensor], int]]:
+        processed = 0
+        for set_name, batch, global_batch_size in self.dataloader:
+            if self.max_problems is not None:
+                remaining = self.max_problems - processed
                 if remaining <= 0:
                     break
-                if valid_indices.numel() > remaining:
-                    keep_mask = torch.zeros_like(valid_example_mask)
-                    keep_mask[valid_indices[:remaining]] = True
-
-            with torch.device(str(device)):
-                carry = model.initial_carry(batch)  # type: ignore[misc]
-
-            active_batch = batch
-            active_indices = torch.arange(batch_size, device=device)
-            pruned_chunks: List[Dict[str, Any]] = []
-            preds: Optional[Dict[str, torch.Tensor]] = None
-            captured_loop_checkpoints: Set[int] = set()
-
-            while True:
-                carry_before_step = None
-                if hidden_pruning_enabled and active_indices.numel() > 0 and hasattr(carry, "current_hidden"):
-                    carry_before_step = carry #_unwrap_eval_model(model).inner.reset_carry(carry.halted, carry)
-
-                carry, _loss, _metrics, preds, all_finish = model(
-                    carry=carry,
-                    batch=active_batch,
-                    return_keys=return_keys,
-                )
-
-                current_step = _uniform_step_value(carry.steps)
-                if (
-                    current_step is not None
-                    and current_step in loop_checkpoints
-                    and current_step not in captured_loop_checkpoints
-                ):
-                    if pruned_chunks:
-                        checkpoint_preds, checkpoint_steps = _merge_pruned_predictions(
-                            model=model,
-                            batch_size=batch_size,
-                            return_keys=metric_return_keys,
-                            active_indices=active_indices,
-                            active_preds=preds,
-                            active_steps=carry.steps if preds is not None else None,
-                            pruned_chunks=pruned_chunks,
-                        )
-                    else:
-                        if preds is None:
-                            raise RuntimeError("Model evaluation did not produce predictions for the batch.")
-                        checkpoint_preds = preds
-                        checkpoint_steps = carry.steps
-
-                    checkpoint_metric_sums = _compute_batch_metric_sums(
-                        model=model,
-                        batch=batch,
-                        preds=checkpoint_preds,
-                        final_steps=checkpoint_steps,
-                        keep_mask=keep_mask,
-                    )
-                    for metric_name, metric_value in checkpoint_metric_sums.items():
-                        loop_metric_totals_by_step[current_step][set_name][metric_name] += metric_value
-                    captured_loop_checkpoints.add(current_step)
-
-                model_halted_mask: Optional[torch.Tensor] = None
-                if hasattr(carry, "halted") and carry.halted is not None and not all_finish:
-                    model_halted_mask = carry.halted
-
-                act_pruned_mask: Optional[torch.Tensor] = model_halted_mask
-                if act_early_stop_enabled and preds is not None and not all_finish:
-                    q_halt_logits = preds.get("q_halt_logits")
-                    if q_halt_logits is None:
-                        raise RuntimeError("ACT early stopping requires q_halt_logits during evaluation.")
-                    q_halt_pruned_mask = q_halt_logits > 0
-                    act_pruned_mask = (
-                        q_halt_pruned_mask
-                        if act_pruned_mask is None
-                        else (act_pruned_mask | q_halt_pruned_mask)
-                    )
-
-                hidden_pruned_mask: Optional[torch.Tensor] = None
-                if hidden_pruning_enabled and carry_before_step is not None and not all_finish:
-                    hidden_diff_norm = _hidden_diff_norm(
-                        carry.current_hidden.detach(),
-                        carry_before_step.current_hidden.detach(),
-                    )
-                    hidden_pruned_mask = hidden_diff_norm <= hidden_diff_threshold
-
-                prune_mask: Optional[torch.Tensor] = None
-                if act_pruned_mask is not None and hidden_pruned_mask is not None:
-                    prune_mask = act_pruned_mask | hidden_pruned_mask
-                elif act_pruned_mask is not None:
-                    prune_mask = act_pruned_mask
-                else:
-                    prune_mask = hidden_pruned_mask
-
-                if prune_mask is not None and torch.any(prune_mask):
-                    _append_pruned_chunk(
-                        pruned_chunks=pruned_chunks,
-                        model=model,
-                        active_indices=active_indices,
-                        carry=carry,
-                        preds=preds,
-                        prune_mask=prune_mask,
-                    )
-
-                    keep_indices = torch.nonzero(~prune_mask, as_tuple=False).squeeze(-1)
-                    if keep_indices.numel() == 0:
-                        active_indices = active_indices[:0]
-                        preds = None
-                        break
-
-                    active_indices = active_indices[keep_indices]
-                    active_batch = {key: value.index_select(0, keep_indices) for key, value in active_batch.items()}
-                    carry = _index_structure(carry, keep_indices)
-
-                if all_finish:
-                    break
-
-            if pruned_chunks:
-                preds, final_steps = _merge_pruned_predictions(
-                    model=model,
-                    batch_size=batch_size,
-                    return_keys=return_keys,
-                    active_indices=active_indices,
-                    active_preds=preds,
-                    active_steps=carry.steps if preds is not None else None,
-                    pruned_chunks=pruned_chunks,
-                )
+                batch_count = _sample_count(batch)
+                if batch_count > remaining:
+                    batch = _truncate_batch(batch, remaining)
+                    batch_count = remaining
+                global_batch_size = min(global_batch_size, batch_count)
             else:
-                if preds is None:
-                    raise RuntimeError("Model evaluation did not produce predictions for the batch.")
-                final_steps = carry.steps
+                batch_count = _sample_count(batch)
 
-            batch_metric_sums = _compute_batch_metric_sums(
-                model=model,
-                batch=batch,
-                preds=preds,
-                final_steps=final_steps,
-                keep_mask=keep_mask,
-            )
-            selected_final_steps = final_steps[keep_mask]
-            if selected_final_steps.numel() > 0:
-                unique_steps, counts = torch.unique(selected_final_steps.to(torch.int64), return_counts=True)
-                completed_total_counts_by_set[set_name] += float(selected_final_steps.numel())
-                for step_value, count_value in zip(unique_steps.tolist(), counts.tolist()):
-                    completed_step_counts_by_set[set_name][int(step_value)] += float(count_value)
-
-            processed_problems += int(batch_metric_sums["count"])
-            for metric_name, metric_value in batch_metric_sums.items():
-                metric_totals_by_set[set_name][metric_name] += metric_value
-                progress_metric_totals[metric_name] += metric_value
-
-            progress_count = progress_metric_totals["count"]
-            if progress_count > 0:
-                progress_bar.set_postfix(
-                    {
-                        "exact_accuracy": f"{progress_metric_totals['exact_accuracy'] / progress_count:.4f}",
-                        "accuracy": f"{progress_metric_totals['accuracy'] / progress_count:.4f}",
-                    }
-                )
-
-            if arc_majority_evaluator is not None:
-                kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
-                if kept_indices.numel() > 0:
-                    arc_batch, arc_preds = _prepare_arc_batch(batch, preds, kept_indices)
-                    arc_majority_evaluator.update_batch(arc_batch, arc_preds)
-
-            if save_predictions:
-                kept_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
-                if kept_indices.numel() > 0:
-                    saved_batch = _select_batch_examples(batch, kept_indices)
-                    saved_preds = _select_prediction_examples(preds, batch, kept_indices)
-                    for key, value in saved_batch.items():
-                        if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs", "seq_lengths", "position_ids"}:
-                            saved_outputs[set_name][key].append(value.detach().cpu())
-                    for key, value in saved_preds.items():
-                        saved_outputs[set_name][key].append(value.detach().cpu())
-
-            if max_problems is not None and processed_problems >= max_problems:
-                break
-
-    finalized_by_set = {
-        set_name: _finalize_metric_totals(metric_totals)
-        for set_name, metric_totals in metric_totals_by_set.items()
-    }
-
-    overall_totals: Dict[str, float] = defaultdict(float)
-    for metric_totals in metric_totals_by_set.values():
-        for key, value in metric_totals.items():
-            overall_totals[key] += value
-    finalized_by_set["overall"] = _finalize_metric_totals(overall_totals)
-
-    finalized_loop_metrics_by_step: Dict[int, Dict[str, Dict[str, float]]] = {}
-    loop_steps = sorted(loop_metric_totals_by_step)
-    finished_fraction_by_loop_by_set = {
-        set_name: _finished_fraction_by_loop(completed_step_counts, completed_total_counts_by_set[set_name], loop_steps)
-        for set_name, completed_step_counts in completed_step_counts_by_set.items()
-    }
-    overall_completed_step_counts: Dict[int, float] = defaultdict(float)
-    overall_completed_total_count = 0.0
-    for set_name, completed_step_counts in completed_step_counts_by_set.items():
-        overall_completed_total_count += completed_total_counts_by_set[set_name]
-        for step_value, count_value in completed_step_counts.items():
-            overall_completed_step_counts[step_value] += count_value
-    overall_finished_fraction_by_loop = _finished_fraction_by_loop(
-        dict(overall_completed_step_counts),
-        overall_completed_total_count,
-        loop_steps,
-    )
-
-    for loop_step, metric_totals_by_set_at_step in sorted(loop_metric_totals_by_step.items()):
-        finalized_loop_metrics_by_step[loop_step] = {
-            set_name: _finalize_metric_totals(metric_totals)
-            for set_name, metric_totals in metric_totals_by_set_at_step.items()
-        }
-        for set_name, finished_fraction_by_loop in finished_fraction_by_loop_by_set.items():
-            finalized_loop_metrics_by_step[loop_step].setdefault(set_name, {})
-            finalized_loop_metrics_by_step[loop_step][set_name]["finished_fraction"] = finished_fraction_by_loop[
-                loop_step
-            ]
-
-        overall_loop_totals: Dict[str, float] = defaultdict(float)
-        for metric_totals in metric_totals_by_set_at_step.values():
-            for key, value in metric_totals.items():
-                overall_loop_totals[key] += value
-        finalized_loop_metrics_by_step[loop_step]["overall"] = _finalize_metric_totals(overall_loop_totals)
-        finalized_loop_metrics_by_step[loop_step]["overall"]["finished_fraction"] = overall_finished_fraction_by_loop[
-            loop_step
-        ]
-
-    return (
-        finalized_by_set,
-        finalized_loop_metrics_by_step,
-        _concat_saved_outputs(saved_outputs),
-        processed_batches,
-        processed_problems,
-    )
+            processed += batch_count
+            yield set_name, batch, global_batch_size
 
 
-def _default_output_path(
-    checkpoint_path: str,
-    split: str,
-    max_batches: Optional[int],
+def _load_weights_only(train_state: TrainState, config: PretrainConfig, checkpoint_path: Path) -> None:
+    print(f"Loading checkpoint {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cuda")
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        step = checkpoint.get("step")
+    else:
+        state_dict = checkpoint
+        step = None
+
+    _load_model_state(train_state, config, state_dict, rank=0)
+    train_state.step = int(step) if step is not None else _checkpoint_step(checkpoint_path)
+    train_state.carry = None
+    train_state.accum_carries = None
+    train_state.accum_metrics = None
+
+
+def _metrics_output_path(
+    checkpoint_path: Path,
+    *,
     max_problems: Optional[int],
     loops: Optional[int],
-    h_cycles: Optional[int],
-    l_cycles: Optional[int],
     hidden_diff_threshold: Optional[float],
 ) -> Path:
-    threshold_suffix = ""
-    if hidden_diff_threshold is not None and hidden_diff_threshold > 0:
-        threshold_value = f"{hidden_diff_threshold:g}".replace("-", "m").replace(".", "_")
-        threshold_suffix = f"_hidden_diff_threshold_{threshold_value}"
-
-    resolved_path = _resolve_checkpoint_path(checkpoint_path)
-    if resolved_path is None:
-        stem = f"evaluation_results_{split}"
-        if max_batches is not None:
-            stem += f"_max_batches_{max_batches}"
-        if max_problems is not None:
-            stem += f"_max_problems_{max_problems}"
-        if loops is not None:
-            stem += f"_loops_{loops}"
-        if h_cycles is not None:
-            stem += f"_H_cycles_{h_cycles}"
-        if l_cycles is not None:
-            stem += f"_L_cycles_{l_cycles}"
-        stem += threshold_suffix
-        return Path(f"{stem}.json")
-    checkpoint_file = Path(resolved_path)
-    stem = f"{checkpoint_file.stem}_evaluation_{split}"
-    if max_batches is not None:
-        stem += f"_max_batches_{max_batches}"
-    if max_problems is not None:
-        stem += f"_max_problems_{max_problems}"
-    if loops is not None:
-        stem += f"_loops_{loops}"
-    if h_cycles is not None:
-        stem += f"_H_cycles_{h_cycles}"
-    if l_cycles is not None:
-        stem += f"_L_cycles_{l_cycles}"
-    stem += threshold_suffix
-    return checkpoint_file.parent / f"{stem}.json"
+    checkpoint_dir = checkpoint_path.parent
+    step = _checkpoint_step(checkpoint_path)
+    max_label = "all" if max_problems is None else str(max_problems)
+    loop_label = "config" if loops is None else str(loops)
+    threshold_label = (
+        "config"
+        if hidden_diff_threshold is None
+        else str(hidden_diff_threshold).replace(".", "_")
+    )
+    return checkpoint_dir / (
+        f"step_{step}_evaluation_test_max_problems_{max_label}"
+        f"_loops_{loop_label}_hidden_diff_threshold_{threshold_label}.json"
+    )
 
 
-def _sidecar_predictions_output_path(output_path: Path) -> Path:
-    return output_path.with_name(f"{output_path.stem}_outputs.pt")
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if torch.is_tensor(value):
+        return _jsonable(value.detach().cpu().tolist())
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def maybe_create_arc_evaluator(config: PretrainConfig, eval_metadata):
+    required_files = (
+        Path(config.data_path) / "identifiers.json",
+        Path(config.data_path) / "test_puzzles.json",
+    )
+    if not all(path.is_file() for path in required_files):
+        return None
+    return ARC(data_path=config.data_path, eval_metadata=eval_metadata)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a saved URM checkpoint.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint file or directory.")
+    parser.add_argument("--batch_size", type=int, default=4096, help="Evaluation global batch size.")
+    parser.add_argument("--hidden_diff_threshold", type=float, default=None, help="Override norm_diff_min/max.")
+    parser.add_argument("--loops", type=int, default=None, help="Override model loop count.")
+    parser.add_argument("--max_problems", type=int, default=None, help="Maximum number of test problems to evaluate.")
+    parser.add_argument("--output", type=str, default=None, help="Optional metrics JSON output path.")
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a trained checkpoint on a dataset split.")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="checkpoints/URM-sudoku-base-good",
-        help="Checkpoint file or checkpoint directory.",
-    )
-    parser.add_argument("--data_path", type=str, default=None, help="Override dataset path from the checkpoint config.")
-    parser.add_argument("--split", type=str, default="test", help="Dataset split to evaluate.")
-    parser.add_argument("--batch_size", type=int, default=None, help="Override the global batch size for evaluation.")
-    parser.add_argument(
-        "--max_problems",
-        type=int,
-        default=None,
-        help="Evaluate at most this many problems. Stops exactly at the requested number.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Optional path to save the evaluation summary as JSON.",
-    )
-    parser.add_argument("--max_batches", type=int, default=None, help="Stop after this many batches for debugging.")
-    parser.add_argument(
-        "--loops",
-        type=int,
-        default=None,
-        help="Override the model loop count used while solving each problem.",
-    )
-    parser.add_argument(
-        "--H_cycles",
-        type=int,
-        default=None,
-        help="Override H_cycles for evaluation.",
-    )
-    parser.add_argument(
-        "--L_cycles",
-        type=int,
-        default=None,
-        help="Override L_cycles for evaluation.",
-    )
-    parser.add_argument("--device", type=str, default=None, help="Device to use, for example 'cuda' or 'cpu'.")
-    parser.add_argument(
-        "--save_predictions",
-        action="store_true",
-        help="Also save inputs, labels, preds, logits, and halt logits to a sidecar .pt file.",
-    )
-    parser.add_argument(
-        "--hidden_diff_threshold",
-        type=float,
-        default=None,
-        help="Prune examples from the carry during evaluation when the relative hidden-state change is at or below this threshold.",
-    )
-    parser.add_argument(
-        "--no_strict_load",
-        action="store_true",
-        help="Allow missing or unexpected keys when loading the checkpoint.",
-    )
-    args = parser.parse_args()
+    args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive.")
+    if args.max_problems is not None and args.max_problems <= 0:
+        raise ValueError("--max_problems must be positive when provided.")
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint)
-    if resolved_checkpoint_path is None:
+    resolved_checkpoint = _resolve_checkpoint_path(args.checkpoint)
+    if resolved_checkpoint is None:
         raise FileNotFoundError(f"Could not resolve checkpoint path from: {args.checkpoint}")
+    checkpoint_path = Path(resolved_checkpoint)
 
-    print(f"Loading config from: {args.checkpoint}")
-    config = load_config_from_checkpoint_path(args.checkpoint)
-    if args.data_path is not None:
-        config.data_path = args.data_path
-    if args.batch_size is not None:
-        config.global_batch_size = args.batch_size
-    loop_override_key: Optional[str] = None
-    if args.loops is not None:
-        loop_override_key = _set_effective_loop_count(config, args.loops)
-    if args.H_cycles is not None:
-        if config.arch.__pydantic_extra__ is None:
-            config.arch.__pydantic_extra__ = {}
-        config.arch.__pydantic_extra__["H_cycles"] = args.H_cycles
-    if args.L_cycles is not None:
-        if config.arch.__pydantic_extra__ is None:
-            config.arch.__pydantic_extra__ = {}
-        config.arch.__pydantic_extra__["L_cycles"] = args.L_cycles
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required because pretrain.py creates and loads the model on CUDA.")
 
-    print(f"Using device: {device}")
-    print(f"Using dataset: {config.data_path} ({args.split})")
-    print(f"Using batch size: {config.global_batch_size}")
-    if args.max_problems is not None:
-        print(f"Evaluating at most {args.max_problems} problems")
-    if args.loops is not None:
-        if loop_override_key == "halt_max_steps":
-            print(f"Overriding loops to: {args.loops} (via halt_max_steps)")
-        else:
-            print(f"Overriding loops to: {args.loops}")
-    if args.H_cycles is not None:
-        print(f"Overriding H_cycles to: {args.H_cycles}")
-    if args.L_cycles is not None:
-        print(f"Overriding L_cycles to: {args.L_cycles}")
-    if args.hidden_diff_threshold is not None and args.hidden_diff_threshold > 0:
-        print(f"Using hidden diff pruning threshold: {args.hidden_diff_threshold}")
-
-    dataloader = create_test_dataloader(config, args.split, config.global_batch_size)
-    metadata = dataloader.dataset.metadata
-    arc_majority_evaluator = maybe_create_arc_majority_vote_evaluator(
-        data_path=config.data_path,
-        eval_metadata=metadata,
-        split=args.split,
-    )
-    if arc_majority_evaluator is not None:
-        print("Detected ARC dataset; enabling ARC majority-vote evaluation.")
-    effective_loops = _get_effective_loop_count(config)
-    loop_checkpoints = _power_of_two_loop_checkpoints(effective_loops)
-    if loop_checkpoints:
-        print(f"Reporting intermediate metrics at power-of-two loops: {loop_checkpoints}")
-
-    print("Reconstructing model...")
-    model = create_model_for_evaluation(config, metadata, device=device)
-
-    print(f"Loading weights from: {resolved_checkpoint_path}")
-    step = load_model_weights(
-        model,
-        resolved_checkpoint_path,
-        device=device,
-        strict=not args.no_strict_load,
-    )
-    start_time = time.time()
-    metrics_by_set, loop_metrics_by_step, saved_outputs, processed_batches, processed_problems = evaluate_model(
-        model=model,
-        dataloader=dataloader,
-        device=device,
-        max_problems=args.max_problems,
-        max_batches=args.max_batches,
-        save_predictions=args.save_predictions,
+    config = load_config_from_checkpoint(args.checkpoint)
+    apply_eval_overrides(
+        config,
+        batch_size=args.batch_size,
+        loops=args.loops,
         hidden_diff_threshold=args.hidden_diff_threshold,
-        loop_checkpoints=loop_checkpoints,
-        arc_majority_evaluator=arc_majority_evaluator,
     )
-    end_time = time.time()
-    elapsed_time = end_time - start_time
+    config.checkpoint_path = str(checkpoint_path.parent)
+
+    torch.random.manual_seed(config.seed)
+
+    train_loader, train_metadata = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=1,
+        global_batch_size=config.global_batch_size,
+        rank=0,
+        world_size=1,
+    )
+    eval_loader, eval_metadata = create_dataloader(
+        config,
+        "test",
+        test_set_mode=True,
+        epochs_per_iter=1,
+        global_batch_size=config.global_batch_size,
+        rank=0,
+        world_size=1,
+    )
+    eval_loader = MaxProblemsDataLoader(eval_loader, args.max_problems)
+
+    train_state = init_train_state(config, train_metadata, rank=0, world_size=1)
+    _load_weights_only(train_state, config, checkpoint_path)
+    train_state.model.eval()
+
+    loop_config = _get_loop_config(train_state.model)
+    if loop_config is not None:
+        if args.loops is not None:
+            loop_config.loops = args.loops
+        if args.hidden_diff_threshold is not None:
+            loop_config.norm_diff_min = args.hidden_diff_threshold
+            loop_config.norm_diff_max = args.hidden_diff_threshold
+
+    evaluators = create_evaluators(config, eval_metadata)
+    if not any(isinstance(evaluator, ARC) for evaluator in evaluators):
+        arc_evaluator = maybe_create_arc_evaluator(config, eval_metadata)
+        if arc_evaluator is not None:
+            print("Detected ARC-AGI dataset; enabling ARC augment consensus evaluator.")
+            evaluators.append(arc_evaluator)
+
+    metrics = evaluate(
+        config,
+        train_state,
+        eval_loader,
+        eval_metadata,
+        evaluators,
+        rank=0,
+        world_size=1,
+        cpu_group=None,
+    )
 
     output_path = (
         Path(args.output)
         if args.output is not None
-        else _default_output_path(
-            args.checkpoint,
-            args.split,
-            args.max_batches,
-            args.max_problems,
-            args.loops,
-            args.H_cycles,
-            args.L_cycles,
-            args.hidden_diff_threshold,
+        else _metrics_output_path(
+            checkpoint_path,
+            max_problems=args.max_problems,
+            loops=args.loops,
+            hidden_diff_threshold=args.hidden_diff_threshold,
         )
     )
-    arc_majority_vote_metrics: Optional[Dict[str, float]] = None
-    arc_submission_dir: Optional[Path] = None
-    if arc_majority_evaluator is not None:
-        arc_submission_dir = default_arc_submission_dir(output_path)
-        arc_majority_vote_metrics = arc_majority_evaluator.result(str(arc_submission_dir))
-
-    print("")
-    print(f"Evaluation completed in {elapsed_time:.2f} seconds.")
-    print(f"Processed batches: {processed_batches}")
-    print(f"Processed problems: {processed_problems}")
-    if step is not None:
-        print(f"Checkpoint step: {step}")
-    for set_name, metrics in metrics_by_set.items():
-        print(f"[{set_name}]")
-        for key, value in sorted(metrics.items()):
-            print(f"  {key}: {value:.6f}")
-
-    if loop_metrics_by_step:
-        print("")
-        print("Intermediate metrics at power-of-two loops:")
-        for loop_step, metrics_per_set in loop_metrics_by_step.items():
-            print(f"[loop={loop_step}]")
-            for set_name, metrics in metrics_per_set.items():
-                print(f"  [{set_name}]")
-                for key in ("accuracy", "exact_accuracy", "lm_loss"):
-                    if key in metrics:
-                        print(f"    {key}: {metrics[key]:.6f}")
-                if "finished_fraction" in metrics:
-                    print(f"    finished_pct: {metrics['finished_fraction'] * 100:.2f}%")
-    if arc_majority_vote_metrics:
-        print("")
-        print("ARC majority-vote metrics:")
-        for key, value in sorted(arc_majority_vote_metrics.items()):
-            print(f"  {key}: {value:.6f}")
-        if arc_submission_dir is not None:
-            print(f"ARC submission saved to: {arc_submission_dir / 'submission.json'}")
-    if output_path.suffix.lower() != ".json":
-        print(f"Warning: writing JSON summary to a path without a .json suffix: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "checkpoint": resolved_checkpoint_path,
-        "checkpoint_step": step,
-        "data_path": config.data_path,
-        "split": args.split,
-        "batch_size": config.global_batch_size,
-        "loops": effective_loops,
-        "H_cycles": (config.arch.__pydantic_extra__ or {}).get("H_cycles"),
-        "L_cycles": (config.arch.__pydantic_extra__ or {}).get("L_cycles"),
-        "hidden_diff_threshold": args.hidden_diff_threshold,
-        "max_batches": args.max_batches,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_step": train_state.step,
+        "batch_size": args.batch_size,
         "max_problems": args.max_problems,
-        "elapsed_time_sec": elapsed_time,
-        "processed_batches": processed_batches,
-        "processed_problems": processed_problems,
-        "metrics": metrics_by_set,
-        "power_of_two_loop_metrics": loop_metrics_by_step,
-        "arc_majority_vote_metrics": arc_majority_vote_metrics,
-        "arc_majority_vote_submission_dir": None if arc_submission_dir is None else str(arc_submission_dir),
+        "loops": getattr(loop_config, "loops", args.loops),
+        "hidden_diff_threshold": args.hidden_diff_threshold,
+        "metrics": _jsonable(metrics),
     }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print(f"\nSaved evaluation summary to: {output_path}")
-    if args.save_predictions:
-        predictions_output_path = _sidecar_predictions_output_path(output_path)
-        torch.save(saved_outputs, predictions_output_path)
-        print(f"Saved prediction tensors to: {predictions_output_path}")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"Saved metrics to {output_path}")
+
+    # Keep worker shutdown deterministic before process exit.
+    del train_loader
+    del eval_loader
 
 
 if __name__ == "__main__":
