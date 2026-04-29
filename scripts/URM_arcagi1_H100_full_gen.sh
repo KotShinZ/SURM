@@ -1,11 +1,12 @@
 # Example: WANDB_MODE=offline bash scripts/URM_arcagi1_H100_full.sh
-run_name="URM-arcagi1-full-gen"
+run_name="URM-arcagi1-full-gen-cross"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
 torchrun --nproc-per-node 1 pretrain.py \
 data_path=data/arc1withgen-aug-1000 \
 arch=urm arch.loops=32 arch.H_cycles=1 arch.L_cycles=1 arch.num_layers=4 \
+arch.answer_only=True arch.answer_only_context_layers=0 \
 arch.use_act=False arch.norm_diff_max=0.1 arch.norm_diff_min=0.001 \
 global_batch_size=64 \
 grad_accum_steps=12 \
