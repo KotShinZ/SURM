@@ -169,6 +169,22 @@ bash scripts/URM_arcagi2.sh
 bash scripts/URM_sudoku.sh
 ```
 
+## evalate Sudoku Score
+```bash
+python evaluate_trained_model.py --checkpoint checkpoints/URM-Sudoku-base --max_problems 4096 --loops 32 --batch_size 4096 --hidden_diff_threshold 0.1
+```
+
+## evalate ARC-AGI Score
+```bash
+python evaluate_trained_model.py --checkpoint checkpoints/URM-arcagi1 --max_problems 4096 --loops 32 --batch_size 4096 --hidden_diff_threshold 0.1
+```
+
+## continue training with checkpoint
+```bash
+torchrun --nproc-per-node 1 pretrain.py +resume_from_checkpoint_dir=checkpoints/URM-arcagi1 +run_name=URM-arcagi1 +checkpoint_path=checkpoints/URM-arcagi1 +load_checkpoint=latest
+```
+
+
 ### Citation
 ```
 @misc{gao2025universalreasoningmodel,
