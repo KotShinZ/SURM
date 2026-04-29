@@ -204,6 +204,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
         input_chunks = []
         label_chunks = []
+        answer_mask_chunks = []
         source_chunks = []
         position_chunks = []
 
@@ -227,30 +228,36 @@ class PuzzleFullDataset(PuzzleDataset):
                 )
 
             input_chunks.append(problem)
-            label_chunks.append(np.zeros_like(problem))
+            label_chunks.append(np.full_like(problem, IGNORE_LABEL_ID))
+            answer_mask_chunks.append(np.zeros(problem.shape, dtype=np.bool_))
             source_chunks.append(problem)
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
                 input_solution = np.zeros_like(solution)
                 label_solution = solution
+                answer_mask = np.ones(solution.shape, dtype=np.bool_)
             else:
                 input_solution = solution
-                label_solution = np.zeros_like(solution)
+                label_solution = np.full_like(solution, IGNORE_LABEL_ID)
+                answer_mask = np.zeros(solution.shape, dtype=np.bool_)
 
             input_chunks.append(input_solution)
             label_chunks.append(label_solution)
+            answer_mask_chunks.append(answer_mask)
             source_chunks.append(solution)
             position_chunks.append(self._make_position_ids(pair_pos, 1, label_shape))
 
         inputs = np.concatenate(input_chunks).astype(np.int32, copy=False)
         labels = np.concatenate(label_chunks).astype(np.int32, copy=False)
+        answer_mask = np.concatenate(answer_mask_chunks).astype(np.bool_, copy=False)
         source_inputs = np.concatenate(source_chunks).astype(np.int32, copy=False)
         position_ids = np.concatenate(position_chunks, axis=0).astype(np.int32, copy=False)
 
         return {
             "inputs": inputs,
             "labels": labels,
+            "answer_mask": answer_mask,
             "source_inputs": source_inputs,
             "position_ids": position_ids,
             "seq_lengths": np.array(inputs.shape[0], dtype=np.int32),
@@ -336,6 +343,7 @@ class PuzzleFullDataset(PuzzleDataset):
         batch = {
             "inputs": np.concatenate([sample["inputs"] for sample in samples]).astype(np.int32, copy=False),
             "labels": np.concatenate([sample["labels"] for sample in samples]).astype(np.int32, copy=False),
+            "answer_mask": np.concatenate([sample["answer_mask"] for sample in samples]).astype(np.bool_, copy=False),
             "source_inputs": np.concatenate([sample["source_inputs"] for sample in samples]).astype(np.int32, copy=False),
             "position_ids": np.concatenate([sample["position_ids"] for sample in samples], axis=0).astype(np.int32, copy=False),
             "seq_lengths": np.array([int(sample["seq_lengths"]) for sample in samples], dtype=np.int32),
@@ -348,9 +356,6 @@ class PuzzleFullDataset(PuzzleDataset):
         batch["seq_offsets"] = np.concatenate(
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
-
-        if self.metadata.ignore_label_id is not None:
-            batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 
@@ -358,6 +363,7 @@ class PuzzleFullDataset(PuzzleDataset):
         batch = {
             "inputs": np.concatenate([sample["inputs"] for sample in samples]).astype(np.int32, copy=False),
             "labels": np.concatenate([sample["labels"] for sample in samples]).astype(np.int32, copy=False),
+            "answer_mask": np.concatenate([sample["answer_mask"] for sample in samples]).astype(np.bool_, copy=False),
             "source_inputs": np.concatenate([sample["source_inputs"] for sample in samples]).astype(np.int32, copy=False),
             "position_ids": np.concatenate([sample["position_ids"] for sample in samples], axis=0).astype(np.int32, copy=False),
             "seq_lengths": np.array([int(sample["seq_lengths"]) for sample in samples], dtype=np.int32),
@@ -370,9 +376,6 @@ class PuzzleFullDataset(PuzzleDataset):
         batch["seq_offsets"] = np.concatenate(
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
-
-        if self.metadata.ignore_label_id is not None:
-            batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 

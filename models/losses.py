@@ -131,6 +131,43 @@ def _packed_segment_sum(
     return totals
 
 
+def _align_packed_logits_to_labels(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    current_data: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if labels.ndim != 1 or logits.ndim < 2 or logits.shape[0] == labels.shape[0]:
+        return logits, labels, torch.ones_like(labels, dtype=torch.bool)
+    if "label_seq_lengths" not in current_data or "seq_lengths" not in current_data:
+        return logits, labels, torch.ones_like(labels, dtype=torch.bool)
+
+    seq_lengths = current_data["seq_lengths"].to(device=logits.device, dtype=torch.long)
+    label_lengths = current_data["label_seq_lengths"].to(device=logits.device, dtype=torch.long)
+    seq_offsets = current_data.get(
+        "seq_offsets",
+        F.pad(torch.cumsum(seq_lengths.to(torch.int32), dim=0), (1, 0)),
+    ).to(device=logits.device, dtype=torch.long)
+    label_offsets = current_data.get(
+        "label_seq_offsets",
+        F.pad(torch.cumsum(label_lengths.to(torch.int32), dim=0), (1, 0)),
+    ).to(device=logits.device, dtype=torch.long)
+
+    aligned_logits = logits.new_zeros((labels.shape[0], *logits.shape[1:]))
+    loss_labels = labels.clone()
+    copied_mask = torch.zeros_like(labels, dtype=torch.bool)
+    for idx in range(label_lengths.shape[0]):
+        copy_len = int(torch.minimum(seq_lengths[idx], label_lengths[idx]).item())
+        if copy_len <= 0:
+            continue
+        src_start = int(seq_offsets[idx].item())
+        dst_start = int(label_offsets[idx].item())
+        aligned_logits[dst_start : dst_start + copy_len] = logits[src_start : src_start + copy_len]
+        copied_mask[dst_start : dst_start + copy_len] = True
+
+    loss_labels[~copied_mask] = IGNORE_LABEL_ID
+    return aligned_logits, loss_labels, copied_mask
+
+
 def s(x, epsilon=1e-30):
     return torch.where(
         x<0,
@@ -192,7 +229,16 @@ class ACTLossHead(nn.Module):
         # B x SeqLen x D
         new_carry, outputs = self.model(**model_kwargs)
         profile = outputs.get("profile")
-        labels = new_carry.current_data["labels"]
+        labels = outputs.get("loss_labels", new_carry.current_data["labels"])
+        loss_labels = labels
+        copied_label_mask = torch.ones_like(labels, dtype=torch.bool) if labels.ndim == 1 else None
+        if labels.ndim == 1:
+            aligned_logits, loss_labels, copied_label_mask = _align_packed_logits_to_labels(
+                outputs["logits"],
+                labels,
+                new_carry.current_data,
+            )
+            outputs["logits"] = aligned_logits
 
         # Correctness
         use_act = getattr(getattr(self.model, "config", None), "use_act", True)
@@ -200,9 +246,18 @@ class ACTLossHead(nn.Module):
             with torch.no_grad():
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
                 mask = labels != IGNORE_LABEL_ID
+                if copied_label_mask is not None:
+                    outputs["preds"] = torch.where(
+                        copied_label_mask,
+                        outputs["preds"],
+                        torch.full_like(outputs["preds"], IGNORE_LABEL_ID),
+                    )
                 is_correct = mask & (outputs["preds"] == labels)
 
-                lengths = new_carry.current_data["seq_lengths"].to(device=labels.device, dtype=torch.long)
+                lengths = outputs.get(
+                    "loss_seq_lengths",
+                    new_carry.current_data.get("label_seq_lengths", new_carry.current_data["seq_lengths"]),
+                ).to(device=labels.device, dtype=torch.long)
                 segment_ids = _packed_segment_ids(lengths, labels.device)
                 loss_counts = _packed_segment_sum(mask, segment_ids, lengths.shape[0], torch.long)
                 correct_counts = _packed_segment_sum(is_correct, segment_ids, lengths.shape[0], torch.long)
@@ -220,7 +275,7 @@ class ACTLossHead(nn.Module):
                 if use_act:
                     metrics["q_halt_accuracy"] = (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum()
 
-            loss_values = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID)
+            loss_values = self.loss_fn(outputs["logits"], loss_labels, ignore_index=IGNORE_LABEL_ID)
             token_divisor = loss_divisor.to(loss_values.dtype)[segment_ids]
             lm_loss = (loss_values / token_divisor).sum()
         else:

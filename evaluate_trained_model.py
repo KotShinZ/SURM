@@ -331,12 +331,23 @@ def _batch_size_from_batch(batch: Dict[str, torch.Tensor]) -> int:
     return int(batch["inputs"].shape[0])
 
 
-def _packed_example_ids(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    seq_lengths = batch["seq_lengths"].to(device=batch["labels"].device, dtype=torch.long)
+def _packed_example_ids(batch: Dict[str, torch.Tensor], *, for_labels: bool = False) -> torch.Tensor:
+    length_key = "label_seq_lengths" if for_labels and "label_seq_lengths" in batch else "seq_lengths"
+    seq_lengths = batch[length_key].to(device=batch["labels"].device, dtype=torch.long)
     return torch.repeat_interleave(
         torch.arange(seq_lengths.shape[0], device=batch["labels"].device, dtype=torch.long),
         seq_lengths,
     )
+
+
+def _packed_offsets(batch: Dict[str, torch.Tensor], *, for_labels: bool = False) -> torch.Tensor:
+    if for_labels and "label_seq_offsets" in batch:
+        return batch["label_seq_offsets"]
+    return batch["seq_offsets"]
+
+
+def _packed_token_count(batch: Dict[str, torch.Tensor], *, for_labels: bool = False) -> int:
+    return int(_packed_offsets(batch, for_labels=for_labels)[-1].item())
 
 
 def _valid_example_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -344,7 +355,7 @@ def _valid_example_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
     if labels.ndim != 1:
         return (labels != IGNORE_LABEL_ID).any(dim=1)
 
-    example_ids = _packed_example_ids(batch)
+    example_ids = _packed_example_ids(batch, for_labels=True)
     token_mask = labels != IGNORE_LABEL_ID
     return torch.bincount(
         example_ids[token_mask],
@@ -571,10 +582,14 @@ def _select_batch_examples(batch: Dict[str, torch.Tensor], example_indices: torc
         return {key: value.index_select(0, example_indices) for key, value in batch.items()}
 
     old_seq_offsets = batch["seq_offsets"]
+    old_label_seq_offsets = _packed_offsets(batch, for_labels=True)
     old_batch_size = batch["puzzle_identifiers"].shape[0]
-    old_token_count = int(old_seq_offsets[-1].item())
+    old_token_count = _packed_token_count(batch)
+    old_label_token_count = _packed_token_count(batch, for_labels=True)
     selected_seq_lengths = batch["seq_lengths"].index_select(0, example_indices)
     selected_seq_offsets = F.pad(torch.cumsum(selected_seq_lengths.to(torch.int32), dim=0), (1, 0))
+    selected_label_seq_lengths = batch.get("label_seq_lengths", batch["seq_lengths"]).index_select(0, example_indices)
+    selected_label_seq_offsets = F.pad(torch.cumsum(selected_label_seq_lengths.to(torch.int32), dim=0), (1, 0))
 
     selected: Dict[str, torch.Tensor] = {}
     for key, value in batch.items():
@@ -582,10 +597,18 @@ def _select_batch_examples(batch: Dict[str, torch.Tensor], example_indices: torc
             selected[key] = selected_seq_lengths
         elif key == "seq_offsets":
             selected[key] = selected_seq_offsets
+        elif key == "label_seq_lengths":
+            selected[key] = selected_label_seq_lengths
+        elif key == "label_seq_offsets":
+            selected[key] = selected_label_seq_offsets
         elif value.ndim > 0 and value.shape[0] == old_batch_size:
             selected[key] = value.index_select(0, example_indices)
+        elif key == "labels" and value.ndim > 0 and value.shape[0] == old_label_token_count:
+            selected[key] = _select_packed_tensor_segments(value, old_label_seq_offsets, example_indices)
         elif value.ndim > 0 and value.shape[0] == old_token_count:
             selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
+        elif value.ndim > 0 and value.shape[0] == old_label_token_count:
+            selected[key] = _select_packed_tensor_segments(value, old_label_seq_offsets, example_indices)
         else:
             selected[key] = value
 
@@ -601,12 +624,16 @@ def _select_prediction_examples(
         return {key: value.index_select(0, example_indices) for key, value in preds.items()}
 
     old_seq_offsets = batch["seq_offsets"]
+    old_label_seq_offsets = _packed_offsets(batch, for_labels=True)
     old_batch_size = batch["puzzle_identifiers"].shape[0]
-    old_token_count = int(old_seq_offsets[-1].item())
+    old_token_count = _packed_token_count(batch)
+    old_label_token_count = _packed_token_count(batch, for_labels=True)
     selected: Dict[str, torch.Tensor] = {}
     for key, value in preds.items():
         if value.ndim > 0 and value.shape[0] == old_batch_size:
             selected[key] = value.index_select(0, example_indices)
+        elif value.ndim > 0 and value.shape[0] == old_label_token_count:
+            selected[key] = _select_packed_tensor_segments(value, old_label_seq_offsets, example_indices)
         elif value.ndim > 0 and value.shape[0] == old_token_count:
             selected[key] = _select_packed_tensor_segments(value, old_seq_offsets, example_indices)
         else:
@@ -614,10 +641,33 @@ def _select_prediction_examples(
     return selected
 
 
-def _dense_arc_grids_from_packed(tokens: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    seq_ids = _packed_example_ids(batch)
-    position_ids = batch["position_ids"].to(device=tokens.device, dtype=torch.long)
-    flat_positions = position_ids[:, 0] * ARCMaxGridSize + position_ids[:, 1]
+def _packed_position_ids(batch: Dict[str, torch.Tensor], *, for_labels: bool = False) -> torch.Tensor:
+    if not for_labels:
+        return batch["position_ids"]
+
+    label_token_count = _packed_token_count(batch, for_labels=True)
+    if "position_ids" in batch and batch["position_ids"].shape[0] == label_token_count:
+        return batch["position_ids"]
+
+    if "label_seq_shapes" not in batch:
+        return batch["position_ids"]
+
+    lengths = batch["label_seq_lengths"].detach().cpu().tolist()
+    widths = torch.clamp(batch["label_seq_shapes"][:, 1].to(torch.long), min=1).detach().cpu().tolist()
+    chunks = []
+    for length, width in zip(lengths, widths):
+        positions = torch.arange(int(length), device=batch["labels"].device, dtype=torch.long)
+        chunks.append(torch.stack([positions // int(width), positions % int(width)], dim=-1))
+    if chunks:
+        return torch.cat(chunks, dim=0)
+    return torch.empty((0, 2), device=batch["labels"].device, dtype=torch.long)
+
+
+def _dense_arc_grids_from_packed(tokens: torch.Tensor, batch: Dict[str, torch.Tensor], *, for_labels: bool = False) -> torch.Tensor:
+    seq_ids = _packed_example_ids(batch, for_labels=for_labels).to(device=tokens.device)
+    position_ids = _packed_position_ids(batch, for_labels=for_labels).to(device=tokens.device, dtype=torch.long)
+    grid_positions = position_ids[:, -2:] if position_ids.shape[-1] >= 2 else position_ids
+    flat_positions = grid_positions[:, 0] * ARCMaxGridSize + grid_positions[:, 1]
     dense = torch.zeros(
         (batch["puzzle_identifiers"].shape[0], ARCMaxGridSize * ARCMaxGridSize),
         dtype=tokens.dtype,
@@ -649,7 +699,7 @@ def _prepare_arc_batch(
         for key, value in selected_preds.items()
         if key == "q_halt_logits"
     }
-    arc_preds["preds"] = _dense_arc_grids_from_packed(selected_preds["preds"], selected_batch)
+    arc_preds["preds"] = _dense_arc_grids_from_packed(selected_preds["preds"], selected_batch, for_labels=True)
     return arc_batch, arc_preds
 
 
@@ -662,7 +712,7 @@ def _compute_batch_metric_sums(
 ) -> Dict[str, float]:
     labels = batch["labels"]
     if labels.ndim == 1:
-        example_ids = _packed_example_ids(batch)
+        example_ids = _packed_example_ids(batch, for_labels=True)
         token_mask = labels != IGNORE_LABEL_ID
         token_counts = torch.bincount(
             example_ids[token_mask],
@@ -1036,7 +1086,19 @@ def evaluate_model(
                     saved_batch = _select_batch_examples(batch, kept_indices)
                     saved_preds = _select_prediction_examples(preds, batch, kept_indices)
                     for key, value in saved_batch.items():
-                        if key in {"inputs", "labels", "puzzle_identifiers", "source_inputs", "seq_lengths", "position_ids"}:
+                        if key in {
+                            "inputs",
+                            "labels",
+                            "puzzle_identifiers",
+                            "source_inputs",
+                            "seq_lengths",
+                            "seq_offsets",
+                            "seq_shapes",
+                            "label_seq_lengths",
+                            "label_seq_offsets",
+                            "label_seq_shapes",
+                            "position_ids",
+                        }:
                             saved_outputs[set_name][key].append(value.detach().cpu())
                     for key, value in saved_preds.items():
                         saved_outputs[set_name][key].append(value.detach().cpu())

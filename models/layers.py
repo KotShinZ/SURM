@@ -183,6 +183,98 @@ def apply_rotary_pos_emb_4d(
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 
+def apply_rotary_pos_emb_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    orig_dtype = x.dtype
+    x = x.to(cos.dtype)
+    x_embed = (x * cos.unsqueeze(-2)) + (rotate_half(x) * sin.unsqueeze(-2))
+    return x_embed.to(orig_dtype)
+
+
+def apply_rotary_pos_emb_single_2d(
+    x: torch.Tensor,
+    cos_row: torch.Tensor,
+    sin_row: torch.Tensor,
+    cos_col: torch.Tensor,
+    sin_col: torch.Tensor,
+):
+    orig_dtype = x.dtype
+    x = x.to(cos_row.dtype)
+
+    half = x.shape[-1] // 2
+    x_row, x_col = x[..., :half], x[..., half:]
+
+    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
+    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    return torch.cat([x_row, x_col], dim=-1).to(orig_dtype)
+
+
+def apply_rotary_pos_emb_single_3d(
+    x: torch.Tensor,
+    cos_depth: torch.Tensor,
+    sin_depth: torch.Tensor,
+    cos_row: torch.Tensor,
+    sin_row: torch.Tensor,
+    cos_col: torch.Tensor,
+    sin_col: torch.Tensor,
+):
+    orig_dtype = x.dtype
+    x = x.to(cos_depth.dtype)
+
+    axis_dims = (
+        cos_depth.shape[-1],
+        cos_row.shape[-1],
+        cos_col.shape[-1],
+    )
+    x_depth, x_row, x_col = torch.split(x, axis_dims, dim=-1)
+
+    x_depth = x_depth * cos_depth.unsqueeze(-2) + rotate_half(x_depth) * sin_depth.unsqueeze(-2)
+    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
+    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    return torch.cat([x_depth, x_row, x_col], dim=-1).to(orig_dtype)
+
+
+def apply_rotary_pos_emb_single_4d(
+    x: torch.Tensor,
+    cos_pair: torch.Tensor,
+    sin_pair: torch.Tensor,
+    cos_io: torch.Tensor,
+    sin_io: torch.Tensor,
+    cos_row: torch.Tensor,
+    sin_row: torch.Tensor,
+    cos_col: torch.Tensor,
+    sin_col: torch.Tensor,
+):
+    orig_dtype = x.dtype
+    x = x.to(cos_pair.dtype)
+
+    axis_dims = (
+        cos_pair.shape[-1],
+        cos_io.shape[-1],
+        cos_row.shape[-1],
+        cos_col.shape[-1],
+    )
+    x_pair, x_io, x_row, x_col = torch.split(x, axis_dims, dim=-1)
+
+    x_pair = x_pair * cos_pair.unsqueeze(-2) + rotate_half(x_pair) * sin_pair.unsqueeze(-2)
+    x_io = x_io * cos_io.unsqueeze(-2) + rotate_half(x_io) * sin_io.unsqueeze(-2)
+    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
+    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    return torch.cat([x_pair, x_io, x_row, x_col], dim=-1).to(orig_dtype)
+
+
+def apply_rotary_pos_emb_one(x: torch.Tensor, cos_sin: Optional[CosSin]):
+    if cos_sin is None:
+        return x
+    if len(cos_sin) == 8:
+        return apply_rotary_pos_emb_single_4d(x, *cos_sin)
+    if len(cos_sin) == 6:
+        return apply_rotary_pos_emb_single_3d(x, *cos_sin)
+    if len(cos_sin) == 4:
+        return apply_rotary_pos_emb_single_2d(x, *cos_sin)
+    cos, sin = cos_sin
+    return apply_rotary_pos_emb_single(x, cos, sin)
+
+
 class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
@@ -833,6 +925,65 @@ class Attention(nn.Module):
             attn_output = attn_output[0]
 
         return self.o_proj(attn_output.reshape(num_tokens, self.output_size))
+
+    def forward_cross_packed(
+        self,
+        query_cos_sin: Optional[CosSin],
+        key_value_cos_sin: Optional[CosSin],
+        query_states: torch.Tensor,
+        key_value_states: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        if self.attention_type != "full":
+            raise ValueError(
+                "Packed answer-only cross-attention currently supports attention_type='full' only, "
+                f"got '{self.attention_type}'."
+            )
+
+        num_query_tokens = query_states.shape[0]
+        num_key_value_tokens = key_value_states.shape[0]
+        if num_query_tokens == 0:
+            return query_states.new_empty((0, self.hidden_size))
+
+        query_qkv = self.qkv_proj(query_states)
+        query_qkv = query_qkv.view(
+            num_query_tokens,
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+        query = query_qkv[:, :self.num_heads]
+
+        key_value_qkv = self.qkv_proj(key_value_states)
+        key_value_qkv = key_value_qkv.view(
+            num_key_value_tokens,
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+        key = key_value_qkv[:, self.num_heads: self.num_heads + self.num_key_value_heads]
+        value = key_value_qkv[:, self.num_heads + self.num_key_value_heads:]
+
+        query = apply_rotary_pos_emb_one(query, query_cos_sin)
+        key = apply_rotary_pos_emb_one(key, key_value_cos_sin)
+
+        attn_output = flash_attn_varlen_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=False,
+            window_size=(-1, -1),
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+
+        return self.o_proj(attn_output.reshape(num_query_tokens, self.output_size))
 
 
 class SwiGLU(nn.Module):
