@@ -204,11 +204,14 @@ class PuzzleFullDataset(PuzzleDataset):
         if len(pairs) != len(shapes):
             raise ValueError(f"pairs and shapes length mismatch: {len(pairs)} != {len(shapes)}")
 
+        answer_only_labels = bool(self.config.answer_only_labels)
+
         input_chunks = []
         label_chunks = []
         answer_mask_chunks = []
         source_chunks = []
         position_chunks = []
+        label_seq_shape = None
 
         for pair_pos, ((problem, solution), shape_pair) in enumerate(zip(pairs, shapes)):
             input_shape = tuple(int(v) for v in shape_pair[0])
@@ -230,7 +233,8 @@ class PuzzleFullDataset(PuzzleDataset):
                 )
 
             input_chunks.append(problem)
-            label_chunks.append(np.full_like(problem, IGNORE_LABEL_ID))
+            if not answer_only_labels:
+                label_chunks.append(np.full_like(problem, IGNORE_LABEL_ID))
             answer_mask_chunks.append(np.zeros(problem.shape, dtype=np.bool_))
             source_chunks.append(problem)
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
@@ -239,13 +243,18 @@ class PuzzleFullDataset(PuzzleDataset):
                 input_solution = np.zeros_like(solution)
                 label_solution = solution
                 answer_mask = np.ones(solution.shape, dtype=np.bool_)
+                label_seq_shape = label_shape
             else:
                 input_solution = solution
                 label_solution = np.full_like(solution, IGNORE_LABEL_ID)
                 answer_mask = np.zeros(solution.shape, dtype=np.bool_)
 
             input_chunks.append(input_solution)
-            label_chunks.append(label_solution)
+            if answer_only_labels:
+                if pair_pos == target_pair_index:
+                    label_chunks.append(label_solution)
+            else:
+                label_chunks.append(label_solution)
             answer_mask_chunks.append(answer_mask)
             source_chunks.append(solution)
             position_chunks.append(self._make_position_ids(pair_pos, 1, label_shape))
@@ -256,7 +265,7 @@ class PuzzleFullDataset(PuzzleDataset):
         source_inputs = np.concatenate(source_chunks).astype(np.int32, copy=False)
         position_ids = np.concatenate(position_chunks, axis=0).astype(np.int32, copy=False)
 
-        return {
+        sample = {
             "inputs": inputs,
             "labels": labels,
             "answer_mask": answer_mask,
@@ -264,6 +273,12 @@ class PuzzleFullDataset(PuzzleDataset):
             "position_ids": position_ids,
             "seq_lengths": np.array(inputs.shape[0], dtype=np.int32),
         }
+        if answer_only_labels:
+            if label_seq_shape is None:
+                raise ValueError("target_pair_index did not match any pair while building answer-only labels.")
+            sample["label_seq_lengths"] = np.array(labels.shape[0], dtype=np.int32)
+            sample["label_seq_shapes"] = np.array(label_seq_shape, dtype=np.int32)
+        return sample
 
     def _build_full_sample(
         self,
@@ -358,6 +373,18 @@ class PuzzleFullDataset(PuzzleDataset):
         batch["seq_offsets"] = np.concatenate(
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
+        if "label_seq_lengths" in samples[0]:
+            batch["label_seq_lengths"] = np.array(
+                [int(sample["label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["label_seq_shapes"] = np.stack(
+                [sample["label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 
@@ -379,6 +406,18 @@ class PuzzleFullDataset(PuzzleDataset):
         batch["seq_offsets"] = np.concatenate(
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
+        if "label_seq_lengths" in samples[0]:
+            batch["label_seq_lengths"] = np.array(
+                [int(sample["label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["label_seq_shapes"] = np.stack(
+                [sample["label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 

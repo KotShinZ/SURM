@@ -160,6 +160,9 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     full_min_pairs: int = 3
     full_max_pairs: int = 8
 
+    # Emit labels as only the answer tokens while keeping inputs full-length.
+    answer_only_labels: bool = False
+
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
         if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:

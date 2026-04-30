@@ -272,6 +272,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             arc_output_mask=arc_output_mask,
             full_min_pairs=config.full_min_pairs,
             full_max_pairs=config.full_max_pairs,
+            answer_only_labels=bool(getattr(config.arch, "answer_only", False)),
             **kwargs,
         ),
         split=split,

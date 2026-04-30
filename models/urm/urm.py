@@ -614,7 +614,11 @@ class URM_Inner(nn.Module):
             answer_lengths.scatter_add_(0, segment_ids, answer_data_mask.to(torch.long))
 
         answer_indices = token_indices[answer_data_mask]
-        answer_labels = batch["labels"][answer_data_mask]
+        if "label_seq_lengths" in batch:
+            answer_labels = batch["labels"]
+            answer_lengths = batch["label_seq_lengths"].to(device=batch["inputs"].device, dtype=torch.long)
+        else:
+            answer_labels = batch["labels"][answer_data_mask]
         full_lengths = lengths + self.puzzle_emb_len
         context_lengths = full_lengths - answer_lengths
         cu_answer = F.pad(torch.cumsum(answer_lengths.to(torch.int32), dim=0), (1, 0))

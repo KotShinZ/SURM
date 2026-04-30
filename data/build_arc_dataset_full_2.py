@@ -26,6 +26,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     num_aug: int = 1000
     no_padding: bool = True
+    include_eos: bool = True
     min_context_pairs: int = 2
 
 
@@ -58,6 +59,7 @@ def np_grid_to_fixed_seq_translational_augment(
     inp: np.ndarray,
     out: np.ndarray,
     do_translation: bool,
+    include_eos: bool = True,
 ):
     # PAD: 0, <eos>: 1, digits: 2 ... 11
     # Compute random top-left pad
@@ -77,19 +79,20 @@ def np_grid_to_fixed_seq_translational_augment(
             constant_values=0,
         )
 
-        # Add <eos>
-        eos_row, eos_col = pad_r + nrow, pad_c + ncol
-        if eos_row < ARCMaxGridSize:
-            grid[eos_row, pad_c:eos_col] = 1
-        if eos_col < ARCMaxGridSize:
-            grid[pad_r:eos_row, eos_col] = 1
+        if include_eos:
+            # Add <eos>
+            eos_row, eos_col = pad_r + nrow, pad_c + ncol
+            if eos_row < ARCMaxGridSize:
+                grid[eos_row, pad_c:eos_col] = 1
+            if eos_col < ARCMaxGridSize:
+                grid[pad_r:eos_row, eos_col] = 1
 
         result.append(grid.flatten())
 
     return result
 
 
-def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
+def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray, include_eos: bool = True):
     # PAD: 0, <eos>: 1, digits: 2 ... 11
     #
     # The full-context dataset concatenates multiple grid-pairs into a 1D sequence.
@@ -97,9 +100,9 @@ def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
     # both grids plus the EOS border when the ARC 30x30 limit leaves room for it.
     canvas_h = max(inp.shape[0], out.shape[0])
     canvas_w = max(inp.shape[1], out.shape[1])
-    if canvas_h < ARCMaxGridSize:
+    if include_eos and canvas_h < ARCMaxGridSize:
         canvas_h += 1
-    if canvas_w < ARCMaxGridSize:
+    if include_eos and canvas_w < ARCMaxGridSize:
         canvas_w += 1
 
     result = []
@@ -108,10 +111,11 @@ def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
         canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
         canvas[:nrow, :ncol] = grid + 2
 
-        if nrow < canvas_h:
-            canvas[nrow, :ncol] = 1
-        if ncol < canvas_w:
-            canvas[:nrow, ncol] = 1
+        if include_eos:
+            if nrow < canvas_h:
+                canvas[nrow, :ncol] = 1
+            if ncol < canvas_w:
+                canvas[:nrow, ncol] = 1
 
         result.append(canvas.flatten())
 
@@ -372,24 +376,25 @@ def _pair_seq_upper_bound(
     inp: np.ndarray,
     out: np.ndarray,
     no_padding: bool,
+    include_eos: bool,
 ):
     if not no_padding:
         return 2 * ARCMaxGridSize * ARCMaxGridSize
 
     canvas_h = max(inp.shape[0], out.shape[0])
     canvas_w = max(inp.shape[1], out.shape[1])
-    if canvas_h < ARCMaxGridSize:
+    if include_eos and canvas_h < ARCMaxGridSize:
         canvas_h += 1
-    if canvas_w < ARCMaxGridSize:
+    if include_eos and canvas_w < ARCMaxGridSize:
         canvas_w += 1
     return 2 * canvas_h * canvas_w
 
 
-def _full_sample_upper_bound(group: List[ARCFullPuzzle], no_padding: bool):
+def _full_sample_upper_bound(group: List[ARCFullPuzzle], no_padding: bool, include_eos: bool):
     if not group:
         return 0
     return max(
-        sum(_pair_seq_upper_bound(inp, out, no_padding) for inp, out in puzzle.pairs)
+        sum(_pair_seq_upper_bound(inp, out, no_padding, include_eos) for inp, out in puzzle.pairs)
         for puzzle in group
     )
 
@@ -399,14 +404,16 @@ def _make_pair_sequences(
     out: np.ndarray,
     do_translation: bool,
     no_padding: bool,
+    include_eos: bool,
 ):
     if no_padding:
-        (inp_seq, out_seq), pair_shape = np_grids_to_unpadded_seq(inp, out)
+        (inp_seq, out_seq), pair_shape = np_grids_to_unpadded_seq(inp, out, include_eos=include_eos)
     else:
         inp_seq, out_seq = np_grid_to_fixed_seq_translational_augment(
             inp,
             out,
             do_translation=do_translation,
+            include_eos=include_eos,
         )
         pair_shape = (ARCMaxGridSize, ARCMaxGridSize)
 
@@ -434,6 +441,7 @@ def _build_training_full_context_example(
     puzzle: ARCFullPuzzle,
     enable_translational_augment: bool,
     no_padding: bool,
+    include_eos: bool,
 ):
     ordered_indices = list(range(len(puzzle.pairs)))
     no_aug_pair_pos = np.random.randint(0, len(ordered_indices))
@@ -444,7 +452,13 @@ def _build_training_full_context_example(
     for pair_pos, pair_idx in enumerate(ordered_indices):
         inp, out = puzzle.pairs[pair_idx]
         do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
-        inp_seq, out_seq, pair_shape = _make_pair_sequences(inp, out, do_translation, no_padding)
+        inp_seq, out_seq, pair_shape = _make_pair_sequences(
+            inp,
+            out,
+            do_translation,
+            no_padding,
+            include_eos,
+        )
         inp_pos_ids, out_pos_ids = _make_pair_position_ids(pair_shape, pair_pos)
 
         input_parts.extend([inp_seq, out_seq])
@@ -462,6 +476,7 @@ def _build_full_context_example(
     min_context_pairs: int,
     enable_translational_augment: bool,
     no_padding: bool,
+    include_eos: bool,
     use_all_pairs_in_order: bool = False,
 ):
     if use_all_pairs_in_order:
@@ -487,7 +502,13 @@ def _build_full_context_example(
     for pair_pos, pair_idx in enumerate(ordered_indices):
         inp, out = puzzle.pairs[pair_idx]
         do_translation = enable_translational_augment and pair_pos != no_aug_pair_pos
-        inp_seq, out_seq, pair_shape = _make_pair_sequences(inp, out, do_translation, no_padding)
+        inp_seq, out_seq, pair_shape = _make_pair_sequences(
+            inp,
+            out,
+            do_translation,
+            no_padding,
+            include_eos,
+        )
 
         zero_inp = np.zeros_like(inp_seq, dtype=np.uint8)
         zero_out = np.zeros_like(out_seq, dtype=np.uint8)
@@ -653,7 +674,10 @@ def convert_dataset(config: DataProcessConfig):
     for split in data.values():
         for subset in split.values():
             for group in subset:
-                global_seq_len = max(global_seq_len, _full_sample_upper_bound(group, config.no_padding))
+                global_seq_len = max(
+                    global_seq_len,
+                    _full_sample_upper_bound(group, config.no_padding, config.include_eos),
+                )
 
     if global_seq_len <= 0:
         raise ValueError("No full-context ARC samples were generated.")
@@ -694,6 +718,7 @@ def convert_dataset(config: DataProcessConfig):
                                 puzzle=puzzle,
                                 enable_translational_augment=enable_translational_augment,
                                 no_padding=config.no_padding,
+                                include_eos=config.include_eos,
                             )
                         ]
                     else:
@@ -704,6 +729,7 @@ def convert_dataset(config: DataProcessConfig):
                                 min_context_pairs=config.min_context_pairs,
                                 enable_translational_augment=enable_translational_augment,
                                 no_padding=config.no_padding,
+                                include_eos=config.include_eos,
                                 use_all_pairs_in_order=True,
                             )
                             for target_idx in puzzle.target_indices
@@ -815,6 +841,7 @@ def convert_dataset(config: DataProcessConfig):
             sets=list(split.keys()),
             variable_seq_lengths=config.no_padding,
             position_id_shape=split_max_position_id.tolist() if config.no_padding and total_examples > 0 else None,
+            sequence_layout="pair_eos" if config.include_eos else "pair_no_eos",
             train_target_mode="random_output_pair" if split_name == "train" else None,
             min_context_pairs=config.min_context_pairs if split_name == "train" else None,
         )

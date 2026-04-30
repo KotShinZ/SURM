@@ -202,7 +202,10 @@ class ACTLossHead(nn.Module):
                 mask = labels != IGNORE_LABEL_ID
                 is_correct = mask & (outputs["preds"] == labels)
 
-                lengths = new_carry.current_data["seq_lengths"].to(device=labels.device, dtype=torch.long)
+                lengths = new_carry.current_data.get(
+                    "label_seq_lengths",
+                    new_carry.current_data["seq_lengths"],
+                ).to(device=labels.device, dtype=torch.long)
                 segment_ids = _packed_segment_ids(lengths, labels.device)
                 loss_counts = _packed_segment_sum(mask, segment_ids, lengths.shape[0], torch.long)
                 correct_counts = _packed_segment_sum(is_correct, segment_ids, lengths.shape[0], torch.long)
