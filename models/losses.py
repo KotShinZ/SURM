@@ -167,12 +167,16 @@ class ACTLossHead(nn.Module):
         loss_type: str,
         diff_L_loss_enabled: bool = False,
         diff_L_loss_weight: float = 0.01,
+        label_mask: float = 0.0,
     ):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
         self.diff_L_loss_enabled = diff_L_loss_enabled
         self.diff_L_loss_weight = diff_L_loss_weight
+        if not 0.0 <= label_mask <= 1.0:
+            raise ValueError(f"label_mask must be between 0 and 1, got {label_mask}")
+        self.label_mask = float(label_mask)
 
         model_config = getattr(self.model, "config", None)
         if model_config is not None and hasattr(model_config, "diff_L_loss_enabled"):
@@ -180,6 +184,20 @@ class ACTLossHead(nn.Module):
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
+
+    def _mask_labels_for_training(self, labels: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.label_mask <= 0.0:
+            return labels
+
+        valid_mask = labels != IGNORE_LABEL_ID
+        if self.label_mask >= 1.0:
+            mask = valid_mask
+        else:
+            mask = valid_mask & (torch.rand(labels.shape, device=labels.device) < self.label_mask)
+
+        masked_labels = labels.clone()
+        masked_labels[mask] = IGNORE_LABEL_ID
+        return masked_labels
 
     def forward(
         self,
@@ -193,6 +211,7 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         profile = outputs.get("profile")
         labels = new_carry.current_data["labels"]
+        labels = self._mask_labels_for_training(labels)
 
         # Correctness
         use_act = getattr(getattr(self.model, "config", None), "use_act", True)

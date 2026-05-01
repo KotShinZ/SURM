@@ -2,6 +2,7 @@ name: urm.urm@URM
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  label_mask: 0.0
   diff_L_loss_enabled: false
   diff_L_loss_weight: 100
 

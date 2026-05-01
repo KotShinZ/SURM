@@ -67,6 +67,60 @@ class PackedLossMetricTests(unittest.TestCase):
         self.assertTrue(torch.allclose(metrics["lm_loss"], expected_lm_loss, atol=1e-6, rtol=1e-6))
         self.assertTrue(torch.allclose(total_loss, expected_lm_loss, atol=1e-6, rtol=1e-6))
 
+    def test_label_mask_one_masks_all_training_labels(self) -> None:
+        labels = torch.tensor([[1, 2, IGNORE_LABEL_ID], [0, 1, 2]], dtype=torch.int32)
+        logits = torch.zeros((2, 3, 4), dtype=torch.float32)
+        halted = torch.tensor([True, True], dtype=torch.bool)
+        steps = torch.tensor([1, 1], dtype=torch.int32)
+
+        carry = types.SimpleNamespace(
+            current_data={"labels": labels, "seq_lengths": torch.tensor([3, 3], dtype=torch.int32)},
+            halted=halted,
+            steps=steps,
+        )
+        outputs = {"logits": logits}
+        loss_head = ACTLossHead(
+            _DummyModel(carry, outputs),
+            loss_type="softmax_cross_entropy",
+            label_mask=1.0,
+        )
+
+        _, total_loss, metrics, _, _ = loss_head(return_keys=set())
+
+        self.assertEqual(int(metrics["count"].item()), 0)
+        self.assertTrue(torch.allclose(metrics["lm_loss"], torch.tensor(0.0), atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(total_loss, torch.tensor(0.0), atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.equal(carry.current_data["labels"], labels))
+
+    def test_label_mask_is_disabled_during_eval(self) -> None:
+        labels = torch.tensor([[1, 2, IGNORE_LABEL_ID], [0, 1, 2]], dtype=torch.int32)
+        logits = torch.zeros((2, 3, 4), dtype=torch.float32)
+        halted = torch.tensor([True, True], dtype=torch.bool)
+        steps = torch.tensor([1, 1], dtype=torch.int32)
+
+        carry = types.SimpleNamespace(
+            current_data={"labels": labels, "seq_lengths": torch.tensor([3, 3], dtype=torch.int32)},
+            halted=halted,
+            steps=steps,
+        )
+        outputs = {"logits": logits}
+        loss_head = ACTLossHead(
+            _DummyModel(carry, outputs),
+            loss_type="softmax_cross_entropy",
+            label_mask=1.0,
+        )
+        loss_head.eval()
+
+        _, total_loss, metrics, _, _ = loss_head(return_keys=set())
+        expected_loss = (
+            softmax_cross_entropy(logits, labels, ignore_index=IGNORE_LABEL_ID)
+            / torch.tensor([[2.0], [3.0]])
+        ).sum()
+
+        self.assertEqual(int(metrics["count"].item()), 2)
+        self.assertTrue(torch.allclose(metrics["lm_loss"], expected_loss, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(total_loss, expected_loss, atol=1e-6, rtol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()
