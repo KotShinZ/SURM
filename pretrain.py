@@ -856,11 +856,17 @@ def _add_train_timing_metrics(train_state: TrainState, metrics: Dict[str, Any], 
     )
 
 
-def _add_eval_timing_metrics(train_state: TrainState, metrics: Dict[str, Any]) -> None:
+def _add_eval_timing_metrics(
+    train_state: TrainState,
+    metrics: Dict[str, Any],
+    eval_time_h: Optional[float] = None,
+) -> None:
     metrics["train/total_train_time_h"] = train_state.train_time_h
     metrics["train/avg_step_time_h"] = train_state.train_time_h / max(train_state.step, 1)
     if train_state.last_step_time_h is not None:
         metrics["train/step_time_h"] = train_state.last_step_time_h
+    if eval_time_h is not None:
+        metrics["all/eval_time_h"] = eval_time_h
 
     _add_time_axis_metrics(
         train_state,
@@ -1567,6 +1573,8 @@ def launch(hydra_config: DictConfig):
                 if loop_config is not None:
                     loop_config.loops = original_loops + delta
 
+                torch.cuda.synchronize()
+                eval_start_s = time.perf_counter()
                 metrics = evaluate(
                     config,
                     train_state_eval,
@@ -1578,8 +1586,10 @@ def launch(hydra_config: DictConfig):
                     cpu_group=CPU_PROCESS_GROUP,
                     early_eval=True,
                 )
+                torch.cuda.synchronize()
+                eval_time_h = (time.perf_counter() - eval_start_s) / 3600.0
                 if RANK == 0 and metrics is not None:
-                    _add_eval_timing_metrics(train_state, metrics)
+                    _add_eval_timing_metrics(train_state, metrics, eval_time_h=eval_time_h)
                     wandb.log(metrics, step=train_state.step)
 
             if loop_config is not None:
@@ -1644,6 +1654,8 @@ def launch(hydra_config: DictConfig):
                 if loop_config is not None:
                     loop_config.loops = original_loops + delta
 
+                torch.cuda.synchronize()
+                eval_start_s = time.perf_counter()
                 metrics = evaluate(
                     config,
                     train_state_eval,
@@ -1655,8 +1667,10 @@ def launch(hydra_config: DictConfig):
                     cpu_group=CPU_PROCESS_GROUP,
                     early_eval=True,
                 )
+                torch.cuda.synchronize()
+                eval_time_h = (time.perf_counter() - eval_start_s) / 3600.0
                 if RANK == 0 and metrics is not None:
-                    _add_eval_timing_metrics(train_state, metrics)
+                    _add_eval_timing_metrics(train_state, metrics, eval_time_h=eval_time_h)
                     wandb.log(metrics, step=train_state.step)
 
             if loop_config is not None:
