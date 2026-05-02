@@ -193,11 +193,35 @@ class PuzzleFullDataset(PuzzleDataset):
         end = int(offsets[example_index + 1])
         return dataset[field_name][start:end].astype(np.int32, copy=False)
 
+    def _make_answer_initial_tokens(
+        self,
+        solution: np.ndarray,
+        rng: Optional[np.random.Generator],
+    ) -> np.ndarray:
+        mode = self.config.full_answer_initial_mode
+        if mode == "black":
+            return np.full_like(solution, int(self.config.full_answer_initial_black_token_id))
+
+        if mode != "noised_label":
+            raise ValueError(f"Unknown full_answer_initial_mode: {mode}")
+        if rng is None:
+            raise ValueError("noised_label answer initialization requires an rng.")
+
+        gamma_min = float(self.config.full_answer_initial_gamma_min)
+        gamma_max = float(self.config.full_answer_initial_gamma_max)
+        gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
+        noise_min = int(self.config.full_answer_initial_noise_token_min)
+        noise_max = int(self.config.full_answer_initial_noise_token_max)
+        epsilon = rng.integers(noise_min, noise_max + 1, size=solution.shape, dtype=np.int32)
+        keep_solution = rng.random(solution.shape) < gamma
+        return np.where(keep_solution, solution, epsilon).astype(np.int32, copy=False)
+
     def _build_pairs_sample(
         self,
         pairs: Sequence[Tuple[np.ndarray, np.ndarray]],
         shapes: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]],
         target_pair_index: int,
+        rng: Optional[np.random.Generator] = None,
     ) -> dict:
         if not pairs:
             raise ValueError("Cannot build a full sample from zero pairs.")
@@ -240,7 +264,7 @@ class PuzzleFullDataset(PuzzleDataset):
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
-                input_solution = np.zeros_like(solution)
+                input_solution = self._make_answer_initial_tokens(solution, rng)
                 label_solution = solution
                 answer_mask = np.ones(solution.shape, dtype=np.bool_)
                 label_seq_shape = label_shape
@@ -308,7 +332,7 @@ class PuzzleFullDataset(PuzzleDataset):
             pairs.append((problem, solution))
             shapes.append((input_shape, label_shape))
 
-        return self._build_pairs_sample(pairs, shapes, target_pair_index)
+        return self._build_pairs_sample(pairs, shapes, target_pair_index, rng=rng)
 
     def _context_pairs_for_test_example(self, dataset: dict, example_index: int):
         context_examples = dataset["examples"][example_index]
@@ -331,7 +355,12 @@ class PuzzleFullDataset(PuzzleDataset):
 
         return pairs, shapes
 
-    def _build_test_sample(self, dataset: dict, example_index: int) -> dict:
+    def _build_test_sample(
+        self,
+        dataset: dict,
+        example_index: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> dict:
         pairs, shapes = self._context_pairs_for_test_example(dataset, example_index)
         query_problem = self._read_example_array(dataset, "inputs", example_index)
         query_solution = self._read_example_array(dataset, "labels", example_index)
@@ -343,7 +372,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
         pairs.append((query_problem, query_solution))
         shapes.append((query_input_shape, query_label_shape))
-        return self._build_pairs_sample(pairs, shapes, target_pair_index=len(pairs) - 1)
+        return self._build_pairs_sample(pairs, shapes, target_pair_index=len(pairs) - 1, rng=rng)
 
     def _collate_full_samples(
         self,
@@ -463,6 +492,8 @@ class PuzzleFullDataset(PuzzleDataset):
                     yield set_name, batch, self.config.global_batch_size
 
     def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
         for set_name, dataset in self._data.items():  # type: ignore
             start_index = 0
             total_examples = dataset["seq_offsets"].size - 1
@@ -476,7 +507,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
                 local_indices = np.arange(local_start, local_end, dtype=np.int64)
                 puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
-                samples = [self._build_test_sample(dataset, int(example_index)) for example_index in local_indices]
+                samples = [self._build_test_sample(dataset, int(example_index), rng=rng) for example_index in local_indices]
                 batch = self._collate_built_samples(
                     samples,
                     dataset["puzzle_identifiers"][puzzle_indices],

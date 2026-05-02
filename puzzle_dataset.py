@@ -159,6 +159,12 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # ARC full-context training built from one-pair examples.
     full_min_pairs: int = 3
     full_max_pairs: int = 8
+    full_answer_initial_mode: Literal["black", "noised_label"] = "black"
+    full_answer_initial_black_token_id: int = 2
+    full_answer_initial_gamma_min: float = 0.0
+    full_answer_initial_gamma_max: float = 1.0
+    full_answer_initial_noise_token_min: int = 2
+    full_answer_initial_noise_token_max: int = 11
 
     # Emit labels as only the answer tokens while keeping inputs full-length.
     answer_only_labels: bool = False
@@ -175,6 +181,36 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
         if self.full_max_pairs < self.full_min_pairs:
             raise ValueError(
                 f"full_max_pairs ({self.full_max_pairs}) must be >= full_min_pairs ({self.full_min_pairs})"
+            )
+        if self.full_answer_initial_black_token_id < 0:
+            raise ValueError(
+                "full_answer_initial_black_token_id must be >= 0, "
+                f"got {self.full_answer_initial_black_token_id}"
+            )
+        if not (0.0 <= self.full_answer_initial_gamma_min <= 1.0):
+            raise ValueError(
+                "full_answer_initial_gamma_min must be in [0, 1], "
+                f"got {self.full_answer_initial_gamma_min}"
+            )
+        if not (0.0 <= self.full_answer_initial_gamma_max <= 1.0):
+            raise ValueError(
+                "full_answer_initial_gamma_max must be in [0, 1], "
+                f"got {self.full_answer_initial_gamma_max}"
+            )
+        if self.full_answer_initial_gamma_min > self.full_answer_initial_gamma_max:
+            raise ValueError(
+                "full_answer_initial_gamma_min must be <= full_answer_initial_gamma_max, "
+                f"got {self.full_answer_initial_gamma_min} > {self.full_answer_initial_gamma_max}"
+            )
+        if self.full_answer_initial_noise_token_min < 0:
+            raise ValueError(
+                "full_answer_initial_noise_token_min must be >= 0, "
+                f"got {self.full_answer_initial_noise_token_min}"
+            )
+        if self.full_answer_initial_noise_token_max < self.full_answer_initial_noise_token_min:
+            raise ValueError(
+                "full_answer_initial_noise_token_max must be >= full_answer_initial_noise_token_min, "
+                f"got {self.full_answer_initial_noise_token_max} < {self.full_answer_initial_noise_token_min}"
             )
         return self
 

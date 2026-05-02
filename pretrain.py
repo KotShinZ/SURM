@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List, Tuple, Dict
+from typing import Optional, Any, Sequence, List, Tuple, Dict, Literal
 from dataclasses import dataclass
 import os
 import math
@@ -168,6 +168,12 @@ class PretrainConfig(pydantic.BaseModel):
     mask_full_training: bool = False
     full_min_pairs: int = 3
     full_max_pairs: int = 8
+    full_answer_initial_mode: Literal["black", "noised_label"] = "black"
+    full_answer_initial_black_token_id: int = 2
+    full_answer_initial_gamma_min: float = 1.0
+    full_answer_initial_gamma_max: float = 1.0
+    full_answer_initial_noise_token_min: int = 2
+    full_answer_initial_noise_token_max: int = 11
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
@@ -242,7 +248,7 @@ class ShuffledTestPuzzleFullDataset(PuzzleFullDataset):
 
                 local_indices = global_indices[local_start:local_end]
                 puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
-                samples = [self._build_test_sample(dataset, int(example_index)) for example_index in local_indices]
+                samples = [self._build_test_sample(dataset, int(example_index), rng=rng) for example_index in local_indices]
                 batch = self._collate_built_samples(
                     samples,
                     dataset["puzzle_identifiers"][puzzle_indices],
@@ -274,6 +280,12 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             arc_output_mask=arc_output_mask,
             full_min_pairs=config.full_min_pairs,
             full_max_pairs=config.full_max_pairs,
+            full_answer_initial_mode=config.full_answer_initial_mode,
+            full_answer_initial_black_token_id=config.full_answer_initial_black_token_id,
+            full_answer_initial_gamma_min=config.full_answer_initial_gamma_min,
+            full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
+            full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
+            full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
             answer_only_labels=bool(getattr(config.arch, "answer_only", False)),
             **kwargs,
         ),
