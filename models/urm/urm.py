@@ -92,6 +92,7 @@ class URMConfig(BaseModel):
     forward_dtype: str = "bfloat16"
     use_act: bool = True
     input_embedding_noise_size: float = 0.0
+    input_injection_enabled: bool = True
     noise_size: float = 0.0
     noise_seed: int = 42
     norm_diff_max: float = 0.2
@@ -683,6 +684,11 @@ class URM_Inner(nn.Module):
             return None
         return batch["seq_lengths"].to(torch.int32) + self.puzzle_emb_len
 
+    def _inject_inputs(self, hidden_states: torch.Tensor, input_embeddings: torch.Tensor) -> torch.Tensor:
+        if not self.config.input_injection_enabled:
+            return hidden_states
+        return hidden_states + input_embeddings
+
     def forward(
         self,
         carry: URMCarry,
@@ -702,7 +708,7 @@ class URM_Inner(nn.Module):
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
+                        hidden_states = self._inject_inputs(hidden_states, input_embeddings)
                         for layer in self.layers:
                             hidden_states = layer(hidden_states=hidden_states, **seq_info)
                         if self.config.noise_size > 0:
@@ -731,7 +737,7 @@ class URM_Inner(nn.Module):
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
         for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings # + (torch.randn_like(hidden_states) * 2 - 1)
+            hidden_states = self._inject_inputs(hidden_states, input_embeddings)
             for layer in self.layers:
                 pre_hidden_states = hidden_states
                 hidden_states = layer(hidden_states=pre_hidden_states, **seq_info)
@@ -777,7 +783,7 @@ class URM_Inner(nn.Module):
             with torch.no_grad():
                 for _ in range(self.config.H_cycles - 1):
                     for _ in range(self.config.L_cycles):
-                        hidden_states = hidden_states + input_embeddings
+                        hidden_states = self._inject_inputs(hidden_states, input_embeddings)
                         for layer in self.layers:
                             hidden_states = layer.forward_packed(
                                 cos_sin=cos_sin,
@@ -810,7 +816,7 @@ class URM_Inner(nn.Module):
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
         for _ in range(self.config.L_cycles):
-            hidden_states = hidden_states + input_embeddings
+            hidden_states = self._inject_inputs(hidden_states, input_embeddings)
             for layer in self.layers:
                 pre_hidden_states = hidden_states
                 hidden_states = layer.forward_packed(
@@ -873,7 +879,10 @@ class URM_Inner(nn.Module):
             return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
 
         context_indices = self._packed_context_indices(hidden_states, answer_indices)
-        context_states = hidden_states[context_indices] + input_embeddings[context_indices]
+        context_states = self._inject_inputs(
+            hidden_states[context_indices],
+            input_embeddings[context_indices],
+        )
         context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
         for layer in self.context_layers:
             context_states = layer.forward_packed(
@@ -887,7 +896,10 @@ class URM_Inner(nn.Module):
             answer_cos_sin = self._slice_packed_cos_sin(cos_sin, answer_indices)
             for _ in range(self.config.L_cycles):
                 states = states.clone()
-                states[answer_indices] = states[answer_indices] + input_embeddings[answer_indices]
+                states[answer_indices] = self._inject_inputs(
+                    states[answer_indices],
+                    input_embeddings[answer_indices],
+                )
                 for layer in self.layers:
                     kv_states = states.clone()
                     kv_states[context_indices] = context_states

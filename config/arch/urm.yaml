@@ -50,5 +50,6 @@ use_act: False
 norm_diff_max: 0.1
 norm_diff_min: 0.001
 input_embedding_noise_size: 0.0
+input_injection_enabled: True
 noise_size: 0.0
 noise_seed: 42
