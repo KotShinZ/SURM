@@ -52,13 +52,13 @@ python -m data.build_arc_dataset \
   --test-set-name evaluation
 
 # ARC-AGI-1-full
-python -m data.build_arc_dataset_full \
+python -m data.build_arc_dataset \
   --input-file-prefix kaggle/combined/arc-agi \
-  --output-dir data/arc1concept-full-aug-1000-nopadding-13_2 \
+  --output-dir data/arc1-full-aug-1000 \
   --subsets training evaluation concept \
   --test-set-name evaluation \
   --no-padding \
-  --no-padding-mode sample
+  --sources ARC-AGI1 ARC-AGI2 ARC-GEN1 ARC-GEN2
 
 # pair ごとの最小キャンバスで詰め、EOS は残す
 python -m data.build_arc_dataset_full \

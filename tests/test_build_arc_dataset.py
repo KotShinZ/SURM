@@ -79,6 +79,21 @@ class BuildARCDatasetTests(unittest.TestCase):
         with open(prefix.parent / f"{prefix.name}_{subset_name}-solutions.json", "w", encoding="utf-8") as f:
             json.dump(solution_puzzles, f)
 
+    def test_num_aug_all_sets_source_defaults_and_allows_overrides(self) -> None:
+        config = DataProcessConfig(
+            input_file_prefix="arc",
+            output_dir="dataset",
+            subsets=["training"],
+            test_set_name="evaluation",
+            num_aug_all=7,
+            num_aug={"ARC-AGI2": 3},
+        )
+
+        self.assertEqual(config.num_aug.ARC_AGI1, 7)
+        self.assertEqual(config.num_aug.ARC_AGI2, 3)
+        self.assertEqual(config.num_aug.ARC_GEN1, 7)
+        self.assertEqual(config.num_aug.ARC_GEN2, 7)
+
     def test_arc_gen_examples_are_merged_into_training_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -262,6 +277,75 @@ class BuildARCDatasetTests(unittest.TestCase):
             self.assertEqual(inputs.shape, (3, 900))
             np.testing.assert_array_equal(puzzle_indices, np.array([0, 3], dtype=np.int32))
             np.testing.assert_array_equal(group_indices, np.array([0, 1], dtype=np.int32))
+
+    def test_explicit_sources_share_groups_by_task_id_and_use_source_aug_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+            arc_gen1_dir = tmp_path / "arc-gen1"
+            arc_gen2_dir = tmp_path / "arc-gen2"
+            arc_gen1_dir.mkdir()
+            arc_gen2_dir.mkdir()
+
+            self._write_subset(
+                input_prefix,
+                "training",
+                {
+                    "p_shared": {
+                        "train": [{"input": [[1]], "output": [[2]]}],
+                        "test": [{"input": [[3]]}],
+                    }
+                },
+                {"p_shared": [[[4]]]},
+            )
+            self._write_subset(
+                input_prefix,
+                "training2",
+                {
+                    "p_shared": {
+                        "train": [{"input": [[5]], "output": [[6]]}],
+                        "test": [{"input": [[7]]}],
+                    }
+                },
+                {"p_shared": [[[8]]]},
+            )
+
+            with open(arc_gen1_dir / "p_shared.json", "w", encoding="utf-8") as f:
+                json.dump([{"input": [[1]], "output": [[3]]}], f)
+            with open(arc_gen2_dir / "p_shared.json", "w", encoding="utf-8") as f:
+                json.dump([{"input": [[2]], "output": [[4]]}], f)
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["training"],
+                    test_set_name="evaluation",
+                    seed=0,
+                    sources=["ARC-AGI1", "ARC-AGI2", "ARC-GEN1", "ARC-GEN2"],
+                    num_aug={
+                        "ARC-AGI1": 0,
+                        "ARC-AGI2": 0,
+                        "ARC-GEN1": 2,
+                        "ARC-GEN2": 0,
+                    },
+                    no_padding=False,
+                    arc_gen_dir=str(arc_gen1_dir),
+                    arc_gen2_dir=str(arc_gen2_dir),
+                )
+            )
+
+            inputs = np.load(output_dir / "train" / "all__inputs.npy")
+            puzzle_indices = np.load(output_dir / "train" / "all__puzzle_indices.npy")
+            group_indices = np.load(output_dir / "train" / "all__group_indices.npy")
+
+            self.assertEqual(inputs.shape, (7, 900))
+            np.testing.assert_array_equal(
+                puzzle_indices,
+                np.array([0, 2, 4, 5, 6, 7], dtype=np.int32),
+            )
+            np.testing.assert_array_equal(group_indices, np.array([0, 5], dtype=np.int32))
 
     def test_test_split_writes_attached_examples_only_for_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
