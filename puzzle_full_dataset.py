@@ -207,9 +207,12 @@ class PuzzleFullDataset(PuzzleDataset):
         if rng is None:
             raise ValueError("noised_label answer initialization requires an rng.")
 
-        gamma_min = float(self.config.full_answer_initial_gamma_min)
-        gamma_max = float(self.config.full_answer_initial_gamma_max)
-        gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
+        if self.split == "train":
+            gamma_min = float(self.config.full_answer_initial_gamma_min)
+            gamma_max = float(self.config.full_answer_initial_gamma_max)
+            gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
+        else:
+            gamma = 0.0
         noise_min = int(self.config.full_answer_initial_noise_token_min)
         noise_max = int(self.config.full_answer_initial_noise_token_max)
         epsilon = rng.integers(noise_min, noise_max + 1, size=solution.shape, dtype=np.int32)
