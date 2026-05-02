@@ -187,6 +187,8 @@ class TrainState:
     accum_step: int = 0
     accum_carries: Optional[List[Any]] = None
     accum_metrics: Optional[Dict[str, torch.Tensor]] = None
+    train_time_h: float = 0.0
+    last_step_time_h: Optional[float] = None
 
 
 class ShuffledTestPuzzleDataset(PuzzleDataset):
@@ -488,6 +490,8 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     os.makedirs(config.checkpoint_path, exist_ok=True)
     state = {
         "step": train_state.step,
+        "train_time_h": train_state.train_time_h,
+        "last_step_time_h": train_state.last_step_time_h,
         "model_state_dict": train_state.model.state_dict(),
         "optimizer_states": [optim.state_dict() for optim in train_state.optimizers],
     }
@@ -636,6 +640,12 @@ def _load_checkpoint_payload(load_path: str, checkpoint_path: Optional[str], ran
         state_dict = checkpoint["model_state_dict"]
         optimizer_states = checkpoint.get("optimizer_states")
         step = checkpoint.get("step")
+        train_time_h = checkpoint.get("train_time_h")
+        last_step_time_h = checkpoint.get("last_step_time_h")
+        if train_time_h is None and checkpoint.get("train_time_s") is not None:
+            train_time_h = float(checkpoint["train_time_s"]) / 3600.0
+        if last_step_time_h is None and checkpoint.get("last_step_time_s") is not None:
+            last_step_time_h = float(checkpoint["last_step_time_s"]) / 3600.0
         rng_state = checkpoint.get("rng_state")
         cuda_rng_state = checkpoint.get("cuda_rng_state")
     else:
@@ -643,10 +653,12 @@ def _load_checkpoint_payload(load_path: str, checkpoint_path: Optional[str], ran
         state_dict = checkpoint
         optimizer_states = None
         step = None
+        train_time_h = None
+        last_step_time_h = None
         rng_state = None
         cuda_rng_state = None
 
-    return state_dict, optimizer_states, step, rng_state, cuda_rng_state
+    return state_dict, optimizer_states, step, train_time_h, last_step_time_h, rng_state, cuda_rng_state
 
 
 def _load_model_state(train_state: TrainState, config: PretrainConfig, state_dict: dict, rank: int):
@@ -672,7 +684,7 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
     if load_path is None:
         return
 
-    state_dict, optimizer_states, step, rng_state, cuda_rng_state = _load_checkpoint_payload(
+    state_dict, optimizer_states, step, train_time_h, last_step_time_h, rng_state, cuda_rng_state = _load_checkpoint_payload(
         load_path, checkpoint_path=config.checkpoint_path, rank=rank
     )
     _load_model_state(train_state, config, state_dict, rank)
@@ -692,6 +704,10 @@ def load_checkpoint(train_state: TrainState, config: PretrainConfig, rank: int):
 
     if step is not None:
         train_state.step = int(step)
+    if train_time_h is not None:
+        train_state.train_time_h = float(train_time_h)
+    if last_step_time_h is not None:
+        train_state.last_step_time_h = float(last_step_time_h)
 
     # Reset carry since we do not serialize it
     train_state.carry = None
@@ -731,7 +747,7 @@ def load_checkpoint_file(train_state: TrainState, config: PretrainConfig, rank: 
     if load_path is None:
         return
 
-    state_dict, _, _, _, _ = _load_checkpoint_payload(
+    state_dict, _, _, _, _, _, _ = _load_checkpoint_payload(
         load_path, checkpoint_path=config.checkpoint_path, rank=rank
     )
     _load_model_state(train_state, config, state_dict, rank)
@@ -789,6 +805,81 @@ def _get_puzzle_embedding_module(module: nn.Module):
         if hasattr(candidate, "puzzle_emb"):
             return candidate.puzzle_emb
     return None
+
+
+def _get_metric_value(metrics: Dict[str, Any], keys: Sequence[str]) -> Optional[float]:
+    for key in keys:
+        value = metrics.get(key)
+        if value is not None:
+            return float(value)
+
+        if "/" in key:
+            nested = metrics
+            for part in key.split("/"):
+                if not isinstance(nested, dict) or part not in nested:
+                    nested = None
+                    break
+                nested = nested[part]
+            if nested is not None:
+                return float(nested)
+
+    return None
+
+
+def _add_time_axis_metrics(
+    train_state: TrainState,
+    metrics: Dict[str, Any],
+    metric_specs: Sequence[Tuple[str, Sequence[str]]],
+) -> None:
+    metrics["time/total_train_time_h"] = train_state.train_time_h
+
+    for output_key, source_keys in metric_specs:
+        value = _get_metric_value(metrics, source_keys)
+        if value is not None:
+            metrics[f"time/{output_key}"] = value
+
+
+def _add_train_timing_metrics(train_state: TrainState, metrics: Dict[str, Any], prefix: str = "train") -> None:
+    metrics[f"{prefix}/total_train_time_h"] = train_state.train_time_h
+    metrics[f"{prefix}/avg_step_time_h"] = train_state.train_time_h / max(train_state.step, 1)
+    if train_state.last_step_time_h is not None:
+        metrics[f"{prefix}/step_time_h"] = train_state.last_step_time_h
+
+    _add_time_axis_metrics(
+        train_state,
+        metrics,
+        (
+            ("train_lm_loss", ("train/lm_loss",)),
+            ("train_accuracy", ("train/accuracy",)),
+            ("train_exact_accuracy", ("train/exact_accuracy",)),
+        ),
+    )
+
+
+def _add_eval_timing_metrics(train_state: TrainState, metrics: Dict[str, Any]) -> None:
+    metrics["train/total_train_time_h"] = train_state.train_time_h
+    metrics["train/avg_step_time_h"] = train_state.train_time_h / max(train_state.step, 1)
+    if train_state.last_step_time_h is not None:
+        metrics["train/step_time_h"] = train_state.last_step_time_h
+
+    _add_time_axis_metrics(
+        train_state,
+        metrics,
+        (
+            (
+                "all_accuracy",
+                ("all_accuracy", "all/accuracy", "eval/all_accuracy", "eval/all/accuracy"),
+            ),
+            (
+                "all_lm_loss",
+                ("all_lm_loss", "all/lm_loss", "eval/all_lm_loss", "eval/all/lm_loss"),
+            ),
+            (
+                "all_exact_accuracy",
+                ("all_exact_accuracy", "all/exact_accuracy", "eval/all_exact_accuracy", "eval/all/exact_accuracy"),
+            ),
+        ),
+    )
 
 
 def train_batch(
@@ -1421,6 +1512,8 @@ def launch(hydra_config: DictConfig):
             mode=wandb_mode,
             settings=wandb.Settings(_disable_stats=True),
         )
+        wandb.define_metric("time/total_train_time_h")
+        wandb.define_metric("time/*", step_metric="time/total_train_time_h")
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config, config.checkpoint_path)
         
@@ -1486,6 +1579,7 @@ def launch(hydra_config: DictConfig):
                     early_eval=True,
                 )
                 if RANK == 0 and metrics is not None:
+                    _add_eval_timing_metrics(train_state, metrics)
                     wandb.log(metrics, step=train_state.step)
 
             if loop_config is not None:
@@ -1496,18 +1590,37 @@ def launch(hydra_config: DictConfig):
 
         ############ Train Iter
         train_state.model.train()
+        active_train_step_start_s = None
 
         for set_name, batch, global_batch_size in train_loader:
+            if train_state.accum_step == 0:
+                torch.cuda.synchronize()
+                active_train_step_start_s = time.perf_counter()
+
+            before_step = train_state.step
             metrics = train_batch(
                 config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE
             )
+            stepped = train_state.step > before_step
 
             # EMA update
-            if metrics is not None and config.ema and ema_helper is not None:
+            if stepped and config.ema and ema_helper is not None:
                 ema_helper.update(train_state.model)
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+            if stepped:
+                torch.cuda.synchronize()
+                if active_train_step_start_s is not None:
+                    step_time_h = (time.perf_counter() - active_train_step_start_s) / 3600.0
+                    train_state.last_step_time_h = step_time_h
+                    train_state.train_time_h += step_time_h
+                active_train_step_start_s = None
+
+            if RANK == 0 and stepped:
+                if train_state.step % 10 == 0 or train_state.step >= train_state.total_steps:
+                    if metrics is None:
+                        metrics = {}
+                    _add_train_timing_metrics(train_state, metrics)
+                    wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)
 
         ############ Evaluation
@@ -1543,6 +1656,7 @@ def launch(hydra_config: DictConfig):
                     early_eval=True,
                 )
                 if RANK == 0 and metrics is not None:
+                    _add_eval_timing_metrics(train_state, metrics)
                     wandb.log(metrics, step=train_state.step)
 
             if loop_config is not None:
