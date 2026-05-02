@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 from dataclasses import dataclass
 import os
 import json
@@ -6,13 +6,39 @@ import hashlib
 import numpy as np
 
 from argdantic import ArgParser
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from tqdm import tqdm
 
 from data.common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
 
 cli = ArgParser()
+
+
+class SourceNumAugConfig(BaseModel):
+    ARC_AGI1: int = 1000
+    ARC_AGI2: int = 1000
+    ARC_GEN1: int = 1000
+    ARC_GEN2: int = 1000
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_source_keys(cls, value):
+        if isinstance(value, int):
+            return {
+                "ARC_AGI1": value,
+                "ARC_AGI2": value,
+                "ARC_GEN1": value,
+                "ARC_GEN2": value,
+            }
+
+        if isinstance(value, dict):
+            normalized = {}
+            for key, item in value.items():
+                normalized[str(key).upper().replace("-", "_")] = item
+            return normalized
+
+        return value
 
 
 class DataProcessConfig(BaseModel):
@@ -23,17 +49,53 @@ class DataProcessConfig(BaseModel):
     test_set_name: str
 
     seed: int = 42
-    num_aug: int = 1000
+    sources: Optional[List[str]] = None
+    num_aug_all: Optional[int] = None
+    num_aug: SourceNumAugConfig = Field(default_factory=SourceNumAugConfig)
     num_aug_gen: Optional[int] = None
     no_padding: bool = False
     include_arc_gen: bool = False
     arc_gen_dir: Optional[str] = "data/arc-gen"
+    arc_gen2_dir: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_num_aug_all(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        num_aug_all = value.get("num_aug_all")
+        if num_aug_all is None:
+            return value
+
+        configured_num_aug = value.get("num_aug")
+        if isinstance(configured_num_aug, int):
+            return value
+
+        merged_num_aug = {
+            "ARC_AGI1": num_aug_all,
+            "ARC_AGI2": num_aug_all,
+            "ARC_GEN1": num_aug_all,
+            "ARC_GEN2": num_aug_all,
+        }
+        if isinstance(configured_num_aug, dict):
+            merged_num_aug.update(configured_num_aug)
+
+        value = dict(value)
+        value["num_aug"] = merged_num_aug
+        return value
     
     
 ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
 
 PuzzleIdSeparator = "|||"
+
+ARC_AGI1_SOURCE = "ARC-AGI1"
+ARC_AGI2_SOURCE = "ARC-AGI2"
+ARC_GEN1_SOURCE = "ARC-GEN1"
+ARC_GEN2_SOURCE = "ARC-GEN2"
+ARC_SOURCES = {ARC_AGI1_SOURCE, ARC_AGI2_SOURCE, ARC_GEN1_SOURCE, ARC_GEN2_SOURCE}
 
 _ARC_TOKEN_BG_COLORS = {
     2: 16,   # ARC color 0: black
@@ -449,10 +511,105 @@ def puzzle_hash(puzzle: dict):
     return hashlib.sha256("|".join(hashes).encode()).hexdigest()
 
 
-def load_arc_gen_puzzles(arc_gen_dir: str):
+def _normalize_arc_source(source: str) -> str:
+    source = source.upper().replace("_", "-")
+    aliases = {
+        "ARC-AGI": ARC_AGI1_SOURCE,
+        "ARC-AGI-1": ARC_AGI1_SOURCE,
+        "ARC-AGI1": ARC_AGI1_SOURCE,
+        "ARC-AGI-2": ARC_AGI2_SOURCE,
+        "ARC-AGI2": ARC_AGI2_SOURCE,
+        "ARC-GEN": ARC_GEN1_SOURCE,
+        "ARC-GEN-1": ARC_GEN1_SOURCE,
+        "ARC-GEN1": ARC_GEN1_SOURCE,
+        "ARC-GEN-2": ARC_GEN2_SOURCE,
+        "ARC-GEN2": ARC_GEN2_SOURCE,
+    }
+    normalized = aliases.get(source)
+    if normalized is None:
+        raise ValueError(
+            f"Unknown ARC source '{source}'. Expected one of {sorted(ARC_SOURCES)}"
+        )
+    return normalized
+
+
+def _normalized_sources(config: DataProcessConfig) -> List[str]:
+    configured_sources = config.sources or [ARC_AGI1_SOURCE]
+    return [_normalize_arc_source(source) for source in configured_sources]
+
+
+def _num_aug_for_source(config: DataProcessConfig, source: str) -> int:
+    if source.startswith("ARC-GEN") and config.num_aug_gen is not None:
+        return config.num_aug_gen
+
+    return getattr(config.num_aug, source.replace("-", "_"))
+
+
+def _arc_agi_subset_for_source(subset_name: str, source: str) -> Optional[str]:
+    if source == ARC_AGI1_SOURCE:
+        if subset_name.endswith("2"):
+            return None
+        return subset_name
+
+    if source == ARC_AGI2_SOURCE:
+        if subset_name in {"training", "evaluation"}:
+            return f"{subset_name}2"
+        return subset_name
+
+    raise ValueError(f"{source} is not an ARC-AGI source")
+
+
+def _test_set_name_for_source(test_set_name: str, source: str) -> str:
+    if source == ARC_AGI2_SOURCE and test_set_name == "evaluation":
+        return "evaluation2"
+    return test_set_name
+
+
+def _load_arc_agi_task_ids(input_file_prefix: str, source: str) -> Set[str]:
+    task_ids: Set[str] = set()
+    source_subsets = ["training", "evaluation", "concept"] if source == ARC_AGI1_SOURCE else ["training2", "evaluation2"]
+
+    for subset_name in source_subsets:
+        path = f"{input_file_prefix}_{subset_name}-challenges.json"
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r") as f:
+            task_ids.update(json.load(f).keys())
+
+    return task_ids
+
+
+def _load_arc_gen_task_ids_by_version(arc_gen_root: str = "ARC-GEN") -> Dict[str, Set[str]]:
+    task_list_path = os.path.join(arc_gen_root, "task_list.py")
+    if not os.path.isfile(task_list_path):
+        return {}
+
+    task_ids_by_version = {ARC_GEN1_SOURCE: set(), ARC_GEN2_SOURCE: set()}
+    current_source = None
+    with open(task_list_path, "r") as f:
+        for line in f:
+            if line.strip() == "# V1 Tasks":
+                current_source = ARC_GEN1_SOURCE
+                continue
+            if line.strip() == "# V2 Tasks":
+                current_source = ARC_GEN2_SOURCE
+                continue
+            if current_source is None:
+                continue
+            stripped = line.strip()
+            if not stripped.startswith("from tasks import task_"):
+                continue
+            task_id = stripped.split("task_", 1)[1].split()[0]
+            task_ids_by_version[current_source].add(task_id)
+
+    return task_ids_by_version
+
+
+def load_arc_gen_puzzles(arc_gen_dir: str, allowed_task_ids: Optional[Set[str]] = None):
     arc_gen_puzzles = {}
     total_examples = 0
     removed_examples = 0
+    skipped_puzzles = 0
 
     for file_name in tqdm(
         sorted(os.listdir(arc_gen_dir)),
@@ -462,6 +619,10 @@ def load_arc_gen_puzzles(arc_gen_dir: str):
             continue
 
         puzzle_id = os.path.splitext(file_name)[0]
+        if allowed_task_ids is not None and puzzle_id not in allowed_task_ids:
+            skipped_puzzles += 1
+            continue
+
         with open(os.path.join(arc_gen_dir, file_name), "r") as f:
             examples = json.load(f)
 
@@ -490,6 +651,8 @@ def load_arc_gen_puzzles(arc_gen_dir: str):
         f"Loaded {len(arc_gen_puzzles)} arc-gen puzzles with "
         f"{total_examples} generated train examples from {arc_gen_dir}"
     )
+    if skipped_puzzles > 0:
+        print(f"Skipped {skipped_puzzles} arc-gen puzzles outside the requested source")
     if removed_examples > 0:
         print(
             f"Filtered out {removed_examples} arc-gen examples with size >= "
@@ -632,150 +795,293 @@ def convert_single_arc_puzzle(
     )
 
 
+def convert_arc_source_puzzle_to_groups(
+    name: str,
+    puzzle: dict,
+    source: str,
+    aug_count: int,
+    dest_mapping: Dict[str, Tuple[str, str]],
+    extra_train_examples: Optional[List[dict]] = None,
+):
+    dests = set(dest_mapping.values())
+    converted = {dest: ARCPuzzle(f"{source}:{name}", []) for dest in dests}
+
+    source_train_examples = [
+        (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+        for example in puzzle.get("train", [])
+    ]
+    for example_type, examples in puzzle.items():
+        if len(examples) == 0 or example_type not in dest_mapping:
+            continue
+
+        dest = dest_mapping[example_type]
+        converted[dest].examples.extend(
+            [
+                (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+                for example in examples
+            ]
+        )
+        if dest[0] == "test":
+            converted[dest].context_examples = list(source_train_examples)
+
+    train_dest = dest_mapping.get("train")
+    if extra_train_examples and train_dest is not None:
+        converted.setdefault(train_dest, ARCPuzzle(f"{source}:{name}", []))
+        converted[train_dest].examples.extend(
+            [
+                (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+                for example in extra_train_examples
+            ]
+        )
+
+    converted = {
+        dest: converted_puzzle
+        for dest, converted_puzzle in converted.items()
+        if converted_puzzle.examples
+    }
+    return build_augmented_puzzle_family(
+        f"{source}:{name}",
+        converted,
+        aug_count,
+    )
+
+
+def convert_arc_gen_source_puzzle_to_groups(
+    name: str,
+    examples: List[dict],
+    source: str,
+    aug_count: int,
+    train_dest: Tuple[str, str],
+):
+    converted = {
+        train_dest: ARCPuzzle(
+            f"{source}:{name}",
+            [
+                (arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"]))
+                for example in examples
+            ],
+        )
+    }
+    return build_augmented_puzzle_family(
+        f"{source}:{name}",
+        converted,
+        aug_count,
+    )
+
+
+def _append_groups_by_task(
+    grouped_results: Dict[Tuple[str, str], Dict[str, List[ARCPuzzle]]],
+    task_id: str,
+    groups_by_dest: Dict[Tuple[str, str], List[ARCPuzzle]],
+):
+    for dest, group in groups_by_dest.items():
+        grouped_results.setdefault(dest, {})
+        grouped_results[dest].setdefault(task_id, [])
+        grouped_results[dest][task_id].extend(group)
+
+
+def _materialize_grouped_results(
+    grouped_results: Dict[Tuple[str, str], Dict[str, List[ARCPuzzle]]],
+):
+    results = {}
+    for (split_name, set_name), groups_by_task in grouped_results.items():
+        results.setdefault(split_name, {})
+        results[split_name][set_name] = list(groups_by_task.values())
+    return results
+
+
 def load_puzzles_arcagi(config: DataProcessConfig):
     train_examples_dest = ("train", "all")
-    test_examples_map = {
-        config.test_set_name: [(1.0, ("test", "all"))],
-        "_default": [(1.0, ("train", "all"))]
-    }
-    
+    sources = _normalized_sources(config)
+    print(f"Using ARC sources: {sources}")
+
     test_puzzles = {}
-    results = {}
+    grouped_results = {}
+    legacy_arc_gen_puzzles = {}
+    use_legacy_arc_gen_merge = config.include_arc_gen and (
+        config.sources is None
+        or [_normalize_arc_source(source) for source in config.sources] == [ARC_AGI1_SOURCE]
+    )
 
-    total_source_groups = 0
-    output_group_counts = {}
-    output_puzzle_counts = {}
-
-    arc_gen_puzzles = {}
-    if "training" in config.subsets:
-        if not config.include_arc_gen:
-            print("ARC-GEN integration disabled by config, skipping")
+    if use_legacy_arc_gen_merge:
+        if config.arc_gen_dir and os.path.isdir(config.arc_gen_dir):
+            legacy_arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
         elif config.arc_gen_dir:
-            if os.path.isdir(config.arc_gen_dir):
-                arc_gen_puzzles = load_arc_gen_puzzles(config.arc_gen_dir)
-            else:
-                print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
+            print(f"arc-gen directory not found at {config.arc_gen_dir}, skipping")
         else:
             print("ARC-GEN integration enabled but no arc_gen_dir was provided, skipping")
 
-    for subset_name in config.subsets:
-        # Load all puzzles in this subset
-        with open(f"{config.input_file_prefix}_{subset_name}-challenges.json", "r") as f:
-            puzzles = json.load(f)
-            print (f"Loaded {len(puzzles)} puzzles from {subset_name} challenges")
+    for source in [source for source in sources if source.startswith("ARC-AGI")]:
+        test_set_name = _test_set_name_for_source(config.test_set_name, source)
+        test_examples_map = {
+            test_set_name: [(1.0, ("test", "all"))],
+            "_default": [(1.0, ("train", "all"))],
+        }
+        aug_count = _num_aug_for_source(config, source)
 
-        sols_filename = f"{config.input_file_prefix}_{subset_name}-solutions.json"
-        if os.path.isfile(sols_filename):
-            with open(sols_filename, "r") as f:
-                sols = json.load(f)
-                print (f"Loaded {len(sols)} solutions from {subset_name} solutions")
-                
-                for puzzle_id in puzzles.keys():
-                    for idx, sol_grid in enumerate(sols[puzzle_id]):
-                        puzzles[puzzle_id]["test"][idx]["output"] = sol_grid
-        else:
-            # Fill with dummy
-            print (f"{subset_name} solutions not found, filling with dummy")
+        for requested_subset_name in config.subsets:
+            subset_name = _arc_agi_subset_for_source(requested_subset_name, source)
+            if subset_name is None:
+                continue
 
-            for puzzle_id, puzzle in puzzles.items():
-                for example in puzzle["test"]:
-                    example.setdefault("output", [[0]])
+            challenges_filename = f"{config.input_file_prefix}_{subset_name}-challenges.json"
+            if not os.path.isfile(challenges_filename):
+                print(f"{source} subset '{subset_name}' not found at {challenges_filename}, skipping")
+                continue
 
-        arc_gen_enabled_for_subset = subset_name == "training" and bool(arc_gen_puzzles)
-        if arc_gen_enabled_for_subset:
-            matched_arc_gen_groups = sum(
-                1 for puzzle_id in puzzles.keys() if arc_gen_puzzles.get(puzzle_id)
+            with open(challenges_filename, "r") as f:
+                puzzles = json.load(f)
+                print(f"Loaded {len(puzzles)} {source} puzzles from {subset_name} challenges")
+
+            sols_filename = f"{config.input_file_prefix}_{subset_name}-solutions.json"
+            if os.path.isfile(sols_filename):
+                with open(sols_filename, "r") as f:
+                    sols = json.load(f)
+                    print(f"Loaded {len(sols)} {source} solutions from {subset_name} solutions")
+
+                    for puzzle_id in puzzles.keys():
+                        for idx, sol_grid in enumerate(sols[puzzle_id]):
+                            puzzles[puzzle_id]["test"][idx]["output"] = sol_grid
+            else:
+                print(f"{subset_name} solutions not found, filling with dummy")
+                for puzzle in puzzles.values():
+                    for example in puzzle["test"]:
+                        example.setdefault("output", [[0]])
+
+            legacy_arc_gen_enabled_for_subset = (
+                use_legacy_arc_gen_merge
+                and source == ARC_AGI1_SOURCE
+                and subset_name == "training"
+                and bool(legacy_arc_gen_puzzles)
             )
-            matched_arc_gen_seed_puzzles = sum(
-                len(arc_gen_puzzles[puzzle_id]) for puzzle_id in puzzles.keys() if arc_gen_puzzles.get(puzzle_id)
-            )
-            missing_arc_gen_groups = sum(
-                1 for puzzle_id in arc_gen_puzzles.keys() if puzzle_id not in puzzles
-            )
-            print(
-                f"ARC-GEN matched {matched_arc_gen_groups} training groups "
-                f"with {matched_arc_gen_seed_puzzles} seed puzzles before augmentation "
-                f"({missing_arc_gen_groups} unmatched puzzles)"
-            )
-            if config.num_aug_gen is not None and config.num_aug_gen != config.num_aug:
-                print(
-                    "num_aug_gen is ignored when merging ARC-GEN examples into ARC-AGI "
-                    "augmentation puzzles; using num_aug for puzzle count"
+            if legacy_arc_gen_enabled_for_subset:
+                matched_arc_gen_groups = sum(
+                    1 for puzzle_id in puzzles.keys() if legacy_arc_gen_puzzles.get(puzzle_id)
                 )
+                matched_arc_gen_seed_puzzles = sum(
+                    len(legacy_arc_gen_puzzles[puzzle_id])
+                    for puzzle_id in puzzles.keys()
+                    if legacy_arc_gen_puzzles.get(puzzle_id)
+                )
+                missing_arc_gen_groups = sum(
+                    1 for puzzle_id in legacy_arc_gen_puzzles.keys() if puzzle_id not in puzzles
+                )
+                print(
+                    f"ARC-GEN matched {matched_arc_gen_groups} training groups "
+                    f"with {matched_arc_gen_seed_puzzles} seed puzzles before augmentation "
+                    f"({missing_arc_gen_groups} unmatched puzzles)"
+                )
+                if (
+                    config.num_aug_gen is not None
+                    and config.num_aug_gen != _num_aug_for_source(config, ARC_AGI1_SOURCE)
+                ):
+                    print(
+                        "num_aug_gen is ignored when merging ARC-GEN examples into ARC-AGI "
+                        "augmentation puzzles; using num_aug for puzzle count"
+                    )
 
-        puzzles = filter_puzzles_by_size(
-            puzzles,
-            source_name=subset_name,
-            extra_train_examples_by_puzzle=arc_gen_puzzles if arc_gen_enabled_for_subset else None,
-        )
-
-        # Shuffle puzzles
-        puzzles = list(puzzles.items())
-        print (f"Shuffling {len(puzzles)} puzzles...")
-        np.random.shuffle(puzzles)
-
-        added_arc_gen_groups = 0
-        added_arc_gen_examples = 0
-        
-        # Assign by fraction
-        for idx, (name, puzzle) in tqdm(
-            enumerate(puzzles),
-            total=len(puzzles),
-            desc=f"Converting {subset_name}",
-        ):
-            fraction = idx / len(puzzles)
-            test_examples_dest = None
-            for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
-                if fraction < f:
-                    test_examples_dest = dest
-                    break
-                    
-            assert test_examples_dest is not None
-            
-            if test_examples_dest[0] == "test" and len(puzzle.get("test", [])) > 0:
-                test_puzzles[name] = puzzle
-
-            (
-                used_dests,
-                added_arc_gen_example_count,
-                _added_arc_gen_total_puzzle_count,
-                puzzle_counts_by_dest,
-            ) = convert_single_arc_puzzle(
-                results,
-                name,
-                puzzle,
-                config.num_aug,
-                {"train": train_examples_dest, "test": test_examples_dest},
-                arc_gen_examples=arc_gen_puzzles.get(name) if arc_gen_enabled_for_subset else None,
-                arc_gen_aug_count=(
-                    config.num_aug_gen
-                    if config.num_aug_gen is not None
-                    else config.num_aug
+            puzzles = filter_puzzles_by_size(
+                puzzles,
+                source_name=f"{source}/{subset_name}",
+                extra_train_examples_by_puzzle=(
+                    legacy_arc_gen_puzzles if legacy_arc_gen_enabled_for_subset else None
                 ),
             )
-            if used_dests:
-                total_source_groups += 1
-            for dest, num_puzzles in puzzle_counts_by_dest.items():
-                output_group_counts[dest] = output_group_counts.get(dest, 0) + 1
-                output_puzzle_counts[dest] = output_puzzle_counts.get(dest, 0) + num_puzzles
-            if added_arc_gen_example_count > 0:
-                added_arc_gen_groups += 1
-                added_arc_gen_examples += added_arc_gen_example_count
 
-        if arc_gen_enabled_for_subset:
-            print(
-                f"Merged {added_arc_gen_examples} ARC-GEN examples into "
-                f"{added_arc_gen_groups} training groups in subset '{subset_name}'"
+            puzzles = list(puzzles.items())
+            print(f"Shuffling {len(puzzles)} {source}/{subset_name} puzzles...")
+            np.random.shuffle(puzzles)
+
+            for idx, (name, puzzle) in tqdm(
+                enumerate(puzzles),
+                total=len(puzzles),
+                desc=f"Converting {source}/{subset_name}",
+            ):
+                fraction = idx / len(puzzles) if puzzles else 0.0
+                test_examples_dest = None
+                for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
+                    if fraction < f:
+                        test_examples_dest = dest
+                        break
+
+                assert test_examples_dest is not None
+
+                if test_examples_dest[0] == "test" and len(puzzle.get("test", [])) > 0:
+                    test_puzzles[name] = puzzle
+
+                groups_by_dest = convert_arc_source_puzzle_to_groups(
+                    name,
+                    puzzle,
+                    source,
+                    aug_count,
+                    {"train": train_examples_dest, "test": test_examples_dest},
+                    extra_train_examples=(
+                        legacy_arc_gen_puzzles.get(name)
+                        if legacy_arc_gen_enabled_for_subset
+                        else None
+                    ),
+                )
+                _append_groups_by_task(grouped_results, name, groups_by_dest)
+
+    arc_gen_sources = [source for source in sources if source.startswith("ARC-GEN")]
+    if arc_gen_sources:
+        arc_gen_task_ids_by_version = _load_arc_gen_task_ids_by_version()
+        fallback_task_ids = {
+            ARC_GEN1_SOURCE: _load_arc_agi_task_ids(config.input_file_prefix, ARC_AGI1_SOURCE),
+            ARC_GEN2_SOURCE: _load_arc_agi_task_ids(config.input_file_prefix, ARC_AGI2_SOURCE),
+        }
+
+        for source in arc_gen_sources:
+            arc_gen_dir = config.arc_gen2_dir if source == ARC_GEN2_SOURCE and config.arc_gen2_dir else config.arc_gen_dir
+            if not arc_gen_dir:
+                print(f"{source} requested but no arc-gen directory was provided, skipping")
+                continue
+            if not os.path.isdir(arc_gen_dir):
+                print(f"{source} directory not found at {arc_gen_dir}, skipping")
+                continue
+
+            default_arc_gen_dir = os.path.normpath(arc_gen_dir) == os.path.normpath("data/arc-gen")
+            allowed_task_ids = (
+                (arc_gen_task_ids_by_version.get(source) or fallback_task_ids[source])
+                if default_arc_gen_dir
+                else None
             )
+            arc_gen_puzzles = load_arc_gen_puzzles(arc_gen_dir, allowed_task_ids=allowed_task_ids)
+            aug_count = _num_aug_for_source(config, source)
 
-    print (f"Total source task groups: {total_source_groups}")
-    print (f"Source task groups with held-out test examples: {len(test_puzzles)}")
-    print (f"Source task groups routed only to train: {total_source_groups - len(test_puzzles)}")
-    for dest in sorted(output_group_counts):
-        print(
-            f"Output {dest[0]}/{dest[1]}: "
-            f"groups={output_group_counts[dest]}, puzzles={output_puzzle_counts[dest]}"
-        )
+            puzzles = list(arc_gen_puzzles.items())
+            print(f"Shuffling {len(puzzles)} {source} puzzles...")
+            np.random.shuffle(puzzles)
+
+            for name, examples in tqdm(puzzles, desc=f"Converting {source}"):
+                groups_by_dest = convert_arc_gen_source_puzzle_to_groups(
+                    name,
+                    examples,
+                    source,
+                    aug_count,
+                    train_examples_dest,
+                )
+                _append_groups_by_task(grouped_results, name, groups_by_dest)
+
+    results = _materialize_grouped_results(grouped_results)
+
+    total_source_groups = len(
+        {
+            task_id
+            for groups_by_task in grouped_results.values()
+            for task_id in groups_by_task.keys()
+        }
+    )
+    print(f"Total source task groups: {total_source_groups}")
+    print(f"Source task groups with held-out test examples: {len(test_puzzles)}")
+    print(f"Source task groups routed only to train: {total_source_groups - len(test_puzzles)}")
+    for split_name, split in sorted(results.items()):
+        for set_name, groups in sorted(split.items()):
+            puzzle_count = sum(len(group) for group in groups)
+            print(
+                f"Output {split_name}/{set_name}: "
+                f"groups={len(groups)}, puzzles={puzzle_count}"
+            )
     print("results keys:", results.keys())
     return results, test_puzzles
 

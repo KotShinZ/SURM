@@ -2,6 +2,7 @@ name: urm.urm_energy@URM
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  label_mask: 0.0
 
 loops: 16
 num_layers: 8
