@@ -83,8 +83,14 @@ arc_output_mask:
 # black: fill the target answer slot with ARC black token id 2.
 # noised_label: keep answer input tokens black, then initialize answer hidden states
 # inside URM as gamma * emb(label) + (1 - gamma) * epsilon.
+# gamma_distribution:
+#   uniform: gamma ~ U(gamma_min, gamma_max)
+#   logistic_normal: gamma = sigmoid(N(log_snr_mean, log_snr_std) / 2)
 # Evaluation uses gamma = 0.0 so label information is not mixed into inputs.
 full_answer_initial_mode: "black" # Literal["black", "noised_label"]
 full_answer_initial_black_token_id: 2
+full_answer_initial_gamma_distribution: "uniform" # Literal["uniform", "logistic_normal"]
 full_answer_initial_gamma_min: 0.0
 full_answer_initial_gamma_max: 1.0
+full_answer_initial_log_snr_mean: -6.0
+full_answer_initial_log_snr_std: 2.0

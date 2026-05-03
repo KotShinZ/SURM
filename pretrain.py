@@ -170,8 +170,11 @@ class PretrainConfig(pydantic.BaseModel):
     full_max_pairs: int = 8
     full_answer_initial_mode: Literal["black", "noised_label"] = "black"
     full_answer_initial_black_token_id: int = 2
+    full_answer_initial_gamma_distribution: Literal["uniform", "logistic_normal"] = "uniform"
     full_answer_initial_gamma_min: float = 0.0
     full_answer_initial_gamma_max: float = 1.0
+    full_answer_initial_log_snr_mean: float = -6.0
+    full_answer_initial_log_snr_std: float = 2.0
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
@@ -280,8 +283,11 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_max_pairs=config.full_max_pairs,
             full_answer_initial_mode=config.full_answer_initial_mode,
             full_answer_initial_black_token_id=config.full_answer_initial_black_token_id,
+            full_answer_initial_gamma_distribution=config.full_answer_initial_gamma_distribution,
             full_answer_initial_gamma_min=config.full_answer_initial_gamma_min,
             full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
+            full_answer_initial_log_snr_mean=config.full_answer_initial_log_snr_mean,
+            full_answer_initial_log_snr_std=config.full_answer_initial_log_snr_std,
             answer_only_labels=bool(getattr(config.arch, "answer_only", False)),
             **kwargs,
         ),

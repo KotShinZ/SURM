@@ -209,9 +209,21 @@ class PuzzleFullDataset(PuzzleDataset):
         else:
             if rng is None:
                 raise ValueError("noised_label answer initialization requires an rng.")
-            gamma_min = float(self.config.full_answer_initial_gamma_min)
-            gamma_max = float(self.config.full_answer_initial_gamma_max)
-            gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
+            distribution = self.config.full_answer_initial_gamma_distribution
+            if distribution == "uniform":
+                gamma_min = float(self.config.full_answer_initial_gamma_min)
+                gamma_max = float(self.config.full_answer_initial_gamma_max)
+                gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
+            elif distribution == "logistic_normal":
+                log_snr = float(
+                    rng.normal(
+                        loc=float(self.config.full_answer_initial_log_snr_mean),
+                        scale=float(self.config.full_answer_initial_log_snr_std),
+                    )
+                )
+                gamma = 1.0 / (1.0 + math.exp(-0.5 * log_snr))
+            else:
+                raise ValueError(f"Unknown full_answer_initial_gamma_distribution: {distribution}")
         return np.array(gamma, dtype=np.float32)
 
     def _build_pairs_sample(
