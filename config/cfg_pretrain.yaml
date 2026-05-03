@@ -87,6 +87,8 @@ arc_output_mask:
 #   uniform: gamma ~ U(gamma_min, gamma_max)
 #   logistic_normal: gamma = sigmoid(N(log_snr_mean, log_snr_std) / 2)
 # Evaluation uses gamma = 0.0 so label information is not mixed into inputs.
+# During noised_label evaluation, each recurrent loop enters with:
+#   mix_ratio * hidden_after_model + (1 - mix_ratio) * hidden_before_model
 full_answer_initial_mode: "black" # Literal["black", "noised_label"]
 full_answer_initial_black_token_id: 2
 full_answer_initial_gamma_distribution: "uniform" # Literal["uniform", "logistic_normal"]
@@ -94,3 +96,4 @@ full_answer_initial_gamma_min: 0.0
 full_answer_initial_gamma_max: 1.0
 full_answer_initial_log_snr_mean: -6.0
 full_answer_initial_log_snr_std: 2.0
+full_answer_initial_eval_hidden_mix_ratio: 1.0

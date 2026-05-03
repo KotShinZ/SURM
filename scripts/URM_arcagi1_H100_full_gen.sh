@@ -22,7 +22,8 @@ weight_decay=0.1 \
 +ema=True \
 evaluators="[]" \
 +mask_full_training=True \
-full_answer_initial_mode="black" \
+full_answer_initial_mode="noised_label" \
+full_answer_initial_gamma_distribution="uniform" \
 full_answer_initial_gamma_min=0.0 \
 full_answer_initial_gamma_max=0.0
 # --load_checkpoint_file checkpoints/URM-nca2d/step_13020.pt

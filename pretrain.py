@@ -1,5 +1,5 @@
 from typing import Optional, Any, Sequence, List, Tuple, Dict, Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import math
 import json
@@ -175,10 +175,20 @@ class PretrainConfig(pydantic.BaseModel):
     full_answer_initial_gamma_max: float = 1.0
     full_answer_initial_log_snr_mean: float = -6.0
     full_answer_initial_log_snr_std: float = 2.0
+    full_answer_initial_eval_hidden_mix_ratio: float = 1.0
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
     benchmark_warmup_steps: int = 1
+
+    @pydantic.model_validator(mode="after")
+    def _validate_full_answer_initial_eval_hidden_mix_ratio(self):
+        if not (0.0 <= self.full_answer_initial_eval_hidden_mix_ratio <= 1.0):
+            raise ValueError(
+                "full_answer_initial_eval_hidden_mix_ratio must be in [0, 1], "
+                f"got {self.full_answer_initial_eval_hidden_mix_ratio}"
+            )
+        return self
 
 
 
@@ -196,6 +206,35 @@ class TrainState:
     accum_metrics: Optional[Dict[str, torch.Tensor]] = None
     train_time_h: float = 0.0
     last_step_time_h: Optional[float] = None
+
+
+def _maybe_mix_noised_label_eval_carry(
+    config: PretrainConfig,
+    before_carry: Any,
+    after_carry: Any,
+) -> Any:
+    if config.full_answer_initial_mode != "noised_label":
+        return after_carry
+
+    ratio = float(config.full_answer_initial_eval_hidden_mix_ratio)
+    if ratio == 1.0:
+        return after_carry
+
+    hidden_attr = None
+    for candidate in ("current_hidden", "hidden_state"):
+        if hasattr(before_carry, candidate) and hasattr(after_carry, candidate):
+            hidden_attr = candidate
+            break
+    if hidden_attr is None:
+        return after_carry
+
+    before_hidden = getattr(before_carry, hidden_attr)
+    after_hidden = getattr(after_carry, hidden_attr)
+    if before_hidden.shape != after_hidden.shape:
+        return after_carry
+
+    mixed_hidden = before_hidden + (after_hidden - before_hidden) * ratio
+    return replace(after_carry, **{hidden_attr: mixed_hidden.detach()})
 
 
 class ShuffledTestPuzzleDataset(PuzzleDataset):
@@ -1173,6 +1212,8 @@ def evaluate(
                 # Forward
                 inference_steps = 0
                 while True:
+                    if config.full_answer_initial_eval_hidden_mix_ratio < 1.0:
+                        before_carry = carry
                     carry, loss, metrics, preds, all_finish = train_state.model(
                         carry=carry, batch=batch, return_keys=return_keys
                     )
@@ -1180,6 +1221,9 @@ def evaluate(
 
                     if all_finish:
                         break
+                    
+                    if config.full_answer_initial_eval_hidden_mix_ratio < 1.0:
+                        carry = _maybe_mix_noised_label_eval_carry(config, before_carry, carry)
 
                 if rank == 0:
                     print(f"  Completed inference in {inference_steps} steps")

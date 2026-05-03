@@ -463,6 +463,7 @@ def main() -> None:
         "max_problems": args.max_problems,
         "loops": getattr(loop_config, "loops", args.loops),
         "hidden_diff_threshold": args.hidden_diff_threshold,
+        "full_answer_initial_eval_hidden_mix_ratio": config.full_answer_initial_eval_hidden_mix_ratio,
         "metrics": _jsonable(metrics),
     }
     with open(output_path, "w", encoding="utf-8") as f:
