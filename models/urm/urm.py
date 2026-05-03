@@ -107,12 +107,13 @@ class URMConfig(BaseModel):
     profile: bool = False
     answer_only: bool = False
     answer_only_context_layers: int = 0
+    num_memory_tokens: int = 0
 
 
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig, attention_window_size: int) -> None:
         super().__init__()
-        puzzle_prefix_len = -(config.puzzle_emb_ndim // -config.hidden_size)
+        prefix_seq_len = -(config.puzzle_emb_ndim // -config.hidden_size) + config.num_memory_tokens
         attention_type = config.attention_type.lower()
         if attention_type in {"full", "swa"}:
             attention_type = "full" if attention_window_size == -1 else "swa"
@@ -129,7 +130,7 @@ class URMBlock(nn.Module):
             attention_topk=config.attention_topk,
             grid_height=config.grid_height,
             grid_width=config.grid_width,
-            prefix_seq_len=puzzle_prefix_len,
+            prefix_seq_len=prefix_seq_len,
             topk_sparsity=config.topk_sparsity,
         )
         self.mlp = ConvSwiGLU(
@@ -262,6 +263,21 @@ class URM_Inner(nn.Module):
             self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
+        if self.config.num_memory_tokens < 0:
+            raise ValueError(f"num_memory_tokens must be >= 0, got {self.config.num_memory_tokens}")
+        self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
+
+        if self.config.num_memory_tokens > 0:
+            self.memory_tokens = nn.Parameter(
+                trunc_normal_init_(
+                    torch.empty(
+                        self.config.num_memory_tokens,
+                        self.config.hidden_size,
+                        dtype=self.forward_dtype,
+                    ),
+                    std=embed_init_std,
+                )
+            )
 
         if self.config.puzzle_emb_ndim > 0:
             self.puzzle_emb = CastedSparseEmbedding(
@@ -284,7 +300,7 @@ class URM_Inner(nn.Module):
                 grid_io=self.inner_config.grid_io,
                 grid_height=self.inner_config.grid_height,
                 grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.puzzle_emb_len,
+                puzzle_emb_len=self.prefix_seq_len,
                 base=self.inner_config.rope_theta,
             )
         elif (
@@ -297,7 +313,7 @@ class URM_Inner(nn.Module):
                 grid_depth=self.inner_config.grid_depth,
                 grid_height=self.inner_config.grid_height,
                 grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.puzzle_emb_len,
+                puzzle_emb_len=self.prefix_seq_len,
                 base=self.inner_config.rope_theta,
             )
         elif self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
@@ -305,13 +321,13 @@ class URM_Inner(nn.Module):
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_height=self.inner_config.grid_height,
                 grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.puzzle_emb_len,
+                puzzle_emb_len=self.prefix_seq_len,
                 base=self.inner_config.rope_theta,
             )
         else:
             self.rotary_emb = RotaryEmbedding(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
-                max_position_embeddings=self.inner_seq_len + self.puzzle_emb_len,
+                max_position_embeddings=self.inner_seq_len + self.prefix_seq_len,
                 base=self.inner_config.rope_theta,
             )
 
@@ -416,10 +432,15 @@ class URM_Inner(nn.Module):
         return patches.reshape(batch_size, self.padded_seq_len, channels)[:, : self.config.seq_len]
 
     def _output_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        output = self.lm_head(hidden_states)[:, self.puzzle_emb_len:]
+        output = self.lm_head(hidden_states)[:, self.prefix_seq_len:]
         if self.config.patch_io_enabled:
             output = self.post_head(self._unpatchify(output))
         return output
+
+    def _memory_embeddings(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        if self.config.num_memory_tokens == 0:
+            return None
+        return self.memory_tokens.to(device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         if self.config.patch_io_enabled:
@@ -435,6 +456,16 @@ class URM_Inner(nn.Module):
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
             embedding = torch.cat(
                 (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding),
+                dim=-2,
+            )
+        memory_embedding = self._memory_embeddings(embedding.shape[0], embedding.device)
+        if memory_embedding is not None:
+            embedding = torch.cat(
+                (
+                    embedding[:, : self.puzzle_emb_len],
+                    memory_embedding,
+                    embedding[:, self.puzzle_emb_len :],
+                ),
                 dim=-2,
             )
         embedding = self.embed_scale * embedding
@@ -460,10 +491,10 @@ class URM_Inner(nn.Module):
         batch: Dict[str, torch.Tensor],
         token_indices: torch.Tensor,
     ) -> CosSin:
-        if self.puzzle_emb_len == 0:
+        if self.prefix_seq_len == 0:
             return axes
 
-        total_len = token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len
+        total_len = token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.prefix_seq_len
         prefix_indices = self._packed_prefix_indices(batch)
         packed_axes = []
         for cos, sin in zip(axes[::2], axes[1::2]):
@@ -478,14 +509,14 @@ class URM_Inner(nn.Module):
 
     @torch.compiler.disable
     def _packed_cu_seqlens(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, int]:
-        lengths = self._packed_lengths(batch) + self.puzzle_emb_len
+        lengths = self._packed_lengths(batch) + self.prefix_seq_len
         cu_seqlens = F.pad(torch.cumsum(lengths, dim=0), (1, 0)).to(torch.int32)
         max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
         return cu_seqlens, max_seqlen
 
     def _packed_data_token_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         num_tokens = batch["inputs"].shape[0]
-        if self.puzzle_emb_len == 0:
+        if self.prefix_seq_len == 0:
             return torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
 
         lengths = self._packed_lengths(batch)
@@ -494,16 +525,36 @@ class URM_Inner(nn.Module):
             lengths,
         )
         token_positions = torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
-        return token_positions + seq_ids * self.puzzle_emb_len + self.puzzle_emb_len
+        return token_positions + seq_ids * self.prefix_seq_len + self.prefix_seq_len
 
-    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _packed_puzzle_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         batch_size = batch["puzzle_identifiers"].shape[0]
         if self.puzzle_emb_len == 0 or batch_size == 0:
             return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
 
         data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.puzzle_emb_len
+        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
         prefix_offsets = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+        return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
+
+    def _packed_memory_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size = batch["puzzle_identifiers"].shape[0]
+        if self.config.num_memory_tokens == 0 or batch_size == 0:
+            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
+
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
+        memory_offsets = torch.arange(self.config.num_memory_tokens, device=batch["inputs"].device, dtype=torch.long)
+        return (seq_offsets[:, None] + self.puzzle_emb_len + memory_offsets[None, :]).reshape(-1)
+
+    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size = batch["puzzle_identifiers"].shape[0]
+        if self.prefix_seq_len == 0 or batch_size == 0:
+            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
+
+        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
+        prefix_offsets = torch.arange(self.prefix_seq_len, device=batch["inputs"].device, dtype=torch.long)
         return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
 
     def _input_embeddings_packed(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -513,17 +564,20 @@ class URM_Inner(nn.Module):
         token_embedding = self.embed_tokens(batch["inputs"].to(torch.int32))
         token_indices = self._packed_data_token_indices(batch)
 
-        if self.puzzle_emb_len > 0:
-            puzzle_embedding = self.puzzle_emb(batch["puzzle_identifiers"])
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-            puzzle_embedding = puzzle_embedding.view(-1, self.config.hidden_size)
-
-            total_len = token_embedding.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len
+        if self.prefix_seq_len > 0:
+            total_len = token_embedding.shape[0] + batch["puzzle_identifiers"].shape[0] * self.prefix_seq_len
             embedding = token_embedding.new_empty((total_len, self.config.hidden_size))
             embedding[token_indices] = token_embedding
-            embedding[self._packed_prefix_indices(batch)] = puzzle_embedding
+            if self.puzzle_emb_len > 0:
+                puzzle_embedding = self.puzzle_emb(batch["puzzle_identifiers"])
+                pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+                if pad_count > 0:
+                    puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+                embedding[self._packed_puzzle_indices(batch)] = puzzle_embedding.view(-1, self.config.hidden_size)
+            if self.config.num_memory_tokens > 0:
+                batch_size = batch["puzzle_identifiers"].shape[0]
+                memory_embedding = self.memory_tokens.to(device=token_embedding.device).expand(batch_size, -1, -1)
+                embedding[self._packed_memory_indices(batch)] = memory_embedding.reshape(-1, self.config.hidden_size)
         else:
             embedding = token_embedding
 
@@ -552,11 +606,11 @@ class URM_Inner(nn.Module):
 
         if isinstance(self.rotary_emb, RotaryEmbedding2D):
             position_ids = batch["position_ids"].to(device=batch["inputs"].device, dtype=torch.long)
-            data_flat_ids = self.puzzle_emb_len + position_ids[:, 0] * self.rotary_emb.grid_width + position_ids[:, 1]
-            if self.puzzle_emb_len > 0:
-                flat_ids = data_flat_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len,))
+            data_flat_ids = self.prefix_seq_len + position_ids[:, 0] * self.rotary_emb.grid_width + position_ids[:, 1]
+            if self.prefix_seq_len > 0:
+                flat_ids = data_flat_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.prefix_seq_len,))
                 flat_ids[token_indices] = data_flat_ids
-                prefix_ids = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+                prefix_ids = torch.arange(self.prefix_seq_len, device=batch["inputs"].device, dtype=torch.long)
                 flat_ids[self._packed_prefix_indices(batch)] = prefix_ids.repeat(batch["puzzle_identifiers"].shape[0])
             else:
                 flat_ids = data_flat_ids
@@ -575,17 +629,25 @@ class URM_Inner(nn.Module):
         )
         data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
         token_positions = torch.arange(batch["inputs"].shape[0], device=batch["inputs"].device, dtype=torch.long)
-        data_pos_ids = self.puzzle_emb_len + token_positions - data_offsets[seq_ids]
-        if self.puzzle_emb_len > 0:
-            flat_ids = data_pos_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.puzzle_emb_len,))
+        data_pos_ids = self.prefix_seq_len + token_positions - data_offsets[seq_ids]
+        if self.prefix_seq_len > 0:
+            flat_ids = data_pos_ids.new_empty((token_indices.shape[0] + batch["puzzle_identifiers"].shape[0] * self.prefix_seq_len,))
             flat_ids[token_indices] = data_pos_ids
-            prefix_ids = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
+            prefix_ids = torch.arange(self.prefix_seq_len, device=batch["inputs"].device, dtype=torch.long)
             flat_ids[self._packed_prefix_indices(batch)] = prefix_ids.repeat(batch["puzzle_identifiers"].shape[0])
         else:
             flat_ids = data_pos_ids
 
         cos, sin = self.rotary_emb()
-        return cos[flat_ids], sin[flat_ids]
+        cos = cos[flat_ids]
+        sin = sin[flat_ids]
+        if self.config.num_memory_tokens > 0:
+            memory_indices = self._packed_memory_indices(batch)
+            cos = cos.clone()
+            sin = sin.clone()
+            cos[memory_indices] = 1
+            sin[memory_indices] = 0
+        return cos, sin
 
     def _slice_packed_cos_sin(self, cos_sin: CosSin, indices: torch.Tensor) -> CosSin:
         return tuple(axis[indices] for axis in cos_sin)
@@ -620,7 +682,7 @@ class URM_Inner(nn.Module):
             answer_lengths = batch["label_seq_lengths"].to(device=batch["inputs"].device, dtype=torch.long)
         else:
             answer_labels = batch["labels"][answer_data_mask]
-        full_lengths = lengths + self.puzzle_emb_len
+        full_lengths = lengths + self.prefix_seq_len
         context_lengths = full_lengths - answer_lengths
         cu_answer = F.pad(torch.cumsum(answer_lengths.to(torch.int32), dim=0), (1, 0))
         cu_context = F.pad(torch.cumsum(context_lengths.to(torch.int32), dim=0), (1, 0))
@@ -655,7 +717,7 @@ class URM_Inner(nn.Module):
         return URMCarry(
             current_hidden=torch.empty(
                 batch_size,
-                carry_seq_len + self.puzzle_emb_len,
+                carry_seq_len + self.prefix_seq_len,
                 self.config.hidden_size,
                 dtype=self.forward_dtype,
             ),
@@ -674,15 +736,28 @@ class URM_Inner(nn.Module):
             self.rotary_emb,
             (RotaryEmbedding2D, RotaryEmbedding3D, RotaryEmbedding4D),
         ):
-            return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.puzzle_emb_len)
+            return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.prefix_seq_len)
         if isinstance(self.rotary_emb, (RotaryEmbedding3D, RotaryEmbedding4D)):
             raise ValueError(f"{type(self.rotary_emb).__name__} requires explicit position_ids in the batch.")
-        return self.rotary_emb()
+        cos_sin = self.rotary_emb()
+        if self.config.num_memory_tokens == 0:
+            return cos_sin
+
+        masked_axes = []
+        memory_start = self.puzzle_emb_len
+        memory_end = self.prefix_seq_len
+        for cos, sin in zip(cos_sin[::2], cos_sin[1::2]):
+            cos = cos.clone()
+            sin = sin.clone()
+            cos[memory_start:memory_end] = 1
+            sin[memory_start:memory_end] = 0
+            masked_axes.extend([cos, sin])
+        return tuple(masked_axes)
 
     def _sequence_lengths(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         if not self.config.variable_seq_lengths or "seq_lengths" not in batch:
             return None
-        return batch["seq_lengths"].to(torch.int32) + self.puzzle_emb_len
+        return batch["seq_lengths"].to(torch.int32) + self.prefix_seq_len
 
     def _inject_inputs(self, hidden_states: torch.Tensor, input_embeddings: torch.Tensor) -> torch.Tensor:
         if not self.config.input_injection_enabled:
@@ -1049,14 +1124,14 @@ class URM(nn.Module):
 
         reset = reset_flag.detach().cpu().tolist()
         current_lengths = current_data["seq_lengths"].detach().cpu().tolist()
-        old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.puzzle_emb_len).detach().cpu().tolist()
+        old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.prefix_seq_len).detach().cpu().tolist()
         old_hidden_offsets = [0]
         for length in old_hidden_lengths:
             old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
 
         hidden_chunks = []
         for idx, should_reset in enumerate(reset):
-            new_len = int(current_lengths[idx]) + self.inner.puzzle_emb_len
+            new_len = int(current_lengths[idx]) + self.inner.prefix_seq_len
             if should_reset:
                 hidden_chunks.append(self.inner.init_hidden.expand(new_len, -1))
             else:
@@ -1096,7 +1171,7 @@ class URM(nn.Module):
             target_seq_len = batch["inputs"].shape[1]
         else:
             target_seq_len = max(carry.current_data["inputs"].shape[1], batch["inputs"].shape[1])
-        target_hidden_len = target_seq_len + self.inner.puzzle_emb_len
+        target_hidden_len = target_seq_len + self.inner.prefix_seq_len
 
         aligned_batch = {
             k: self._pad_to_seq_len(k, v, target_seq_len)
@@ -1126,11 +1201,11 @@ class URM(nn.Module):
     def norm_func(self, x1, x2, seq_lengths: Optional[torch.Tensor] = None):
         #return torch.norm(x1 - x2, dim=(1,2))
         if seq_lengths is not None and x1.ndim == 2:
-            lengths = seq_lengths.to(x1.device) + self.inner.puzzle_emb_len
+            lengths = seq_lengths.to(x1.device) + self.inner.prefix_seq_len
             return packed_norm_ratio_from_lengths(x1, x2, lengths)
 
         if seq_lengths is not None:
-            lengths = (seq_lengths.to(x1.device) + self.inner.puzzle_emb_len).clamp(max=x1.shape[1])
+            lengths = (seq_lengths.to(x1.device) + self.inner.prefix_seq_len).clamp(max=x1.shape[1])
             mask = torch.arange(x1.shape[1], device=x1.device).unsqueeze(0) < lengths.unsqueeze(1)
             mask = mask.unsqueeze(-1)
             diff_norm = torch.norm(torch.where(mask, x1 - x2, torch.zeros_like(x1)), dim=(1, 2))
