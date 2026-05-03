@@ -78,3 +78,14 @@ masked_input:
 arc_output_mask:
   enabled: true
   fill_mode: "zero" # Literal["zero", "random_color"] 
+
+# PuzzleFullDataset answer-token initialization.
+# black: fill the target answer slot with ARC black token id 2.
+# noised_label: sample gamma ~ Uniform[min, max], then initialize each answer
+# token from the true label with probability gamma, otherwise from random color noise.
+full_answer_initial_mode: "black" # Literal["black", "noised_label"]
+full_answer_initial_black_token_id: 2
+full_answer_initial_gamma_min: 0.0
+full_answer_initial_gamma_max: 1.0
+full_answer_initial_noise_token_min: 2
+full_answer_initial_noise_token_max: 11
