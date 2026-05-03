@@ -163,8 +163,6 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     full_answer_initial_black_token_id: int = 2
     full_answer_initial_gamma_min: float = 0.0
     full_answer_initial_gamma_max: float = 1.0
-    full_answer_initial_noise_token_min: int = 2
-    full_answer_initial_noise_token_max: int = 11
 
     # Emit labels as only the answer tokens while keeping inputs full-length.
     answer_only_labels: bool = False
@@ -201,16 +199,6 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
             raise ValueError(
                 "full_answer_initial_gamma_min must be <= full_answer_initial_gamma_max, "
                 f"got {self.full_answer_initial_gamma_min} > {self.full_answer_initial_gamma_max}"
-            )
-        if self.full_answer_initial_noise_token_min < 0:
-            raise ValueError(
-                "full_answer_initial_noise_token_min must be >= 0, "
-                f"got {self.full_answer_initial_noise_token_min}"
-            )
-        if self.full_answer_initial_noise_token_max < self.full_answer_initial_noise_token_min:
-            raise ValueError(
-                "full_answer_initial_noise_token_max must be >= full_answer_initial_noise_token_min, "
-                f"got {self.full_answer_initial_noise_token_max} < {self.full_answer_initial_noise_token_min}"
             )
         return self
 

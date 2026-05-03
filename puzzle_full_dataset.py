@@ -196,28 +196,23 @@ class PuzzleFullDataset(PuzzleDataset):
     def _make_answer_initial_tokens(
         self,
         solution: np.ndarray,
-        rng: Optional[np.random.Generator],
     ) -> np.ndarray:
-        mode = self.config.full_answer_initial_mode
-        if mode == "black":
-            return np.full_like(solution, int(self.config.full_answer_initial_black_token_id))
+        if self.config.full_answer_initial_mode not in {"black", "noised_label"}:
+            raise ValueError(f"Unknown full_answer_initial_mode: {self.config.full_answer_initial_mode}")
+        return np.full_like(solution, int(self.config.full_answer_initial_black_token_id))
 
-        if mode != "noised_label":
-            raise ValueError(f"Unknown full_answer_initial_mode: {mode}")
-        if rng is None:
-            raise ValueError("noised_label answer initialization requires an rng.")
-
-        if self.split == "train":
+    def _sample_answer_initial_gamma(self, rng: Optional[np.random.Generator]) -> Optional[np.ndarray]:
+        if self.config.full_answer_initial_mode != "noised_label":
+            return None
+        if self.split != "train":
+            gamma = 0.0
+        else:
+            if rng is None:
+                raise ValueError("noised_label answer initialization requires an rng.")
             gamma_min = float(self.config.full_answer_initial_gamma_min)
             gamma_max = float(self.config.full_answer_initial_gamma_max)
             gamma = gamma_min if gamma_min == gamma_max else float(rng.uniform(gamma_min, gamma_max))
-        else:
-            gamma = 0.0
-        noise_min = int(self.config.full_answer_initial_noise_token_min)
-        noise_max = int(self.config.full_answer_initial_noise_token_max)
-        epsilon = rng.integers(noise_min, noise_max + 1, size=solution.shape, dtype=np.int32)
-        keep_solution = rng.random(solution.shape) < gamma
-        return np.where(keep_solution, solution, epsilon).astype(np.int32, copy=False)
+        return np.array(gamma, dtype=np.float32)
 
     def _build_pairs_sample(
         self,
@@ -267,7 +262,7 @@ class PuzzleFullDataset(PuzzleDataset):
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
-                input_solution = self._make_answer_initial_tokens(solution, rng)
+                input_solution = self._make_answer_initial_tokens(solution)
                 label_solution = solution
                 answer_mask = np.ones(solution.shape, dtype=np.bool_)
                 label_seq_shape = label_shape
@@ -300,6 +295,9 @@ class PuzzleFullDataset(PuzzleDataset):
             "position_ids": position_ids,
             "seq_lengths": np.array(inputs.shape[0], dtype=np.int32),
         }
+        answer_initial_gamma = self._sample_answer_initial_gamma(rng)
+        if answer_initial_gamma is not None:
+            sample["answer_initial_gamma"] = answer_initial_gamma
         if answer_only_labels:
             if label_seq_shape is None:
                 raise ValueError("target_pair_index did not match any pair while building answer-only labels.")
@@ -417,6 +415,11 @@ class PuzzleFullDataset(PuzzleDataset):
                 [sample["label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
+        if "answer_initial_gamma" in samples[0]:
+            batch["answer_initial_gamma"] = np.array(
+                [float(sample["answer_initial_gamma"]) for sample in samples],
+                dtype=np.float32,
+            )
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 
@@ -450,6 +453,11 @@ class PuzzleFullDataset(PuzzleDataset):
                 [sample["label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
+        if "answer_initial_gamma" in samples[0]:
+            batch["answer_initial_gamma"] = np.array(
+                [float(sample["answer_initial_gamma"]) for sample in samples],
+                dtype=np.float32,
+            )
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 
