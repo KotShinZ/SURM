@@ -996,6 +996,7 @@ class URM(nn.Module):
         lengths = []
         label_lengths = []
         puzzle_identifiers = []
+        answer_initial_gammas = []
         seq_shapes = []
         label_seq_shapes = []
 
@@ -1014,6 +1015,8 @@ class URM(nn.Module):
             lengths.append(source["seq_lengths"][idx])
             label_lengths.append(source.get("label_seq_lengths", source["seq_lengths"])[idx])
             puzzle_identifiers.append(source["puzzle_identifiers"][idx])
+            if "answer_initial_gamma" in source:
+                answer_initial_gammas.append(source["answer_initial_gamma"][idx])
             if "seq_shapes" in source:
                 seq_shapes.append(source["seq_shapes"][idx])
             if "label_seq_shapes" in source:
@@ -1030,6 +1033,11 @@ class URM(nn.Module):
             merged["seq_lengths"] = torch.stack(lengths).to(device=device, dtype=torch.int32)
             merged["label_seq_lengths"] = torch.stack(label_lengths).to(device=device, dtype=torch.int32)
             merged["puzzle_identifiers"] = torch.stack(puzzle_identifiers).to(device=device, dtype=batch["puzzle_identifiers"].dtype)
+            if answer_initial_gammas:
+                merged["answer_initial_gamma"] = torch.stack(answer_initial_gammas).to(
+                    device=device,
+                    dtype=batch["answer_initial_gamma"].dtype,
+                )
             if seq_shapes:
                 merged["seq_shapes"] = torch.stack(seq_shapes).to(device=device, dtype=batch["seq_shapes"].dtype)
             if label_seq_shapes:
@@ -1038,10 +1046,77 @@ class URM(nn.Module):
             merged["seq_lengths"] = batch["seq_lengths"].new_empty((0,))
             merged["label_seq_lengths"] = batch.get("label_seq_lengths", batch["seq_lengths"]).new_empty((0,))
             merged["puzzle_identifiers"] = batch["puzzle_identifiers"].new_empty((0,))
+            if "answer_initial_gamma" in batch:
+                merged["answer_initial_gamma"] = batch["answer_initial_gamma"].new_empty((0,))
 
         merged["seq_offsets"] = F.pad(torch.cumsum(merged["seq_lengths"].to(torch.int32), dim=0), (1, 0))
         merged["label_seq_offsets"] = F.pad(torch.cumsum(merged["label_seq_lengths"].to(torch.int32), dim=0), (1, 0))
         return merged
+
+    def _apply_noised_answer_initial_hidden(
+        self,
+        current_hidden: torch.Tensor,
+        current_data: Dict[str, torch.Tensor],
+        reset_flag: torch.Tensor,
+    ) -> torch.Tensor:
+        if "answer_initial_gamma" not in current_data or "answer_mask" not in current_data:
+            return current_hidden
+
+        token_indices = self.inner._packed_data_token_indices(current_data)
+        answer_data_mask = self.inner._packed_answer_mask(current_data)
+        lengths = self.inner._packed_lengths(current_data)
+        answer_lengths = torch.zeros(
+            (lengths.shape[0],),
+            device=current_hidden.device,
+            dtype=torch.long,
+        )
+        if lengths.numel() > 0:
+            segment_ids = torch.repeat_interleave(
+                torch.arange(lengths.shape[0], device=current_hidden.device, dtype=torch.long),
+                lengths,
+            )
+            answer_lengths.scatter_add_(0, segment_ids, answer_data_mask.to(torch.long))
+        answer_indices = token_indices[answer_data_mask]
+        if current_data["labels"].shape[0] == current_data["inputs"].shape[0]:
+            answer_labels = current_data["labels"][answer_data_mask]
+        else:
+            answer_labels = current_data["labels"]
+        if answer_indices.numel() == 0:
+            return current_hidden
+
+        answer_sample_ids = torch.repeat_interleave(
+            torch.arange(answer_lengths.shape[0], device=current_hidden.device, dtype=torch.long),
+            answer_lengths,
+        )
+        reset_answer_mask = reset_flag.to(device=current_hidden.device, dtype=torch.bool)[answer_sample_ids]
+        if not bool(reset_answer_mask.any().item()):
+            return current_hidden
+
+        answer_indices = answer_indices[reset_answer_mask]
+        answer_labels = answer_labels[reset_answer_mask]
+        answer_sample_ids = answer_sample_ids[reset_answer_mask]
+        gammas = current_data["answer_initial_gamma"].to(
+            device=current_hidden.device,
+            dtype=current_hidden.dtype,
+        )
+        gamma_tokens = gammas[answer_sample_ids].unsqueeze(-1)
+        generator = self.inner.generator if self.inner.generator.device == current_hidden.device else None
+        noise = torch.randn(
+            (answer_indices.shape[0], self.config.hidden_size),
+            generator=generator,
+            dtype=current_hidden.dtype,
+            device=current_hidden.device,
+        )
+
+        if bool((gamma_tokens != 0).any().item()):
+            label_embedding = self.inner.embed_scale * self.inner.embed_tokens(answer_labels.to(torch.int32))
+            answer_hidden = gamma_tokens * label_embedding.detach() + (1.0 - gamma_tokens) * noise
+        else:
+            answer_hidden = noise
+
+        current_hidden = current_hidden.clone()
+        current_hidden[answer_indices] = answer_hidden
+        return current_hidden
 
     @torch.compiler.disable
     def _reset_packed_carry(self, reset_flag: torch.Tensor, carry: URMCarry, current_data: Dict[str, torch.Tensor]) -> URMCarry:
@@ -1071,6 +1146,7 @@ class URM(nn.Module):
                 dtype=self.inner.forward_dtype,
                 device=current_data["inputs"].device,
             )
+        current_hidden = self._apply_noised_answer_initial_hidden(current_hidden, current_data, reset_flag)
 
         return replace(carry, current_hidden=current_hidden, current_data=current_data)
         
