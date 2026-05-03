@@ -201,6 +201,158 @@ def maybe_create_arc_evaluator(config: PretrainConfig, eval_metadata):
     return ARC(data_path=config.data_path, eval_metadata=eval_metadata)
 
 
+class ARCThirtyByThirtyAdapter:
+    required_outputs = ARC.required_outputs
+
+    def __init__(self, evaluator: ARC):
+        self.evaluator = evaluator
+
+    def begin_eval(self):
+        self.evaluator.begin_eval()
+
+    def result(self, *args, **kwargs):
+        return self.evaluator.result(*args, **kwargs)
+
+    @staticmethod
+    def _canvas_from_positions(tokens: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        canvas = torch.zeros((30 * 30,), dtype=tokens.dtype, device=tokens.device)
+        if tokens.numel() == 0:
+            return canvas
+
+        rows = position_ids[:, -2].to(torch.long)
+        cols = position_ids[:, -1].to(torch.long)
+        valid = (rows >= 0) & (rows < 30) & (cols >= 0) & (cols < 30)
+        canvas[rows[valid] * 30 + cols[valid]] = tokens[valid]
+        return canvas
+
+    @staticmethod
+    def _target_output_mask(
+        sample_inputs: torch.Tensor,
+        sample_source_inputs: torch.Tensor,
+        sample_positions: torch.Tensor,
+        sample_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        output_mask = sample_positions[:, 1] == 1
+        pair_ids = torch.unique(sample_positions[output_mask, 0], sorted=True)
+        label_len = int(sample_labels.numel())
+
+        candidates = []
+        changed_candidates = []
+        matching_candidates = []
+        for pair_id in pair_ids.tolist():
+            mask = output_mask & (sample_positions[:, 0] == int(pair_id))
+            if int(mask.sum().item()) != label_len:
+                continue
+
+            candidates.append(mask)
+            if bool((sample_inputs[mask] != sample_source_inputs[mask]).any().item()):
+                changed_candidates.append(mask)
+            if label_len == 0 or bool((sample_source_inputs[mask] == sample_labels).all().item()):
+                matching_candidates.append(mask)
+
+        if len(changed_candidates) == 1:
+            return changed_candidates[0]
+
+        changed_matching = [
+            mask
+            for mask in changed_candidates
+            if label_len == 0 or bool((sample_source_inputs[mask] == sample_labels).all().item())
+        ]
+        if len(changed_matching) == 1:
+            return changed_matching[0]
+
+        if matching_candidates:
+            return matching_candidates[-1]
+        if candidates:
+            return candidates[-1]
+
+        raise ValueError(
+            "Could not align answer-only ARC labels with a target output slot: "
+            f"label_len={label_len}, output_slots={int(pair_ids.numel())}."
+        )
+
+    def _to_fixed_30x30(
+        self,
+        batch: Dict[str, torch.Tensor],
+        preds: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        labels = batch["labels"]
+        pred_tokens = preds["preds"]
+        if (
+            "label_seq_offsets" not in batch
+            or labels.ndim != 1
+            or pred_tokens.ndim != 1
+            or labels.shape[0] == batch["inputs"].shape[0]
+        ):
+            return batch, preds
+
+        seq_offsets = batch["seq_offsets"]
+        label_offsets = batch["label_seq_offsets"]
+        identifiers = batch.get("arc_identifiers", batch["puzzle_identifiers"])
+        source_inputs = batch.get("source_inputs", batch["inputs"])
+
+        input_canvases = []
+        label_canvases = []
+        pred_canvases = []
+
+        for sample_idx in range(int(identifiers.shape[0])):
+            start = int(seq_offsets[sample_idx].item())
+            end = int(seq_offsets[sample_idx + 1].item())
+            label_start = int(label_offsets[sample_idx].item())
+            label_end = int(label_offsets[sample_idx + 1].item())
+
+            sample_inputs = batch["inputs"][start:end]
+            sample_source_inputs = source_inputs[start:end]
+            sample_positions = batch["position_ids"][start:end]
+            sample_labels = labels[label_start:label_end]
+            sample_preds = pred_tokens[label_start:label_end]
+
+            target_output_mask = self._target_output_mask(
+                sample_inputs,
+                sample_source_inputs,
+                sample_positions,
+                sample_labels,
+            )
+            target_pair_id = sample_positions[target_output_mask][0, 0]
+            target_input_mask = (
+                (sample_positions[:, 0] == target_pair_id)
+                & (sample_positions[:, 1] == 0)
+            )
+            target_output_positions = sample_positions[target_output_mask]
+
+            if sample_labels.numel() != target_output_positions.shape[0]:
+                raise ValueError(
+                    "Answer-only ARC label length does not match target output positions: "
+                    f"sample={sample_idx}, labels={sample_labels.numel()}, "
+                    f"positions={target_output_positions.shape[0]}."
+                )
+
+            input_canvases.append(
+                self._canvas_from_positions(
+                    sample_source_inputs[target_input_mask],
+                    sample_positions[target_input_mask],
+                )
+            )
+            label_canvases.append(self._canvas_from_positions(sample_labels, target_output_positions))
+            pred_canvases.append(self._canvas_from_positions(sample_preds, target_output_positions))
+
+        fixed_batch = {
+            "inputs": torch.stack(input_canvases, dim=0),
+            "source_inputs": torch.stack(input_canvases, dim=0),
+            "labels": torch.stack(label_canvases, dim=0),
+            "puzzle_identifiers": identifiers,
+        }
+        fixed_preds = {
+            "preds": torch.stack(pred_canvases, dim=0),
+            "q_halt_logits": preds["q_halt_logits"],
+        }
+        return fixed_batch, fixed_preds
+
+    def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
+        fixed_batch, fixed_preds = self._to_fixed_30x30(batch, preds)
+        self.evaluator.update_batch(fixed_batch, fixed_preds)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a saved URM checkpoint.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint file or directory.")
@@ -276,6 +428,10 @@ def main() -> None:
         if arc_evaluator is not None:
             print("Detected ARC-AGI dataset; enabling ARC augment consensus evaluator.")
             evaluators.append(arc_evaluator)
+    evaluators = [
+        ARCThirtyByThirtyAdapter(evaluator) if isinstance(evaluator, ARC) else evaluator
+        for evaluator in evaluators
+    ]
 
     metrics = evaluate(
         config,
