@@ -8,6 +8,8 @@ loss:
 
 loops: 16
 num_layers: 8
+prelude_layers: 0
+coda_layers: 0
 
 hidden_size: 512
 num_heads: 8
@@ -31,6 +33,8 @@ grid_width: 0
 
 # Enable timing profile output during training for debugging
 profile: true
+answer_only: false
+answer_only_context_layers: 0
 
 eval_interval: 1000
 checkpoint_every_eval: True

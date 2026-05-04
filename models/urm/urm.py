@@ -107,6 +107,8 @@ class URMConfig(BaseModel):
     profile: bool = False
     answer_only: bool = False
     answer_only_context_layers: int = 0
+    prelude_layers: int = 0
+    coda_layers: int = 0
     num_memory_tokens: int = 0
 
 
@@ -340,6 +342,22 @@ class URM_Inner(nn.Module):
             [
                 URMBlock(self.inner_config, attention_window_size=self.layer_attention_window_sizes[layer_idx])
                 for layer_idx in range(self.config.num_layers)
+            ]
+        )
+        if self.config.prelude_layers < 0:
+            raise ValueError(f"prelude_layers must be >= 0, got {self.config.prelude_layers}")
+        if self.config.coda_layers < 0:
+            raise ValueError(f"coda_layers must be >= 0, got {self.config.coda_layers}")
+        self.prelude_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=-1)
+                for _ in range(self.config.prelude_layers)
+            ]
+        )
+        self.coda_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=-1)
+                for _ in range(self.config.coda_layers)
             ]
         )
         if self.config.answer_only_context_layers < 0:
@@ -764,6 +782,38 @@ class URM_Inner(nn.Module):
             return hidden_states
         return hidden_states + input_embeddings
 
+    def _run_token_layers(
+        self,
+        hidden_states: torch.Tensor,
+        layers: nn.ModuleList,
+        cos_sin: CosSin,
+        sequence_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in layers:
+            hidden_states = layer(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                sequence_lengths=sequence_lengths,
+            )
+        return hidden_states
+
+    def _run_token_layers_packed(
+        self,
+        hidden_states: torch.Tensor,
+        layers: nn.ModuleList,
+        cos_sin: CosSin,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        for layer in layers:
+            hidden_states = layer.forward_packed(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        return hidden_states
+
     def forward(
         self,
         carry: URMCarry,
@@ -777,6 +827,11 @@ class URM_Inner(nn.Module):
             sequence_lengths=self._sequence_lengths(batch),
         )
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._run_token_layers(
+            hidden_states=input_embeddings,
+            layers=self.prelude_layers,
+            **seq_info,
+        )
 
         hidden_states = carry.current_hidden
         if self.config.H_cycles > 1:
@@ -832,8 +887,13 @@ class URM_Inner(nn.Module):
                     _unrolled_idx += 1
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        output = self._output_logits(hidden_states)
-        q_logits = self.q_head(hidden_states[:, 0]).to(torch.float32)
+        head_hidden_states = self._run_token_layers(
+            hidden_states=hidden_states,
+            layers=self.coda_layers,
+            **seq_info,
+        )
+        output = self._output_logits(head_hidden_states)
+        q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
     def forward_packed(
@@ -847,6 +907,13 @@ class URM_Inner(nn.Module):
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+        input_embeddings = self._run_token_layers_packed(
+            hidden_states=input_embeddings,
+            layers=self.prelude_layers,
+            cos_sin=cos_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
 
         hidden_states = carry.current_hidden
         if hidden_states.shape[0] != input_embeddings.shape[0]:
@@ -916,8 +983,15 @@ class URM_Inner(nn.Module):
                     _unrolled_idx += 1
 
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        output = self.lm_head(hidden_states[token_indices])
-        q_logits = self.q_head(hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        head_hidden_states = self._run_token_layers_packed(
+            hidden_states=hidden_states,
+            layers=self.coda_layers,
+            cos_sin=cos_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        output = self.lm_head(head_hidden_states[token_indices])
+        q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
     def forward_answer_only_packed(
@@ -931,6 +1005,13 @@ class URM_Inner(nn.Module):
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+        input_embeddings = self._run_token_layers_packed(
+            hidden_states=input_embeddings,
+            layers=self.prelude_layers,
+            cos_sin=cos_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
         (
             _answer_data_mask,
             answer_indices,
@@ -949,8 +1030,15 @@ class URM_Inner(nn.Module):
             )
         if answer_indices.numel() == 0:
             new_carry = replace(carry, current_hidden=hidden_states.detach())
-            output = self.lm_head(hidden_states.new_empty((0, hidden_states.shape[-1])))
-            q_logits = self.q_head(hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+            head_hidden_states = self._run_token_layers_packed(
+                hidden_states=hidden_states,
+                layers=self.coda_layers,
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+            output = self.lm_head(head_hidden_states.new_empty((0, head_hidden_states.shape[-1])))
+            q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
             return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
 
         context_indices = self._packed_context_indices(hidden_states, answer_indices)
@@ -1010,8 +1098,15 @@ class URM_Inner(nn.Module):
 
         hidden_states = run_answer_layers(hidden_states)
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        output = self.lm_head(hidden_states[answer_indices])
-        q_logits = self.q_head(hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        head_hidden_states = self._run_token_layers_packed(
+            hidden_states=hidden_states,
+            layers=self.coda_layers,
+            cos_sin=cos_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        output = self.lm_head(head_hidden_states[answer_indices])
+        q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
 
 
