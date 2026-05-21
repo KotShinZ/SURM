@@ -58,7 +58,7 @@ python -m data.build_arc_dataset \
   --subsets training evaluation concept \
   --test-set-name evaluation \
   --no-padding \
-  --sources ARC-AGI1 ARC-AGI2 ARC-GEN1 ARC-GEN2
+  --sources ARC-AGI1 ARC-GEN1
 
 # pair ごとの最小キャンバスで詰め、EOS は残す
 python -m data.build_arc_dataset_full \
