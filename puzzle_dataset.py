@@ -278,6 +278,63 @@ class PuzzleDataset(IterableDataset):
                 for field_name, mmap_mode in set_fields.items()
             }
 
+    @staticmethod
+    def _pad_flat_2d_tokens(
+        tokens: np.ndarray,
+        shape: np.ndarray,
+        target_shape: np.ndarray,
+        pad_token: int,
+    ) -> np.ndarray:
+        shape_tuple = tuple(int(v) for v in shape)
+        target_tuple = tuple(int(v) for v in target_shape)
+        if shape_tuple == target_tuple:
+            return tokens
+
+        if len(shape_tuple) != 2 or len(target_tuple) != 2:
+            raise ValueError(
+                "Padding variable-length inputs and labels currently requires 2D shapes, "
+                f"got shape={shape_tuple}, target_shape={target_tuple}."
+            )
+
+        h, w = shape_tuple
+        target_h, target_w = target_tuple
+        if h > target_h or w > target_w:
+            raise ValueError(
+                f"Cannot pad shape={shape_tuple} into smaller target_shape={target_tuple}."
+            )
+        if int(tokens.shape[0]) != h * w:
+            raise ValueError(
+                f"Token length does not match shape: len={tokens.shape[0]}, shape={shape_tuple}."
+            )
+
+        padded = np.full((target_h, target_w), pad_token, dtype=tokens.dtype)
+        padded[:h, :w] = tokens.reshape(h, w)
+        return padded.reshape(-1)
+
+    @staticmethod
+    def _make_padded_position_ids(
+        position_ids: np.ndarray,
+        target_shape: np.ndarray,
+    ) -> np.ndarray:
+        target_h, target_w = (int(v) for v in target_shape)
+        rows, cols = np.indices((target_h, target_w), dtype=np.int32)
+        flat_rows = rows.reshape(-1)
+        flat_cols = cols.reshape(-1)
+
+        if position_ids.ndim != 2:
+            raise ValueError(f"Expected position_ids with ndim=2, got shape={position_ids.shape}.")
+        if position_ids.shape[1] == 2:
+            return np.stack([flat_rows, flat_cols], axis=-1).astype(position_ids.dtype, copy=False)
+        if position_ids.shape[1] >= 4:
+            leading = np.zeros((target_h * target_w, position_ids.shape[1] - 2), dtype=position_ids.dtype)
+            if position_ids.shape[0] > 0:
+                leading[:] = position_ids[0, :-2]
+            return np.concatenate(
+                [leading, np.stack([flat_rows, flat_cols], axis=-1).astype(position_ids.dtype, copy=False)],
+                axis=-1,
+            )
+        raise ValueError(f"Unsupported position_ids shape for padding: {position_ids.shape}.")
+
     def _select_examples(self, dataset: dict, indices: np.ndarray) -> dict:
         if not self.metadata.variable_seq_lengths:
             batch = {
@@ -294,25 +351,61 @@ class PuzzleDataset(IterableDataset):
         lengths = (offsets[indices + 1] - offsets[indices]).astype(np.int32, copy=False)
         label_offsets = dataset.get("label_seq_offsets", offsets)
         label_shapes = dataset.get("label_seq_shapes", dataset["seq_shapes"])
+        selected_label_shapes = label_shapes[indices]
         label_lengths = (
             (label_offsets[indices + 1] - label_offsets[indices]).astype(np.int32, copy=False)
             if "labels" in dataset
             else None
         )
+        pad_inputs_and_labels = (
+            "labels" in dataset
+            and "seq_shapes" in dataset
+            and "label_seq_shapes" in dataset
+            and shapes.ndim == 2
+            and selected_label_shapes.ndim == 2
+            and shapes.shape[1] == 2
+            and selected_label_shapes.shape[1] == 2
+        )
+        if pad_inputs_and_labels:
+            target_shapes = np.maximum(shapes, selected_label_shapes).astype(np.int32, copy=False)
 
         input_chunks = []
         position_chunks = []
         label_chunks = [] if "labels" in dataset else None
-        for example_idx in indices:
+        for batch_idx, example_idx in enumerate(indices):
             start = int(offsets[example_idx])
             end = int(offsets[example_idx + 1])
-            input_chunks.append(dataset["inputs"][start:end])
+            input_chunk = dataset["inputs"][start:end]
             if label_chunks is not None:
                 label_start = int(label_offsets[example_idx])
                 label_end = int(label_offsets[example_idx + 1])
-                label_chunks.append(dataset["labels"][label_start:label_end])
+                label_chunk = dataset["labels"][label_start:label_end]
+                if pad_inputs_and_labels:
+                    input_chunk = self._pad_flat_2d_tokens(
+                        input_chunk,
+                        shapes[batch_idx],
+                        target_shapes[batch_idx],
+                        self.metadata.pad_id,
+                    )
+                    label_chunk = self._pad_flat_2d_tokens(
+                        label_chunk,
+                        selected_label_shapes[batch_idx],
+                        target_shapes[batch_idx],
+                        self.metadata.pad_id,
+                    )
+                label_chunks.append(label_chunk)
+            input_chunks.append(input_chunk)
             if "position_ids" in dataset:
-                position_chunks.append(dataset["position_ids"][start:end])
+                position_chunk = dataset["position_ids"][start:end]
+                if pad_inputs_and_labels:
+                    position_chunk = self._make_padded_position_ids(position_chunk, target_shapes[batch_idx])
+                position_chunks.append(position_chunk)
+
+        if pad_inputs_and_labels:
+            shapes = target_shapes
+            selected_label_shapes = target_shapes
+            lengths = (target_shapes[:, 0] * target_shapes[:, 1]).astype(np.int32, copy=False)
+            label_lengths = lengths.copy()
 
         if input_chunks:
             inputs = np.concatenate(input_chunks).astype(np.uint8, copy=False)
@@ -336,7 +429,7 @@ class PuzzleDataset(IterableDataset):
             batch["label_seq_offsets"] = np.concatenate(
                 [np.zeros((1,), dtype=np.int32), np.cumsum(label_lengths, dtype=np.int32)]
             )
-            batch["label_seq_shapes"] = label_shapes[indices]
+            batch["label_seq_shapes"] = selected_label_shapes
         if "position_ids" in dataset:
             if position_chunks:
                 batch["position_ids"] = np.concatenate(position_chunks, axis=0).astype(
@@ -611,6 +704,9 @@ class PuzzleDataset(IterableDataset):
             [np.zeros((1,), dtype=np.int32), np.cumsum(batch["seq_lengths"], dtype=np.int32)]
         )
         batch["seq_shapes"] = np.array(seq_shapes, dtype=np.int32)
+        batch["label_seq_lengths"] = batch["seq_lengths"].copy()
+        batch["label_seq_offsets"] = batch["seq_offsets"].copy()
+        batch["label_seq_shapes"] = batch["seq_shapes"].copy()
         # _debug_print_arc_variable_batch(
         #     inputs=batch["inputs"],
         #     labels=batch["labels"],

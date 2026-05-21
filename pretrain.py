@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import tqdm
@@ -357,6 +358,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
         variable_seq_lengths=train_metadata.variable_seq_lengths,
+        grad_logging_enabled=not config.halted_replay_training,
         causal=False,  # Non-autoregressive
     )
     model_cfg = _apply_position_id_shape_to_model_cfg(model_cfg, train_metadata.position_id_shape)

@@ -10,8 +10,8 @@ arch.answer_only=False arch.answer_only_context_layers=0 arch.input_injection_en
 arch.use_act=False arch.norm_diff_max=0.1 arch.norm_diff_min=0.001 \
 arch.loss.label_mask=0.0 \
 +arch.num_memory_tokens=0 \
-global_batch_size=128 \
-grad_accum_steps=6 \
+global_batch_size=768 \
+grad_accum_steps=1 \
 halted_replay_training=True \
 epochs=100000 \
 eval_interval=2000 \

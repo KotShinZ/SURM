@@ -105,6 +105,7 @@ class URMConfig(BaseModel):
     patch_pre_embedding_size: int = 3
     variable_seq_lengths: bool = False
     profile: bool = False
+    grad_logging_enabled: bool = True
     answer_only: bool = False
     answer_only_context_layers: int = 0
     prelude_layers: int = 0
@@ -852,7 +853,7 @@ class URM_Inner(nn.Module):
                             hidden_states = hidden_states + noise * self.config.noise_size
 
         # Gradient norm logging for unrolled layers
-        _log_grads = global_logger.is_log and self.training
+        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
         if _log_grads:
             _grad_norms = {}
             _total_unrolled = self.config.L_cycles * len(self.layers)
@@ -943,7 +944,7 @@ class URM_Inner(nn.Module):
                             )
                             hidden_states = hidden_states + noise * self.config.noise_size
 
-        _log_grads = global_logger.is_log and self.training
+        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
         if _log_grads:
             _grad_norms = {}
             _total_unrolled = self.config.L_cycles * len(self.layers)
