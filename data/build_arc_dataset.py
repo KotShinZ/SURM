@@ -565,6 +565,26 @@ def _test_set_name_for_source(test_set_name: str, source: str) -> str:
     return test_set_name
 
 
+def _arc_agi_requested_subsets_for_source(config: DataProcessConfig, source: str) -> List[str]:
+    requested_subset_names: List[str] = []
+
+    for requested_subset_name in config.subsets:
+        subset_name = _arc_agi_subset_for_source(requested_subset_name, source)
+        if subset_name is not None and subset_name not in requested_subset_names:
+            requested_subset_names.append(subset_name)
+
+    return requested_subset_names
+
+
+def _arc_agi_subsets_to_load_for_source(config: DataProcessConfig, source: str) -> List[str]:
+    subset_names = _arc_agi_requested_subsets_for_source(config, source)
+    test_set_name = _test_set_name_for_source(config.test_set_name, source)
+    if test_set_name not in subset_names:
+        subset_names.append(test_set_name)
+
+    return subset_names
+
+
 def _load_arc_agi_task_ids(input_file_prefix: str, source: str) -> Set[str]:
     task_ids: Set[str] = set()
     source_subsets = ["training", "evaluation", "concept"] if source == ARC_AGI1_SOURCE else ["training2", "evaluation2"]
@@ -918,12 +938,9 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             "_default": [(1.0, ("train", "all"))],
         }
         aug_count = _num_aug_for_source(config, source)
+        requested_subset_names = _arc_agi_requested_subsets_for_source(config, source)
 
-        for requested_subset_name in config.subsets:
-            subset_name = _arc_agi_subset_for_source(requested_subset_name, source)
-            if subset_name is None:
-                continue
-
+        for subset_name in _arc_agi_subsets_to_load_for_source(config, source):
             challenges_filename = f"{config.input_file_prefix}_{subset_name}-challenges.json"
             if not os.path.isfile(challenges_filename):
                 print(f"{source} subset '{subset_name}' not found at {challenges_filename}, skipping")
@@ -1006,6 +1023,10 @@ def load_puzzles_arcagi(config: DataProcessConfig):
 
                 assert test_examples_dest is not None
 
+                dest_mapping = {"test": test_examples_dest}
+                if subset_name in requested_subset_names:
+                    dest_mapping["train"] = train_examples_dest
+
                 if test_examples_dest[0] == "test" and len(puzzle.get("test", [])) > 0:
                     test_puzzles[name] = puzzle
 
@@ -1014,7 +1035,7 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                     puzzle,
                     source,
                     aug_count,
-                    {"train": train_examples_dest, "test": test_examples_dest},
+                    dest_mapping,
                     extra_train_examples=(
                         legacy_arc_gen_puzzles.get(name)
                         if legacy_arc_gen_enabled_for_subset

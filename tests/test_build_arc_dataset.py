@@ -401,6 +401,69 @@ class BuildARCDatasetTests(unittest.TestCase):
             np.testing.assert_array_equal(examples[0][1, 0], _encode_fixed_canvas([[3, 3]]))
             np.testing.assert_array_equal(examples[0][1, 1], _encode_fixed_canvas([[4], [4]]))
 
+    def test_test_set_is_loaded_even_when_omitted_from_training_subsets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+
+            self._write_subset(
+                input_prefix,
+                "training",
+                {
+                    "p_train": {
+                        "train": [{"input": [[1]], "output": [[2]]}],
+                        "test": [{"input": [[3]]}],
+                    }
+                },
+                {"p_train": [[[4]]]},
+            )
+            self._write_subset(
+                input_prefix,
+                "concept",
+                {
+                    "p_concept": {
+                        "train": [{"input": [[5]], "output": [[6]]}],
+                        "test": [{"input": [[7]]}],
+                    }
+                },
+                {"p_concept": [[[8]]]},
+            )
+            self._write_subset(
+                input_prefix,
+                "evaluation",
+                {
+                    "p_eval": {
+                        "train": [{"input": [[1, 1]], "output": [[2, 2]]}],
+                        "test": [{"input": [[9]]}],
+                    }
+                },
+                {"p_eval": [[[0]]]},
+            )
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["training", "concept"],
+                    test_set_name="evaluation",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=False,
+                )
+            )
+
+            train_inputs = np.load(output_dir / "train" / "all__inputs.npy")
+            test_inputs = np.load(output_dir / "test" / "all__inputs.npy")
+            examples = np.load(output_dir / "test" / "all__examples.npy", allow_pickle=True)
+
+            self.assertEqual(train_inputs.shape, (4, 900))
+            self.assertEqual(test_inputs.shape, (1, 900))
+            self.assertEqual(examples.shape, (1,))
+            np.testing.assert_array_equal(test_inputs[0], _encode_fixed_canvas([[9]]))
+            np.testing.assert_array_equal(examples[0][0, 0], _encode_fixed_canvas([[1, 1]]))
+            np.testing.assert_array_equal(examples[0][0, 1], _encode_fixed_canvas([[2, 2]]))
+
     def test_test_split_examples_support_no_padding_and_augmentation_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
