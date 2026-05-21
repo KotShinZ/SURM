@@ -40,6 +40,9 @@ puzzle_emb_lr: 1e-2
 use_muon: False
 torch_compile: True
 
+# Probe halting without gradients, then replay only halted samples with gradients.
+halted_replay_training: False
+
 # Fraction of training groups to use per epoch (1.0 = all, 0.5 = half)
 data_fraction: 1.0
 # Number of random examples sampled from each selected puzzle per training batch step.

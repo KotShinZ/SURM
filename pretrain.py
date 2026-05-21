@@ -1,5 +1,5 @@
 from typing import Optional, Any, Sequence, List, Tuple, Dict, Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import math
 import json
@@ -178,6 +178,10 @@ class PretrainConfig(pydantic.BaseModel):
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
     benchmark_warmup_steps: int = 1
+
+    # Training path that probes halting without gradients, then replays only
+    # halted samples with gradients so backward kernels run on a smaller batch.
+    halted_replay_training: bool = False
 
 
 
@@ -854,8 +858,11 @@ def _add_time_axis_metrics(
 def _add_train_timing_metrics(train_state: TrainState, metrics: Dict[str, Any], prefix: str = "train") -> None:
     metrics[f"{prefix}/total_train_time_h"] = train_state.train_time_h
     metrics[f"{prefix}/avg_step_time_h"] = train_state.train_time_h / max(train_state.step, 1)
+    metrics[f"{prefix}/total_train_time_s"] = train_state.train_time_h * 3600.0
+    metrics[f"{prefix}/avg_step_time_s"] = train_state.train_time_h * 3600.0 / max(train_state.step, 1)
     if train_state.last_step_time_h is not None:
         metrics[f"{prefix}/step_time_h"] = train_state.last_step_time_h
+        metrics[f"{prefix}/step_time_s"] = train_state.last_step_time_h * 3600.0
 
     _add_time_axis_metrics(
         train_state,
@@ -875,10 +882,14 @@ def _add_eval_timing_metrics(
 ) -> None:
     metrics["train/total_train_time_h"] = train_state.train_time_h
     metrics["train/avg_step_time_h"] = train_state.train_time_h / max(train_state.step, 1)
+    metrics["train/total_train_time_s"] = train_state.train_time_h * 3600.0
+    metrics["train/avg_step_time_s"] = train_state.train_time_h * 3600.0 / max(train_state.step, 1)
     if train_state.last_step_time_h is not None:
         metrics["train/step_time_h"] = train_state.last_step_time_h
+        metrics["train/step_time_s"] = train_state.last_step_time_h * 3600.0
     if eval_time_h is not None:
         metrics["all/eval_time_h"] = eval_time_h
+        metrics["all/eval_time_s"] = eval_time_h * 3600.0
 
     _add_time_axis_metrics(
         train_state,
@@ -898,6 +909,243 @@ def _add_eval_timing_metrics(
             ),
         ),
     )
+
+
+def _batch_num_examples(batch: Dict[str, torch.Tensor]) -> int:
+    if "puzzle_identifiers" in batch:
+        return int(batch["puzzle_identifiers"].shape[0])
+    return int(batch["inputs"].shape[0])
+
+
+def _offsets_from_lengths(lengths: torch.Tensor, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+    return F.pad(torch.cumsum(lengths.to(dtype), dim=0), (1, 0))
+
+
+def _cat_indexed_ranges(
+    values: torch.Tensor,
+    offsets: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    chunks = []
+    offsets_cpu = offsets.detach().cpu()
+    for index in indices.detach().cpu().tolist():
+        start = int(offsets_cpu[index].item())
+        end = int(offsets_cpu[index + 1].item())
+        chunks.append(values[start:end])
+
+    if chunks:
+        return torch.cat(chunks, dim=0)
+    return values.new_empty((0,) + tuple(values.shape[1:]))
+
+
+def _select_batch_examples(
+    batch: Dict[str, torch.Tensor],
+    sample_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    indices = torch.nonzero(sample_mask, as_tuple=False).flatten().to(device=sample_mask.device)
+    batch_size = _batch_num_examples(batch)
+
+    if "seq_offsets" not in batch:
+        selected: Dict[str, torch.Tensor] = {}
+        for key, value in batch.items():
+            if value.ndim > 0 and value.shape[0] == batch_size:
+                selected[key] = value[indices]
+            else:
+                selected[key] = value
+        return selected
+
+    seq_offsets = batch["seq_offsets"].to(device=batch["inputs"].device, dtype=torch.long)
+    seq_lengths = batch.get("seq_lengths")
+    if seq_lengths is None:
+        seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
+    selected_seq_lengths = seq_lengths[indices].to(torch.int32)
+
+    label_offsets = batch.get("label_seq_offsets", batch["seq_offsets"]).to(
+        device=batch["inputs"].device,
+        dtype=torch.long,
+    )
+    label_lengths = batch.get("label_seq_lengths")
+    if label_lengths is None:
+        label_lengths = label_offsets[1:] - label_offsets[:-1]
+    selected_label_lengths = label_lengths[indices].to(torch.int32)
+
+    token_total = int(seq_offsets[-1].item()) if seq_offsets.numel() else 0
+    label_total = int(label_offsets[-1].item()) if label_offsets.numel() else 0
+
+    selected = {}
+    for key, value in batch.items():
+        if key in {"seq_offsets", "label_seq_offsets"}:
+            continue
+        if key == "seq_lengths":
+            selected[key] = selected_seq_lengths.to(dtype=value.dtype)
+        elif key == "label_seq_lengths":
+            selected[key] = selected_label_lengths.to(dtype=value.dtype)
+        elif key == "labels" and value.ndim > 0 and value.shape[0] == label_total:
+            selected[key] = _cat_indexed_ranges(value, label_offsets, indices)
+        elif value.ndim > 0 and value.shape[0] == token_total:
+            selected[key] = _cat_indexed_ranges(value, seq_offsets, indices)
+        elif value.ndim > 0 and value.shape[0] == batch_size:
+            selected[key] = value[indices]
+        else:
+            selected[key] = value
+
+    selected["seq_lengths"] = selected_seq_lengths
+    selected["seq_offsets"] = _offsets_from_lengths(selected_seq_lengths, dtype=batch["seq_offsets"].dtype).to(
+        device=batch["seq_offsets"].device
+    )
+    if "label_seq_offsets" in batch or "label_seq_lengths" in batch:
+        selected["label_seq_lengths"] = selected_label_lengths
+        selected["label_seq_offsets"] = _offsets_from_lengths(
+            selected_label_lengths,
+            dtype=batch.get("label_seq_offsets", batch["seq_offsets"]).dtype,
+        ).to(device=batch.get("label_seq_offsets", batch["seq_offsets"]).device)
+
+    return selected
+
+
+def _select_packed_hidden(
+    hidden: torch.Tensor,
+    current_data: Optional[Dict[str, torch.Tensor]],
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    if hidden.shape[0] == 0 or current_data is None or "seq_lengths" not in current_data:
+        return hidden.new_empty((0,) + tuple(hidden.shape[1:]))
+
+    indices = torch.nonzero(sample_mask, as_tuple=False).flatten().to(device=sample_mask.device)
+    lengths = current_data["seq_lengths"].to(device=hidden.device, dtype=torch.long)
+    batch_size = int(lengths.shape[0])
+    if batch_size == 0:
+        return hidden.new_empty((0,) + tuple(hidden.shape[1:]))
+
+    prefix_total = int(hidden.shape[0] - int(lengths.sum().item()))
+    prefix_len = max(prefix_total // batch_size, 0)
+    hidden_lengths = lengths + prefix_len
+    hidden_offsets = _offsets_from_lengths(hidden_lengths, dtype=torch.long).to(device=hidden.device)
+    return _cat_indexed_ranges(hidden, hidden_offsets, indices)
+
+
+def _select_carry_examples(carry: Any, sample_mask: torch.Tensor) -> Any:
+    indices = torch.nonzero(sample_mask, as_tuple=False).flatten().to(device=sample_mask.device)
+    current_data = getattr(carry, "current_data", None)
+    selected_current_data = (
+        _select_batch_examples(current_data, sample_mask)
+        if isinstance(current_data, dict)
+        else current_data
+    )
+
+    current_hidden = getattr(carry, "current_hidden", None)
+    if current_hidden is not None:
+        if isinstance(current_data, dict) and "seq_offsets" in current_data:
+            selected_hidden = _select_packed_hidden(current_hidden, current_data, sample_mask)
+        elif current_hidden.ndim > 0 and current_hidden.shape[0] == sample_mask.shape[0]:
+            selected_hidden = current_hidden[indices]
+        else:
+            selected_hidden = current_hidden
+    else:
+        selected_hidden = None
+
+    updates = {"current_data": selected_current_data}
+    if selected_hidden is not None:
+        updates["current_hidden"] = selected_hidden
+
+    steps = getattr(carry, "steps", None)
+    if steps is not None:
+        updates["steps"] = steps[indices]
+
+    halted = getattr(carry, "halted", None)
+    if halted is not None:
+        updates["halted"] = halted[indices]
+
+    return replace(carry, **updates)
+
+
+def _merge_replay_loss_metrics(
+    probe_metrics: Dict[str, torch.Tensor],
+    replay_metrics: Optional[Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
+    metrics = dict(probe_metrics)
+    loss_keys = [key for key in metrics if key.endswith("loss")]
+    if replay_metrics is None:
+        for key in loss_keys:
+            metrics[key] = torch.zeros_like(metrics[key])
+        return metrics
+
+    for key, value in replay_metrics.items():
+        if key.endswith("loss"):
+            metrics[key] = value.detach()
+    for key in loss_keys:
+        if key not in replay_metrics:
+            metrics[key] = torch.zeros_like(metrics[key])
+    return metrics
+
+
+def _sanitize_sparse_embedding_replay_range(
+    puzzle_emb: Any,
+    start: int,
+    reserved_size: int,
+    active_size: int,
+) -> None:
+    if puzzle_emb is None or not hasattr(puzzle_emb, "local_ids"):
+        return
+    if active_size >= reserved_size:
+        return
+
+    local_ids = puzzle_emb.local_ids
+    end = start + reserved_size
+    active_end = start + active_size
+    if active_size > 0:
+        fill_value = local_ids[start].detach().clone()
+    else:
+        fill_value = torch.zeros((), dtype=local_ids.dtype, device=local_ids.device)
+    local_ids[active_end:end] = fill_value
+
+
+def _train_batch_halted_replay(
+    config: PretrainConfig,
+    train_state: TrainState,
+    batch: Dict[str, torch.Tensor],
+    carry: Any,
+    global_batch_size: int,
+    accum_index: int,
+    local_batch_size: int,
+    puzzle_emb: Any,
+):
+    compute_target_q = train_state.step % config.target_q_update_every == 0
+
+    with torch.no_grad():
+        probe_carry, _probe_loss, probe_metrics, _, _ = train_state.model(
+            carry=carry,
+            batch=batch,
+            return_keys=[],
+            compute_target_q=compute_target_q,
+        )
+
+    halted = probe_carry.halted
+    if halted is None:
+        raise RuntimeError("halted_replay_training requires model carries to expose a halted tensor.")
+
+    halted_count = int(halted.sum().item())
+    replay_metrics = None
+    if halted_count > 0:
+        replay_batch = _select_batch_examples(batch, halted)
+        replay_carry = _select_carry_examples(carry, halted)
+        _replay_carry, replay_loss, replay_metrics, _, _ = train_state.model(
+            carry=replay_carry,
+            batch=replay_batch,
+            return_keys=[],
+            compute_target_q=compute_target_q,
+        )
+
+        loss_scale = 1.0 / (global_batch_size * max(1, config.grad_accum_steps))
+        (loss_scale * replay_loss).backward()
+
+    _sanitize_sparse_embedding_replay_range(
+        puzzle_emb,
+        start=accum_index * local_batch_size,
+        reserved_size=local_batch_size,
+        active_size=halted_count,
+    )
+    return probe_carry, _merge_replay_loss_metrics(probe_metrics, replay_metrics)
 
 
 def train_batch(
@@ -942,17 +1190,33 @@ def train_batch(
         carry = train_state.accum_carries[accum_index]
 
     # Forward
-    compute_target_q = train_state.step % config.target_q_update_every == 0
-    carry, loss, metrics, _, _ = train_state.model(
-        carry=carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
-    )
+    if config.halted_replay_training:
+        carry, metrics = _train_batch_halted_replay(
+            config=config,
+            train_state=train_state,
+            batch=batch,
+            carry=carry,
+            global_batch_size=global_batch_size,
+            accum_index=accum_index,
+            local_batch_size=local_batch_size,
+            puzzle_emb=puzzle_emb,
+        )
+    else:
+        compute_target_q = train_state.step % config.target_q_update_every == 0
+        carry, loss, metrics, _, _ = train_state.model(
+            carry=carry, batch=batch, return_keys=[], compute_target_q=compute_target_q
+        )
+        loss_scale = 1.0 / (global_batch_size * accum_steps)
+        (loss_scale * loss).backward()
+
     if accum_steps == 1:
         train_state.carry = carry
     else:
         train_state.accum_carries[accum_index] = carry
 
-    loss_scale = 1.0 / (global_batch_size * accum_steps)
-    (loss_scale * loss).backward()
+    halted = getattr(carry, "halted", None)
+    if halted is not None:
+        metrics["halted_ratio"] = halted.to(torch.float32).sum()
 
     if len(metrics):
         assert not any(v.requires_grad for v in metrics.values())
@@ -980,9 +1244,13 @@ def train_batch(
                 continue
 
             grad = param.grad
+            created_zero_grad = grad is None
             if grad is None:
-                grad = torch.zeros_like(param)
+                param.grad = torch.zeros_like(param)
+                grad = param.grad
             dist.all_reduce(grad)
+            if created_zero_grad and not torch.any(grad != 0):
+                param.grad = None
 
     # Apply optimizer
     lr_this_step = None
@@ -1018,6 +1286,8 @@ def train_batch(
                 if key.startswith("profile/"):
                     return value / (world_size * accum_steps)
                 if key.endswith("loss"):
+                    return value / (global_batch_size * accum_steps)
+                if key == "halted_ratio":
                     return value / (global_batch_size * accum_steps)
                 return value / count
 

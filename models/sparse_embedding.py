@@ -163,6 +163,12 @@ def _sparse_emb_signsgd_dist(
 
         _validate_ids(all_ids, "All-gathered ids")
 
+    active_rows = all_weights_grad.detach().abs().sum(dim=1) != 0
+    if not torch.any(active_rows):
+        return
+    all_weights_grad = all_weights_grad[active_rows]
+    all_ids = all_ids[active_rows]
+
     # Unique
     grad_ids, inv = all_ids.unique(return_inverse=True)
     inv = inv.to(torch.int64)
