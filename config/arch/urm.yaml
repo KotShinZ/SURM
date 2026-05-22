@@ -8,6 +8,8 @@ loss:
 
 loops: 16
 num_layers: 8
+H_layers: 0
+L_layers: 0  # 0 falls back to num_layers unless explicitly set for HRM mode.
 prelude_layers: 0
 coda_layers: 0
 
@@ -17,6 +19,7 @@ expansion: 4
 
 H_cycles: 4
 L_cycles: 3
+grad_H_cycles: 1
 
 loop_deltas: [0]
 
