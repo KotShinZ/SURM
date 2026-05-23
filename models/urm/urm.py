@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict, Optional, Union
+from typing import Tuple, List, Dict, Literal, Optional, Union
 from dataclasses import dataclass, replace
 import math
 import torch
@@ -115,6 +115,22 @@ class URMConfig(BaseModel):
     prelude_layers: int = 0
     coda_layers: int = 0
     num_memory_tokens: int = 0
+    answer_initial_mode: Literal["default", "black", "random", "noised_label_C", "noised_label_D"] = "default"
+    answer_initial_random_std: float = 1.0
+    answer_initial_C_noise_distribution: Literal["uniform", "beta"] = "beta"
+    answer_initial_C_noise_scale: float = 1.0
+    answer_initial_C_beta_alpha: float = 1.0
+    answer_initial_C_beta_beta: float = 2.0
+    answer_initial_D_ratio_distribution: Literal["constant", "normal", "uniform"] = "uniform"
+    answer_initial_D_ratio_min: float = 0.0
+    answer_initial_D_ratio_max: float = 1.0
+    answer_initial_D_ratio_mean: float = 0.5
+    answer_initial_D_ratio_std: float = 0.25
+    answer_initial_random_token_min: int = 2
+    answer_initial_random_token_max: Optional[int] = None
+    answer_initial_pad_token_id: int = 0
+    answer_initial_eos_token_id: int = 1
+    answer_initial_use_labels_in_eval: bool = False
 
 
 class URMBlock(nn.Module):
@@ -288,6 +304,64 @@ class URM_Inner(nn.Module):
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
         if self.config.num_memory_tokens < 0:
             raise ValueError(f"num_memory_tokens must be >= 0, got {self.config.num_memory_tokens}")
+        if self.config.answer_initial_random_std < 0:
+            raise ValueError(
+                "answer_initial_random_std must be >= 0, "
+                f"got {self.config.answer_initial_random_std}"
+            )
+        if self.config.answer_initial_C_noise_scale < 0:
+            raise ValueError(
+                "answer_initial_C_noise_scale must be >= 0, "
+                f"got {self.config.answer_initial_C_noise_scale}"
+            )
+        if self.config.answer_initial_C_beta_alpha <= 0:
+            raise ValueError(
+                "answer_initial_C_beta_alpha must be > 0, "
+                f"got {self.config.answer_initial_C_beta_alpha}"
+            )
+        if self.config.answer_initial_C_beta_beta <= 0:
+            raise ValueError(
+                "answer_initial_C_beta_beta must be > 0, "
+                f"got {self.config.answer_initial_C_beta_beta}"
+            )
+        if not (0.0 <= self.config.answer_initial_D_ratio_min <= 1.0):
+            raise ValueError(
+                "answer_initial_D_ratio_min must be in [0, 1], "
+                f"got {self.config.answer_initial_D_ratio_min}"
+            )
+        if not (0.0 <= self.config.answer_initial_D_ratio_max <= 1.0):
+            raise ValueError(
+                "answer_initial_D_ratio_max must be in [0, 1], "
+                f"got {self.config.answer_initial_D_ratio_max}"
+            )
+        if self.config.answer_initial_D_ratio_min > self.config.answer_initial_D_ratio_max:
+            raise ValueError(
+                "answer_initial_D_ratio_min must be <= answer_initial_D_ratio_max, "
+                f"got {self.config.answer_initial_D_ratio_min} > {self.config.answer_initial_D_ratio_max}"
+            )
+        if not (0.0 <= self.config.answer_initial_D_ratio_mean <= 1.0):
+            raise ValueError(
+                "answer_initial_D_ratio_mean must be in [0, 1], "
+                f"got {self.config.answer_initial_D_ratio_mean}"
+            )
+        if self.config.answer_initial_D_ratio_std < 0:
+            raise ValueError(
+                "answer_initial_D_ratio_std must be >= 0, "
+                f"got {self.config.answer_initial_D_ratio_std}"
+            )
+        if self.config.answer_initial_random_token_min < 0:
+            raise ValueError(
+                "answer_initial_random_token_min must be >= 0, "
+                f"got {self.config.answer_initial_random_token_min}"
+            )
+        if (
+            self.config.patch_io_enabled
+            and self.config.answer_initial_mode in {"noised_label_C", "noised_label_D"}
+        ):
+            raise ValueError(
+                "noised_label_C/noised_label_D answer initialization requires token embeddings "
+                "and is not supported with patch_io_enabled."
+            )
         self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
 
         if self.config.num_memory_tokens > 0:
@@ -1346,39 +1420,355 @@ class URM(nn.Module):
     def puzzle_emb(self):
         return self.inner.puzzle_emb
 
+    def _rng_kwargs(self, device: torch.device) -> Dict[str, torch.Generator]:
+        generator_device = getattr(self.inner.generator, "device", None)
+        if generator_device is not None and torch.device(generator_device).type == device.type:
+            return {"generator": self.inner.generator}
+        return {}
+
+    def _effective_answer_initial_mode(self) -> str:
+        return self.config.answer_initial_mode
+
+    def _use_label_answer_initial(self) -> bool:
+        return self.training or self.config.answer_initial_use_labels_in_eval
+
+    def _empty_initial_hidden(self, shape: Tuple[int, ...], device: torch.device, low: bool = False) -> torch.Tensor:
+        mode = self._effective_answer_initial_mode()
+        dtype = self.inner.forward_dtype
+        if any(dim == 0 for dim in shape):
+            return torch.empty(shape, dtype=dtype, device=device)
+        if mode == "default":
+            init_hidden = self.inner.low_init_hidden if low else self.inner.init_hidden
+            return init_hidden.to(device=device, dtype=dtype).expand(shape)
+        if mode == "black":
+            return torch.zeros(shape, dtype=dtype, device=device)
+        if mode == "random":
+            hidden = torch.randn(
+                shape,
+                dtype=dtype,
+                device=device,
+                **self._rng_kwargs(device),
+            )
+            return hidden * self.config.answer_initial_random_std
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    def _answer_initial_eps(self, shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        scale = float(self.config.answer_initial_C_noise_scale)
+        if scale == 0 or any(dim == 0 for dim in shape):
+            return torch.zeros(shape, dtype=dtype, device=device)
+        return torch.randn(
+            shape,
+            dtype=dtype,
+            device=device,
+            **self._rng_kwargs(device),
+        ) * scale
+
+    def _sample_C_alphas(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        if any(dim == 0 for dim in shape):
+            return torch.empty(shape, dtype=torch.float32, device=device)
+        if self.config.answer_initial_C_noise_distribution == "uniform":
+            return torch.rand(
+                shape,
+                dtype=torch.float32,
+                device=device,
+                **self._rng_kwargs(device),
+            )
+
+        alpha = float(self.config.answer_initial_C_beta_alpha)
+        beta = float(self.config.answer_initial_C_beta_beta)
+        u = torch.rand(
+            shape,
+            dtype=torch.float32,
+            device=device,
+            **self._rng_kwargs(device),
+        ).clamp(torch.finfo(torch.float32).eps, 1.0 - torch.finfo(torch.float32).eps)
+        if math.isclose(beta, 1.0):
+            return u.pow(1.0 / alpha)
+        if math.isclose(alpha, 1.0):
+            return 1.0 - u.pow(1.0 / beta)
+
+        concentration1 = torch.full(shape, alpha, dtype=torch.float32, device=device)
+        concentration0 = torch.full(shape, beta, dtype=torch.float32, device=device)
+        return torch.distributions.Beta(concentration1, concentration0).sample()
+
+    def _mix_C_label_embeddings(self, label_embeddings: torch.Tensor) -> torch.Tensor:
+        alpha = self._sample_C_alphas(
+            tuple(label_embeddings.shape[:-1]),
+            label_embeddings.device,
+        ).unsqueeze(-1)
+        noise_weight = torch.sqrt((1.0 - alpha.square()).clamp_min(0.0))
+        eps = self._answer_initial_eps(
+            tuple(label_embeddings.shape),
+            label_embeddings.device,
+            label_embeddings.dtype,
+        )
+        return alpha.to(label_embeddings.dtype) * label_embeddings + noise_weight.to(label_embeddings.dtype) * eps
+
+    def _sample_D_ratios(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        distribution = self.config.answer_initial_D_ratio_distribution
+        if distribution == "constant":
+            ratio = float(self.config.answer_initial_D_ratio_max)
+            return torch.full(shape, ratio, dtype=torch.float32, device=device)
+        if distribution == "normal":
+            ratios = torch.randn(
+                shape,
+                dtype=torch.float32,
+                device=device,
+                **self._rng_kwargs(device),
+            )
+            ratios = ratios * float(self.config.answer_initial_D_ratio_std)
+            ratios = ratios + float(self.config.answer_initial_D_ratio_mean)
+            return ratios.clamp(0.0, 1.0)
+
+        ratio_min = float(self.config.answer_initial_D_ratio_min)
+        ratio_max = float(self.config.answer_initial_D_ratio_max)
+        if ratio_min == ratio_max:
+            return torch.full(shape, ratio_min, dtype=torch.float32, device=device)
+        ratios = torch.rand(
+            shape,
+            dtype=torch.float32,
+            device=device,
+            **self._rng_kwargs(device),
+        )
+        return ratios * (ratio_max - ratio_min) + ratio_min
+
+    def _random_token_candidates(self, device: torch.device) -> torch.Tensor:
+        token_max = self.config.answer_initial_random_token_max
+        if token_max is None:
+            token_max = self.config.vocab_size - 1
+        token_min = int(self.config.answer_initial_random_token_min)
+        token_max = int(token_max)
+        if token_max < token_min:
+            raise ValueError(
+                "answer_initial_random_token_max must be >= answer_initial_random_token_min, "
+                f"got {token_max} < {token_min}"
+            )
+
+        candidates = torch.arange(token_min, token_max + 1, dtype=torch.long, device=device)
+        candidates = candidates[
+            (candidates != int(self.config.answer_initial_pad_token_id))
+            & (candidates != int(self.config.answer_initial_eos_token_id))
+        ]
+        candidates = candidates[(0 <= candidates) & (candidates < self.config.vocab_size)]
+        if candidates.numel() == 0:
+            raise ValueError(
+                "answer_initial random token range has no valid tokens after excluding "
+                "pad/eos and clipping to vocab_size."
+            )
+        return candidates
+
+    def _random_non_special_tokens(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        candidates = self._random_token_candidates(device)
+        candidate_indices = torch.randint(
+            candidates.numel(),
+            shape,
+            dtype=torch.long,
+            device=device,
+            **self._rng_kwargs(device),
+        )
+        return candidates[candidate_indices]
+
+    def _fixed_answer_mask(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if "answer_mask" in batch:
+            return batch["answer_mask"].to(device=batch["inputs"].device, dtype=torch.bool)
+        return batch["labels"] != -100
+
+    def _safe_label_tokens(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        labels = labels.to(device=labels.device, dtype=torch.long)
+        valid = (labels >= 0) & (labels < self.config.vocab_size)
+        return torch.where(valid, labels, torch.zeros_like(labels)), valid
+
+    def _label_embeddings(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        safe_labels, valid = self._safe_label_tokens(labels)
+        embeddings = self.inner.embed_tokens(safe_labels.to(torch.int32))
+        return self.inner.embed_scale * embeddings, valid
+
+    def _initial_answer_embeddings(
+        self,
+        labels: torch.Tensor,
+        answer_mask: torch.Tensor,
+        replace_probs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mode = self._effective_answer_initial_mode()
+        if mode == "noised_label_C":
+            embeddings, valid_labels = self._label_embeddings(labels)
+            embeddings = self._mix_C_label_embeddings(embeddings)
+            return embeddings, answer_mask & valid_labels
+
+        if mode != "noised_label_D":
+            embeddings, valid_labels = self._label_embeddings(labels)
+            return embeddings, answer_mask & valid_labels
+
+        safe_labels, valid_labels = self._safe_label_tokens(labels)
+        if replace_probs is None:
+            replace_probs = self._sample_D_ratios(tuple(safe_labels.shape), safe_labels.device)
+        replace_probs = replace_probs.to(device=safe_labels.device, dtype=torch.float32)
+        replace_mask = answer_mask & valid_labels & (
+            torch.rand(
+                tuple(safe_labels.shape),
+                dtype=torch.float32,
+                device=safe_labels.device,
+                **self._rng_kwargs(safe_labels.device),
+            ) < replace_probs
+        )
+        random_tokens = self._random_non_special_tokens(tuple(safe_labels.shape), safe_labels.device)
+        corrupted = torch.where(replace_mask, random_tokens, safe_labels)
+        embeddings = self.inner.embed_scale * self.inner.embed_tokens(corrupted.to(torch.int32))
+        return embeddings, answer_mask & valid_labels
+
+    def _make_fixed_initial_hidden(self, batch: Dict[str, torch.Tensor], low: bool = False) -> torch.Tensor:
+        batch_size = batch["inputs"].shape[0]
+        seq_len = batch["inputs"].shape[1]
+        mode = self._effective_answer_initial_mode()
+        hidden = self._empty_initial_hidden(
+            (batch_size, seq_len + self.inner.prefix_seq_len, self.config.hidden_size),
+            batch["inputs"].device,
+            low=low,
+        )
+        if mode not in {"noised_label_C", "noised_label_D"}:
+            return hidden
+
+        answer_mask = self._fixed_answer_mask(batch)
+        valid_mask = answer_mask
+        if mode == "noised_label_C" and not self._use_label_answer_initial():
+            embeddings = self._answer_initial_eps(
+                (batch_size, seq_len, self.config.hidden_size),
+                batch["inputs"].device,
+                hidden.dtype,
+            )
+        elif mode == "noised_label_D" and not self._use_label_answer_initial():
+            random_tokens = self._random_non_special_tokens((batch_size, seq_len), batch["inputs"].device)
+            embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
+        else:
+            if "labels" not in batch:
+                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
+            replace_probs = None
+            if mode == "noised_label_D":
+                replace_probs = self._sample_D_ratios(
+                    (batch_size,),
+                    batch["inputs"].device,
+                ).view(batch_size, 1)
+            embeddings, valid_mask = self._initial_answer_embeddings(batch["labels"], answer_mask, replace_probs)
+        data_hidden = hidden[:, self.inner.prefix_seq_len : self.inner.prefix_seq_len + seq_len]
+        data_hidden = torch.where(valid_mask.unsqueeze(-1), embeddings.to(hidden.dtype), data_hidden)
+        hidden = hidden.clone()
+        hidden[:, self.inner.prefix_seq_len : self.inner.prefix_seq_len + seq_len] = data_hidden
+        return hidden
+
+    def _packed_answer_labels(self, batch: Dict[str, torch.Tensor], answer_data_mask: torch.Tensor) -> torch.Tensor:
+        labels = batch["labels"]
+        if labels.numel() == batch["inputs"].numel():
+            return labels[answer_data_mask]
+        if labels.numel() == int(answer_data_mask.sum().item()):
+            return labels
+        raise ValueError(
+            "Packed answer initialization expected labels to be either full sequence labels "
+            f"({batch['inputs'].numel()} tokens) or answer-only labels "
+            f"({int(answer_data_mask.sum().item())} tokens), got {labels.numel()}."
+        )
+
+    def _make_packed_initial_hidden(self, batch: Dict[str, torch.Tensor], low: bool = False) -> torch.Tensor:
+        lengths = self.inner._packed_lengths(batch)
+        mode = self._effective_answer_initial_mode()
+        total_len = int((lengths + self.inner.prefix_seq_len).sum().item())
+        hidden = self._empty_initial_hidden(
+            (total_len, self.config.hidden_size),
+            batch["inputs"].device,
+            low=low,
+        )
+        if mode not in {"noised_label_C", "noised_label_D"}:
+            return hidden
+
+        answer_data_mask = self.inner._packed_answer_mask(batch)
+        answer_indices = self.inner._packed_data_token_indices(batch)[answer_data_mask]
+        if answer_indices.numel() == 0:
+            return hidden
+        if mode == "noised_label_C" and not self._use_label_answer_initial():
+            embeddings = self._answer_initial_eps(
+                (answer_indices.numel(), self.config.hidden_size),
+                batch["inputs"].device,
+                hidden.dtype,
+            )
+            valid_mask = torch.ones((answer_indices.numel(),), dtype=torch.bool, device=answer_indices.device)
+        elif mode == "noised_label_D" and not self._use_label_answer_initial():
+            random_tokens = self._random_non_special_tokens((answer_indices.numel(),), batch["inputs"].device)
+            embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
+            valid_mask = torch.ones((answer_indices.numel(),), dtype=torch.bool, device=answer_indices.device)
+        else:
+            if "labels" not in batch:
+                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
+            answer_labels = self._packed_answer_labels(batch, answer_data_mask)
+            replace_probs = None
+            if mode == "noised_label_D":
+                seq_ids = torch.repeat_interleave(
+                    torch.arange(lengths.shape[0], device=batch["inputs"].device, dtype=torch.long),
+                    lengths,
+                )
+                sample_ratios = self._sample_D_ratios((lengths.shape[0],), batch["inputs"].device)
+                replace_probs = sample_ratios[seq_ids[answer_data_mask]]
+            embeddings, valid_mask = self._initial_answer_embeddings(
+                answer_labels,
+                torch.ones_like(answer_labels, dtype=torch.bool, device=answer_labels.device),
+                replace_probs,
+            )
+        hidden = hidden.clone()
+        hidden[answer_indices[valid_mask]] = embeddings[valid_mask].to(hidden.dtype)
+        return hidden
+
+    def _make_initial_low_hidden(self, batch: Dict[str, torch.Tensor], packed: bool) -> Optional[torch.Tensor]:
+        if not self.inner.use_hrm:
+            return None
+        if packed:
+            return self._make_packed_initial_hidden(batch, low=True)
+        return self._make_fixed_initial_hidden(batch, low=True)
+
     def initial_carry(self, batch: Dict[str, torch.Tensor]) -> URMCarry:
         batch_size = batch["puzzle_identifiers"].shape[0] if self.config.variable_seq_lengths else batch["inputs"].shape[0]
         if self.config.variable_seq_lengths:
-            empty_low_hidden = None
-            if self.inner.use_hrm:
-                empty_low_hidden = torch.empty(
-                    0,
-                    self.config.hidden_size,
-                    dtype=self.inner.forward_dtype,
-                    device=batch["inputs"].device,
-                )
+            initial_hidden = self._make_packed_initial_hidden(batch)
             return URMCarry(
-                current_hidden=torch.empty(
-                    0,
-                    self.config.hidden_size,
-                    dtype=self.inner.forward_dtype,
-                    device=batch["inputs"].device,
-                ),
+                current_hidden=initial_hidden,
                 steps=torch.zeros((batch_size,), dtype=torch.int32, device=batch["inputs"].device),
                 halted=torch.ones((batch_size,), dtype=torch.bool, device=batch["inputs"].device),
-                current_data={k: torch.empty_like(v) for k, v in batch.items()},
-                current_low_hidden=empty_low_hidden,
+                current_data=dict(batch),
+                current_low_hidden=self._make_initial_low_hidden(batch, packed=True),
             )
 
         seq_len = batch["inputs"].shape[1] if self.config.variable_seq_lengths else None
         base = self.inner.empty_carry(batch_size, seq_len=seq_len)
+        initial_hidden = self._make_fixed_initial_hidden(batch)
+        initial_low_hidden = self._make_initial_low_hidden(batch, packed=False)
         return URMCarry(
-            current_hidden=base.current_hidden,
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),
-            current_data={k: torch.empty_like(v) for k, v in batch.items()},
-            current_low_hidden=base.current_low_hidden,
+            current_hidden=initial_hidden,
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=batch["inputs"].device),
+            halted=torch.ones((batch_size,), dtype=torch.bool, device=batch["inputs"].device),
+            current_data=dict(batch),
+            current_low_hidden=initial_low_hidden if initial_low_hidden is not None else base.current_low_hidden,
         )
+
+    def _reset_fixed_carry(
+        self,
+        reset_flag: torch.Tensor,
+        carry: URMCarry,
+        current_data: Dict[str, torch.Tensor],
+    ) -> URMCarry:
+        initial_hidden = self._make_fixed_initial_hidden(current_data)
+        new_hidden = torch.where(
+            reset_flag.view(-1, 1, 1),
+            initial_hidden,
+            carry.current_hidden,
+        )
+        new_low_hidden = carry.current_low_hidden
+        if self.inner.use_hrm:
+            if new_low_hidden is None:
+                raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
+            initial_low_hidden = self._make_fixed_initial_hidden(current_data, low=True)
+            new_low_hidden = torch.where(
+                reset_flag.view(-1, 1, 1),
+                initial_low_hidden,
+                new_low_hidden,
+            )
+        return replace(carry, current_hidden=new_hidden, current_low_hidden=new_low_hidden)
 
     @torch.compiler.disable
     def _merge_packed_current_data(self, carry: URMCarry, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1455,22 +1845,32 @@ class URM(nn.Module):
 
         reset = reset_flag.detach().cpu().tolist()
         current_lengths = current_data["seq_lengths"].detach().cpu().tolist()
-        old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.prefix_seq_len).detach().cpu().tolist()
-        old_hidden_offsets = [0]
-        for length in old_hidden_lengths:
-            old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
+        current_hidden_lengths = [int(length) + self.inner.prefix_seq_len for length in current_lengths]
+        current_hidden_offsets = [0]
+        for length in current_hidden_lengths:
+            current_hidden_offsets.append(current_hidden_offsets[-1] + int(length))
+
+        old_hidden_offsets = None
+        if not all(reset):
+            old_hidden_lengths = (carry.current_data["seq_lengths"] + self.inner.prefix_seq_len).detach().cpu().tolist()
+            old_hidden_offsets = [0]
+            for length in old_hidden_lengths:
+                old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
 
         hidden_chunks = []
         low_hidden_chunks = [] if self.inner.use_hrm else None
         if self.inner.use_hrm and carry.current_low_hidden is None:
             raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
+        initial_hidden = self._make_packed_initial_hidden(current_data)
+        initial_low_hidden = self._make_packed_initial_hidden(current_data, low=True) if low_hidden_chunks is not None else None
         for idx, should_reset in enumerate(reset):
-            new_len = int(current_lengths[idx]) + self.inner.prefix_seq_len
             if should_reset:
-                hidden_chunks.append(self.inner.init_hidden.expand(new_len, -1))
+                hidden_chunks.append(initial_hidden[current_hidden_offsets[idx]:current_hidden_offsets[idx + 1]])
                 if low_hidden_chunks is not None:
-                    low_hidden_chunks.append(self.inner.low_init_hidden.expand(new_len, -1))
+                    assert initial_low_hidden is not None
+                    low_hidden_chunks.append(initial_low_hidden[current_hidden_offsets[idx]:current_hidden_offsets[idx + 1]])
             else:
+                assert old_hidden_offsets is not None
                 hidden_chunks.append(carry.current_hidden[old_hidden_offsets[idx]:old_hidden_offsets[idx + 1]])
                 if low_hidden_chunks is not None:
                     low_hidden_chunks.append(carry.current_low_hidden[old_hidden_offsets[idx]:old_hidden_offsets[idx + 1]])
@@ -1577,7 +1977,6 @@ class URM(nn.Module):
             return self._forward_packed(carry, batch, compute_target_q=compute_target_q)
 
         carry, batch = self._align_variable_batch(carry, batch)
-        new_carry = self.inner.reset_carry(carry.halted, carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         new_current_data = {
             k: torch.where(
@@ -1587,6 +1986,7 @@ class URM(nn.Module):
             )
             for k, v in carry.current_data.items()
         }
+        new_carry = self._reset_fixed_carry(carry.halted, carry, new_current_data)
 
         new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
         

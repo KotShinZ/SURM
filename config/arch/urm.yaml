@@ -61,3 +61,29 @@ input_embedding_noise_size: 0.0
 input_injection_enabled: True
 noise_size: 0.0
 noise_seed: 42
+
+# Recurrent hidden initialization for answer slots.
+# default: initialize current_hidden with URM's original learned init_hidden buffer.
+# black: initialize current_hidden to zeros.
+# random: initialize current_hidden from N(0, answer_initial_random_std).
+# noised_label_C: train from alpha * label embedding + sqrt(1 - alpha^2) * eps,
+#   where eps is Gaussian and alpha is sampled from uniform or beta; eval from eps only.
+# noised_label_D: initialize answer hidden states from embeddings of labels with a random
+#   per-sample fraction replaced by random non-pad/eos tokens; eval from fully random embeddings.
+answer_initial_mode: default
+answer_initial_random_std: 1.0
+answer_initial_C_noise_distribution: beta  # uniform | beta
+answer_initial_C_noise_scale: 1.0
+answer_initial_C_beta_alpha: 2.0
+answer_initial_C_beta_beta: 1.0
+answer_initial_D_ratio_distribution: uniform  # constant | normal | uniform
+answer_initial_D_ratio_min: 0.0
+answer_initial_D_ratio_max: 1.0
+answer_initial_D_ratio_mean: 0.5
+answer_initial_D_ratio_std: 0.25
+answer_initial_random_token_min: 2
+answer_initial_random_token_max: null
+answer_initial_pad_token_id: 0
+answer_initial_eos_token_id: 1
+# Set true only for debugging; eval will otherwise avoid label-content initialization.
+answer_initial_use_labels_in_eval: false
