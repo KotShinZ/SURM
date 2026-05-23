@@ -74,8 +74,8 @@ answer_initial_mode: default
 answer_initial_random_std: 1.0
 answer_initial_C_noise_distribution: beta  # uniform | beta
 answer_initial_C_noise_scale: 1.0
-answer_initial_C_beta_alpha: 2.0
-answer_initial_C_beta_beta: 1.0
+answer_initial_C_beta_alpha: 1.0
+answer_initial_C_beta_beta: 2.0
 answer_initial_D_ratio_distribution: uniform  # constant | normal | uniform
 answer_initial_D_ratio_min: 0.0
 answer_initial_D_ratio_max: 1.0
