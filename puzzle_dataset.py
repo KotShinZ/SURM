@@ -169,6 +169,13 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     # Emit labels as only the answer tokens while keeping inputs full-length.
     answer_only_labels: bool = False
 
+    # Separate problem and answer tokens in the model input.
+    label_separate: bool = False
+    SeparateMode: str = "D"
+    separate_mode: Optional[str] = None
+    label_separate_noise_token_min: int = 2
+    label_separate_noise_token_max: Optional[int] = None
+
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
         if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:
@@ -212,6 +219,22 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
                 "full_answer_initial_noise_token_max must be >= full_answer_initial_noise_token_min, "
                 f"got {self.full_answer_initial_noise_token_max} < {self.full_answer_initial_noise_token_min}"
             )
+        if self.label_separate_noise_token_min < 0:
+            raise ValueError(
+                "label_separate_noise_token_min must be >= 0, "
+                f"got {self.label_separate_noise_token_min}"
+            )
+        if (
+            self.label_separate_noise_token_max is not None
+            and self.label_separate_noise_token_max < self.label_separate_noise_token_min
+        ):
+            raise ValueError(
+                "label_separate_noise_token_max must be >= label_separate_noise_token_min, "
+                f"got {self.label_separate_noise_token_max} < {self.label_separate_noise_token_min}"
+            )
+        mode = (self.separate_mode or self.SeparateMode).upper()
+        if mode not in {"C", "D"}:
+            raise ValueError(f"SeparateMode must be 'C' or 'D', got {self.separate_mode or self.SeparateMode!r}")
         return self
 
 
@@ -962,3 +985,266 @@ class PuzzleDataset(IterableDataset):
         if self.metadata.variable_seq_lengths:
             return sum(d["seq_offsets"].size - 1 for d in self._data.values())
         return sum(len(d["inputs"]) for d in self._data.values())
+
+
+class PuzzleDatasetSeparate(PuzzleDataset):
+    """Append noised answer tokens after problem tokens.
+
+    The model sees task embedding + problem tokens + answer tokens. Loss labels
+    ignore the problem span and supervise only the answer span.
+    """
+
+    def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
+        super().__init__(config, split=split)
+        self._base_seq_len = int(self.metadata.seq_len)
+        self.metadata.seq_len = self._base_seq_len * 2
+        self.metadata.sequence_layout = (
+            "label_separate"
+            if self.metadata.sequence_layout is None
+            else f"{self.metadata.sequence_layout}+label_separate"
+        )
+        self.metadata.train_target_mode = "label_separate"
+
+        if self.metadata.position_id_shape is not None:
+            if len(self.metadata.position_id_shape) >= 4:
+                raise ValueError(
+                    "PuzzleDatasetSeparate adds a problem/answer position axis and supports "
+                    "at most 3 existing position axes."
+                )
+            self.metadata.position_id_shape = [2, *self.metadata.position_id_shape]
+
+    def _label_separate_noise_bounds(self) -> Tuple[int, int]:
+        token_min = int(self.config.label_separate_noise_token_min)
+        token_max = self.config.label_separate_noise_token_max
+        token_max = self.metadata.vocab_size - 1 if token_max is None else int(token_max)
+        token_max = min(token_max, self.metadata.vocab_size - 1)
+        if token_min > token_max:
+            raise ValueError(
+                "label_separate noise token range is empty after clipping to vocab_size: "
+                f"min={token_min}, max={token_max}, vocab_size={self.metadata.vocab_size}."
+            )
+        return token_min, token_max
+
+    def _separate_mode(self) -> str:
+        return (self.config.separate_mode or self.config.SeparateMode).upper()
+
+    @staticmethod
+    def _torch_generator_from_numpy(rng: np.random.Generator, device: torch.device) -> torch.Generator:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(rng.integers(0, np.iinfo(np.int64).max)))
+        return generator
+
+    def _make_answer_tokens(
+        self,
+        labels: torch.Tensor,
+        rng: np.random.Generator,
+        *,
+        training: bool,
+        sample_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        valid_mask = labels != IGNORE_LABEL_ID
+        token_min, token_max = self._label_separate_noise_bounds()
+        generator = self._torch_generator_from_numpy(rng, labels.device)
+        noise = torch.randint(
+            low=token_min,
+            high=token_max + 1,
+            size=tuple(labels.shape),
+            generator=generator,
+            device=labels.device,
+            dtype=labels.dtype,
+        )
+
+        if self._separate_mode() == "C":
+            return torch.where(valid_mask, noise, torch.full_like(labels, self.metadata.pad_id))
+
+        safe_labels = torch.where(valid_mask, labels, torch.full_like(labels, self.metadata.pad_id))
+        if training:
+            replace_ratio = torch.rand(
+                sample_shape,
+                generator=generator,
+                device=labels.device,
+                dtype=torch.float32,
+            )
+            while replace_ratio.ndim < labels.ndim:
+                replace_ratio = replace_ratio.unsqueeze(-1)
+            replace_with_noise = torch.rand(
+                tuple(labels.shape),
+                generator=generator,
+                device=labels.device,
+                dtype=torch.float32,
+            ) < replace_ratio
+            answer_tokens = torch.where(valid_mask & replace_with_noise, noise, safe_labels)
+        else:
+            answer_tokens = noise
+
+        return torch.where(valid_mask, answer_tokens, torch.full_like(labels, self.metadata.pad_id))
+
+    @staticmethod
+    def _add_separate_slot_axis(position_ids: torch.Tensor, slot_id: int) -> torch.Tensor:
+        slot_ids = torch.full(
+            position_ids.shape[:-1] + (1,),
+            slot_id,
+            dtype=position_ids.dtype,
+            device=position_ids.device,
+        )
+        return torch.cat([slot_ids, position_ids], dim=-1)
+
+    def _separate_fixed_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        rng: np.random.Generator,
+        *,
+        training: bool,
+    ) -> Dict[str, torch.Tensor]:
+        inputs = batch["inputs"]
+        labels = batch["labels"]
+        answer_tokens = self._make_answer_tokens(
+            labels,
+            rng,
+            training=training,
+            sample_shape=tuple(labels.shape[:1]),
+        )
+        ignore_problem = torch.full_like(labels, IGNORE_LABEL_ID)
+        valid_answer = labels != IGNORE_LABEL_ID
+        problem_mask = torch.zeros_like(valid_answer, dtype=torch.bool)
+
+        batch["inputs"] = torch.cat([inputs, answer_tokens], dim=1)
+        batch["labels"] = torch.cat([ignore_problem, labels], dim=1)
+        batch["answer_mask"] = torch.cat([problem_mask, valid_answer], dim=1)
+        batch["source_inputs"] = batch.get("source_inputs", inputs)
+
+        if "position_ids" in batch:
+            batch["position_ids"] = torch.cat(
+                [
+                    self._add_separate_slot_axis(batch["position_ids"], 0),
+                    self._add_separate_slot_axis(batch["position_ids"], 1),
+                ],
+                dim=1,
+            )
+        if "seq_lengths" in batch:
+            label_lengths = batch.get("label_seq_lengths", batch["seq_lengths"])
+            batch["seq_lengths"] = batch["seq_lengths"] + label_lengths
+        if "label_seq_lengths" in batch:
+            batch["label_seq_lengths"] = batch["seq_lengths"].clone()
+        return batch
+
+    def _separate_packed_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        rng: np.random.Generator,
+        *,
+        training: bool,
+    ) -> Dict[str, torch.Tensor]:
+        seq_offsets = batch["seq_offsets"].to(torch.long)
+        label_offsets = batch.get("label_seq_offsets", batch["seq_offsets"]).to(torch.long)
+        seq_lengths = batch["seq_lengths"].to(torch.long)
+        label_lengths = batch.get("label_seq_lengths", batch["seq_lengths"]).to(torch.long)
+
+        input_chunks = []
+        label_chunks = []
+        answer_mask_chunks = []
+        source_chunks = []
+        position_chunks = [] if "position_ids" in batch else None
+
+        for sample_idx in range(int(batch["puzzle_identifiers"].shape[0])):
+            input_start = int(seq_offsets[sample_idx].item())
+            input_end = int(seq_offsets[sample_idx + 1].item())
+            label_start = int(label_offsets[sample_idx].item())
+            label_end = int(label_offsets[sample_idx + 1].item())
+
+            problem_tokens = batch["inputs"][input_start:input_end]
+            true_labels = batch["labels"][label_start:label_end]
+            answer_tokens = self._make_answer_tokens(
+                true_labels,
+                rng,
+                training=training,
+                sample_shape=(),
+            )
+            valid_answer = true_labels != IGNORE_LABEL_ID
+            safe_labels = torch.where(
+                valid_answer,
+                true_labels,
+                torch.full_like(true_labels, self.metadata.pad_id),
+            )
+
+            input_chunks.extend([problem_tokens, answer_tokens])
+            label_chunks.extend([torch.full_like(problem_tokens, IGNORE_LABEL_ID), true_labels])
+            answer_mask_chunks.extend(
+                [
+                    torch.zeros_like(problem_tokens, dtype=torch.bool),
+                    valid_answer,
+                ]
+            )
+            source_chunks.extend([batch.get("source_inputs", batch["inputs"])[input_start:input_end], safe_labels])
+
+            if position_chunks is not None:
+                problem_positions = batch["position_ids"][input_start:input_end]
+                if true_labels.shape[0] == problem_positions.shape[0]:
+                    answer_positions = problem_positions
+                else:
+                    answer_positions = torch.zeros(
+                        (true_labels.shape[0], problem_positions.shape[-1]),
+                        device=problem_positions.device,
+                        dtype=problem_positions.dtype,
+                    )
+                    answer_positions[:, -1] = torch.arange(
+                        true_labels.shape[0],
+                        device=problem_positions.device,
+                        dtype=problem_positions.dtype,
+                    )
+                position_chunks.extend(
+                    [
+                        self._add_separate_slot_axis(problem_positions, 0),
+                        self._add_separate_slot_axis(answer_positions, 1),
+                    ]
+                )
+
+        new_seq_lengths = (seq_lengths + label_lengths).to(torch.int32)
+        batch["inputs"] = torch.cat(input_chunks, dim=0) if input_chunks else batch["inputs"].new_empty((0,))
+        batch["labels"] = torch.cat(label_chunks, dim=0) if label_chunks else batch["labels"].new_empty((0,))
+        batch["answer_mask"] = (
+            torch.cat(answer_mask_chunks, dim=0)
+            if answer_mask_chunks
+            else torch.empty((0,), dtype=torch.bool, device=batch["inputs"].device)
+        )
+        batch["source_inputs"] = (
+            torch.cat(source_chunks, dim=0)
+            if source_chunks
+            else batch["inputs"].new_empty((0,))
+        )
+        if position_chunks is not None:
+            batch["position_ids"] = (
+                torch.cat(position_chunks, dim=0)
+                if position_chunks
+                else batch["position_ids"].new_empty((0, batch["position_ids"].shape[-1] + 1))
+            )
+
+        batch["seq_lengths"] = new_seq_lengths
+        batch["seq_offsets"] = torch.cat(
+            [
+                torch.zeros((1,), dtype=batch["seq_offsets"].dtype, device=batch["seq_offsets"].device),
+                torch.cumsum(new_seq_lengths.to(batch["seq_offsets"].dtype), dim=0),
+            ]
+        )
+        batch["label_seq_lengths"] = new_seq_lengths.clone()
+        batch["label_seq_offsets"] = batch["seq_offsets"].clone()
+        if "label_seq_shapes" in batch:
+            del batch["label_seq_shapes"]
+        return batch
+
+    def _collate_batch(
+        self,
+        batch,
+        rng: np.random.Generator,
+        make_masked_inputs: bool = True,
+    ):
+        if self.config.masked_input is not None and self.config.masked_input.enabled and make_masked_inputs:
+            raise ValueError("masked_input cannot be combined with label_separate.")
+        if self._should_apply_arc_output_mask(make_masked_inputs):
+            raise ValueError("arc_output_mask cannot be combined with label_separate.")
+
+        collated = super()._collate_batch(batch, rng, make_masked_inputs=False)
+        training = bool(make_masked_inputs and self.split == "train")
+        if self.metadata.variable_seq_lengths:
+            return self._separate_packed_batch(collated, rng, training=training)
+        return self._separate_fixed_batch(collated, rng, training=training)

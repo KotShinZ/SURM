@@ -120,14 +120,20 @@ class ARC:
     ) -> None:
         mask = outputs["puzzle_identifiers"] != self.blank_identifier_id
         input_key = "source_inputs" if "source_inputs" in outputs else "inputs"
+        labels = outputs.get("labels")
 
-        for identifier, input, pred, q, q_log_prob in zip(
+        for row_idx, (identifier, input, pred, q, q_log_prob) in enumerate(zip(
             outputs["puzzle_identifiers"][mask].numpy(),
             outputs[input_key][mask].numpy(),
             outputs["preds"][mask].numpy(),
             q_values[mask].numpy(),
             q_log_probs[mask].numpy(),
-        ):
+        )):
+            if labels is not None and pred.shape != input.shape:
+                label = labels[mask][row_idx].numpy()
+                target_mask = label != IGNORE_LABEL_ID
+                if np.any(target_mask):
+                    pred = pred[target_mask]
             self._record_prediction(
                 int(identifier),
                 self._grid_from_tokens(input),

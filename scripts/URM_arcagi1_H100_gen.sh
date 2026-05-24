@@ -1,4 +1,4 @@
-run_name="URM-arcagi1-gen-act-l4-NC_B12"
+run_name="URM-arcagi1-gen-act-l4-sepD"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
@@ -18,4 +18,5 @@ weight_decay=0.1 \
 +checkpoint_path=$checkpoint_path \
 +ema=True \
 evaluators="[]" \
-+answer_initial_mode="noised_label_C" \
++answer_initial_mode="default" \
++label_separate=True \

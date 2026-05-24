@@ -38,6 +38,11 @@ grid_width: 0
 profile: true
 answer_only: false
 answer_only_context_layers: 0
+label_separate: false
+SeparateMode: D  # C | D
+label_separate_noise_token_min: 2
+label_separate_noise_token_max: null
+label_separate_C_noise_scale: 1.0
 
 eval_interval: 1000
 checkpoint_every_eval: True

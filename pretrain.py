@@ -33,6 +33,7 @@ from puzzle_dataset import (
     MaskedInputConfig,
     PuzzleDataset,
     PuzzleDatasetConfig,
+    PuzzleDatasetSeparate,
     PuzzleDatasetMetadata,
 )
 from puzzle_full_dataset import PuzzleFullDataset
@@ -167,6 +168,12 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Build full-context ARC samples on the fly from one-pair examples.
     mask_full_training: bool = False
+    label_separate: bool = False
+    SeparateMode: str = "D"
+    separate_mode: Optional[str] = None
+    label_separate_noise_token_min: int = 2
+    label_separate_noise_token_max: Optional[int] = None
+    label_separate_C_noise_scale: float = 1.0
     full_min_pairs: int = 3
     full_max_pairs: int = 8
     full_answer_initial_mode: Literal["black", "noised_label"] = "black"
@@ -233,6 +240,37 @@ class ShuffledTestPuzzleDataset(PuzzleDataset):
                 start_index += self.config.global_batch_size
 
 
+class ShuffledTestPuzzleSeparateDataset(PuzzleDatasetSeparate):
+    def _iter_test(self):
+        rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
+
+        for set_name, dataset in self._data.items():  # type: ignore
+            total_examples = (
+                dataset["seq_offsets"].size - 1
+                if self.metadata.variable_seq_lengths
+                else len(dataset["inputs"])
+            )
+            shuffled_indices = rng.permutation(total_examples)
+
+            start_index = 0
+            while start_index < total_examples:
+                end_index = min(total_examples, start_index + self.config.global_batch_size)
+                global_indices = shuffled_indices[start_index:end_index]
+
+                local_start = self.config.rank * self.local_batch_size
+                local_end = min((self.config.rank + 1) * self.local_batch_size, global_indices.size)
+                local_indices = global_indices[local_start:local_end]
+                puzzle_indices = np.searchsorted(dataset["puzzle_indices"], local_indices, side="right") - 1
+
+                batch_fields = self._select_examples(dataset, local_indices)
+                batch_fields["puzzle_identifiers"] = dataset["puzzle_identifiers"][puzzle_indices]
+                batch = self._collate_batch(batch_fields, rng, make_masked_inputs=False)
+
+                yield set_name, batch, end_index - start_index
+
+                start_index += self.config.global_batch_size
+
+
 class ShuffledTestPuzzleFullDataset(PuzzleFullDataset):
     def _iter_test(self):
         rng = np.random.Generator(np.random.Philox(seed=self.config.seed + 10_000 + self.config.rank))
@@ -263,15 +301,39 @@ class ShuffledTestPuzzleFullDataset(PuzzleFullDataset):
                 start_index += self.config.global_batch_size
 
 
+def _label_separate_enabled(config: PretrainConfig) -> bool:
+    return bool(config.label_separate or getattr(config.arch, "label_separate", False))
+
+
+def _config_or_arch_extra(config: PretrainConfig, key: str):
+    return getattr(config.arch, key, getattr(config, key))
+
+
+def _separate_mode(config: PretrainConfig) -> str:
+    mode = getattr(
+        config.arch,
+        "SeparateMode",
+        getattr(config.arch, "separate_mode", config.separate_mode or config.SeparateMode),
+    )
+    return str(mode).upper()
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_test = kwargs.get("test_set_mode", False)
+    label_separate = _label_separate_enabled(config)
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
+    if config.mask_full_training and label_separate:
+        raise ValueError("label_separate cannot be combined with mask_full_training.")
+    if label_separate and online_aug is not None and online_aug.enabled:
+        raise ValueError("label_separate cannot be combined with online_aug.")
     if config.mask_full_training:
         dataset_cls = ShuffledTestPuzzleFullDataset if is_test else PuzzleFullDataset
+    elif label_separate:
+        dataset_cls = ShuffledTestPuzzleSeparateDataset if is_test else PuzzleDatasetSeparate
     else:
         dataset_cls = ShuffledTestPuzzleDataset if is_test else PuzzleDataset
     dataset = dataset_cls(
@@ -292,12 +354,18 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
             full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
             answer_only_labels=bool(getattr(config.arch, "answer_only", False)),
+            label_separate=label_separate,
+            SeparateMode=_separate_mode(config),
+            label_separate_noise_token_min=int(_config_or_arch_extra(config, "label_separate_noise_token_min")),
+            label_separate_noise_token_max=_config_or_arch_extra(config, "label_separate_noise_token_max"),
             **kwargs,
         ),
         split=split,
     )
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
-    if is_test and not config.mask_full_training:
+    if is_test and label_separate:
+        print("Evaluation split uses PuzzleDatasetSeparate with fully noised answer tokens.")
+    elif is_test and not config.mask_full_training:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
     elif is_test:
         print(
@@ -310,6 +378,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             "Training split uses PuzzleFullDataset "
             f"with {config.full_min_pairs}-{config.full_max_pairs} pairs per sample."
         )
+    elif label_separate:
+        print("Training split uses PuzzleDatasetSeparate with appended noised answer tokens.")
     elif dataset.metadata.train_target_mode == "random_output_pair":
         min_context_pairs = dataset.metadata.min_context_pairs
         if min_context_pairs is None and config.arc_output_mask is not None:
@@ -361,6 +431,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         grad_logging_enabled=not config.halted_replay_training,
         causal=False,  # Non-autoregressive
     )
+    model_cfg["label_separate"] = _label_separate_enabled(config)
+    model_cfg["SeparateMode"] = _separate_mode(config)
+    model_cfg["label_separate_C_noise_scale"] = float(_config_or_arch_extra(config, "label_separate_C_noise_scale"))
     model_cfg = _apply_position_id_shape_to_model_cfg(model_cfg, train_metadata.position_id_shape)
 
     # Instantiate model with loss head

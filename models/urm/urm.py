@@ -112,6 +112,10 @@ class URMConfig(BaseModel):
     grad_logging_enabled: bool = True
     answer_only: bool = False
     answer_only_context_layers: int = 0
+    label_separate: bool = False
+    SeparateMode: str = "D"
+    separate_mode: Optional[str] = None
+    label_separate_C_noise_scale: float = 1.0
     prelude_layers: int = 0
     coda_layers: int = 0
     num_memory_tokens: int = 0
@@ -309,6 +313,13 @@ class URM_Inner(nn.Module):
                 "answer_initial_random_std must be >= 0, "
                 f"got {self.config.answer_initial_random_std}"
             )
+        if self.config.label_separate_C_noise_scale < 0:
+            raise ValueError(
+                "label_separate_C_noise_scale must be >= 0, "
+                f"got {self.config.label_separate_C_noise_scale}"
+            )
+        if self._separate_mode() not in {"C", "D"}:
+            raise ValueError(f"SeparateMode must be 'C' or 'D', got {self._separate_mode()!r}")
         if self.config.answer_initial_C_noise_scale < 0:
             raise ValueError(
                 "answer_initial_C_noise_scale must be >= 0, "
@@ -574,7 +585,120 @@ class URM_Inner(nn.Module):
             return None
         return self.memory_tokens.to(device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+    def _separate_mode(self) -> str:
+        return str(self.config.separate_mode or self.config.SeparateMode).upper()
+
+    def _label_separate_C_enabled(self) -> bool:
+        return bool(self.config.label_separate and self._separate_mode() == "C")
+
+    def _sample_label_separate_C_alphas(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        if any(dim == 0 for dim in shape):
+            return torch.empty(shape, dtype=torch.float32, device=device)
+        rng_kwargs = {}
+        generator_device = getattr(self.generator, "device", None)
+        if generator_device is not None and torch.device(generator_device).type == device.type:
+            rng_kwargs["generator"] = self.generator
+        u = torch.rand(
+            shape,
+            dtype=torch.float32,
+            device=device,
+            **rng_kwargs,
+        )
+        u = u.clamp(torch.finfo(torch.float32).eps, 1.0 - torch.finfo(torch.float32).eps)
+        return 1.0 - torch.sqrt(1.0 - u)
+
+    def _label_separate_C_noise(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        scale = float(self.config.label_separate_C_noise_scale)
+        if scale == 0 or any(dim == 0 for dim in shape):
+            return torch.zeros(shape, dtype=dtype, device=device)
+        rng_kwargs = {}
+        generator_device = getattr(self.generator, "device", None)
+        if generator_device is not None and torch.device(generator_device).type == device.type:
+            rng_kwargs["generator"] = self.generator
+        return torch.randn(shape, dtype=dtype, device=device, **rng_kwargs) * scale
+
+    def _label_separate_C_mixed_embeddings(self, labels: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            safe_labels = torch.where(labels >= 0, labels, torch.zeros_like(labels)).to(torch.int32)
+            label_embeddings = self.embed_scale * self.embed_tokens(safe_labels)
+            noise = self._label_separate_C_noise(
+                tuple(label_embeddings.shape),
+                label_embeddings.device,
+                label_embeddings.dtype,
+            )
+            alpha = self._sample_label_separate_C_alphas(
+                tuple(label_embeddings.shape[:-1]),
+                label_embeddings.device,
+            ).unsqueeze(-1)
+            return alpha.to(label_embeddings.dtype) * label_embeddings + (1.0 - alpha).to(label_embeddings.dtype) * noise
+
+        return self._label_separate_C_noise(
+            (*tuple(labels.shape), self.config.hidden_size),
+            labels.device,
+            self.forward_dtype,
+        )
+
+    def _apply_label_separate_C_fixed(
+        self,
+        embedding: torch.Tensor,
+        batch: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        if batch is None or not self._label_separate_C_enabled() or "answer_mask" not in batch:
+            return embedding
+
+        answer_mask = batch["answer_mask"].to(device=embedding.device, dtype=torch.bool)
+        if not bool(answer_mask.any().item()):
+            return embedding
+
+        labels = batch.get("labels")
+        if labels is None:
+            labels = torch.zeros(answer_mask.shape, dtype=torch.long, device=embedding.device)
+        else:
+            labels = labels.to(device=embedding.device, dtype=torch.long)
+
+        mixed = self._label_separate_C_mixed_embeddings(labels)
+        data_embedding = embedding[:, self.prefix_seq_len : self.prefix_seq_len + answer_mask.shape[1]]
+        data_embedding = torch.where(answer_mask.unsqueeze(-1), mixed.to(data_embedding.dtype), data_embedding)
+        embedding = embedding.clone()
+        embedding[:, self.prefix_seq_len : self.prefix_seq_len + answer_mask.shape[1]] = data_embedding
+        return embedding
+
+    def _apply_label_separate_C_packed(
+        self,
+        embedding: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+        token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self._label_separate_C_enabled() or "answer_mask" not in batch:
+            return embedding
+
+        answer_mask = batch["answer_mask"].to(device=batch["inputs"].device, dtype=torch.bool)
+        if not bool(answer_mask.any().item()):
+            return embedding
+
+        labels = batch.get("labels")
+        if labels is None or labels.numel() != answer_mask.numel():
+            labels = torch.zeros((answer_mask.numel(),), dtype=torch.long, device=batch["inputs"].device)
+        else:
+            labels = labels.to(device=batch["inputs"].device, dtype=torch.long)
+
+        answer_indices = token_indices[answer_mask]
+        mixed = self._label_separate_C_mixed_embeddings(labels[answer_mask])
+        embedding = embedding.clone()
+        embedding[answer_indices] = mixed.to(embedding.dtype)
+        return embedding
+
+    def _input_embeddings(
+        self,
+        input: torch.Tensor,
+        puzzle_identifiers: torch.Tensor,
+        batch: Optional[Dict[str, torch.Tensor]] = None,
+    ):
         if self.config.patch_io_enabled:
             pixels = self.pre_embedding(self._one_hot_inputs(input))
             embedding = self.embed_tokens(self._patchify(pixels))
@@ -601,6 +725,7 @@ class URM_Inner(nn.Module):
                 dim=-2,
             )
         embedding = self.embed_scale * embedding
+        embedding = self._apply_label_separate_C_fixed(embedding, batch)
 
         if self.config.input_embedding_noise_size > 0:
             noise = torch.randn(
@@ -714,6 +839,7 @@ class URM_Inner(nn.Module):
             embedding = token_embedding
 
         embedding = self.embed_scale * embedding
+        embedding = self._apply_label_separate_C_packed(embedding, batch, token_indices)
 
         if self.config.input_embedding_noise_size > 0:
             noise = torch.randn(
@@ -1032,7 +1158,7 @@ class URM_Inner(nn.Module):
             cos_sin=self._rotary_cos_sin(batch),
             sequence_lengths=self._sequence_lengths(batch),
         )
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
         input_embeddings = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
