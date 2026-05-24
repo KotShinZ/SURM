@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -998,6 +999,7 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         super().__init__(config, split=split)
         self._base_seq_len = int(self.metadata.seq_len)
         self.metadata.seq_len = self._base_seq_len * 2
+        self._separate_position_slot_axis = False
         self.metadata.sequence_layout = (
             "label_separate"
             if self.metadata.sequence_layout is None
@@ -1005,13 +1007,33 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         )
         self.metadata.train_target_mode = "label_separate"
 
-        if self.metadata.position_id_shape is not None:
-            if len(self.metadata.position_id_shape) >= 4:
+        position_id_shape = self.metadata.position_id_shape
+        if position_id_shape is None and self.metadata.variable_seq_lengths:
+            position_id_shape = self._infer_generated_position_id_shape()
+
+        if position_id_shape is not None:
+            if len(position_id_shape) >= 4:
                 raise ValueError(
                     "PuzzleDatasetSeparate adds a problem/answer position axis and supports "
                     "at most 3 existing position axes."
                 )
-            self.metadata.position_id_shape = [2, *self.metadata.position_id_shape]
+            self.metadata.position_id_shape = [2, *position_id_shape]
+            self._separate_position_slot_axis = True
+
+    def _infer_generated_position_id_shape(self) -> Optional[List[int]]:
+        """Infer the 2D position shape used by PuzzleDataset._collate_batch.
+
+        Variable-length ARC-style datasets often store seq_shapes but leave
+        metadata.position_id_shape unset. The base collator still generates
+        2D row/column position_ids from those seq_shapes; label_separate then
+        adds a problem/answer slot axis. Exposing that inferred slot shape in
+        metadata lets the model select 3D RoPE instead of silently treating the
+        slot axis as the row axis.
+        """
+        side = math.isqrt(self._base_seq_len)
+        if side * side == self._base_seq_len:
+            return [side, side]
+        return None
 
     def _label_separate_noise_bounds(self) -> Tuple[int, int]:
         token_min = int(self.config.label_separate_noise_token_min)
@@ -1089,6 +1111,11 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         )
         return torch.cat([slot_ids, position_ids], dim=-1)
 
+    def _maybe_add_separate_slot_axis(self, position_ids: torch.Tensor, slot_id: int) -> torch.Tensor:
+        if not self._separate_position_slot_axis:
+            return position_ids
+        return self._add_separate_slot_axis(position_ids, slot_id)
+
     def _separate_fixed_batch(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1116,8 +1143,8 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         if "position_ids" in batch:
             batch["position_ids"] = torch.cat(
                 [
-                    self._add_separate_slot_axis(batch["position_ids"], 0),
-                    self._add_separate_slot_axis(batch["position_ids"], 1),
+                    self._maybe_add_separate_slot_axis(batch["position_ids"], 0),
+                    self._maybe_add_separate_slot_axis(batch["position_ids"], 1),
                 ],
                 dim=1,
             )
@@ -1194,8 +1221,8 @@ class PuzzleDatasetSeparate(PuzzleDataset):
                     )
                 position_chunks.extend(
                     [
-                        self._add_separate_slot_axis(problem_positions, 0),
-                        self._add_separate_slot_axis(answer_positions, 1),
+                        self._maybe_add_separate_slot_axis(problem_positions, 0),
+                        self._maybe_add_separate_slot_axis(answer_positions, 1),
                     ]
                 )
 

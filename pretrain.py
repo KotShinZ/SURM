@@ -1237,12 +1237,14 @@ def train_batch(
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
+    # for key in batch.keys():
+    #     print(f"Batch key: {key}, shape: {batch[key].shape}, dtype: {batch[key].dtype}")
 
     accum_index = train_state.accum_step % accum_steps
     local_batch_size = int(batch["puzzle_identifiers"].shape[0] if "puzzle_identifiers" in batch else batch["inputs"].shape[0])
     puzzle_emb = _get_puzzle_embedding_module(train_state.model)
-    if puzzle_emb is not None and hasattr(puzzle_emb, "set_local_range"):
-        puzzle_emb.set_local_range(accum_index * local_batch_size, local_batch_size)
+    # if puzzle_emb is not None and hasattr(puzzle_emb, "set_local_range"):
+    #     puzzle_emb.set_local_range(accum_index * local_batch_size, local_batch_size)
 
     if accum_steps == 1:
         # Preserve the original single-carry behavior for non-accumulated training.
