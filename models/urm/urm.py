@@ -682,13 +682,20 @@ class URM_Inner(nn.Module):
             return embedding
 
         labels = batch.get("labels")
-        if labels is None or labels.numel() != answer_mask.numel():
-            labels = torch.zeros((answer_mask.numel(),), dtype=torch.long, device=batch["inputs"].device)
+        answer_count = int(answer_mask.sum().item())
+        if labels is None:
+            answer_labels = torch.zeros((answer_count,), dtype=torch.long, device=batch["inputs"].device)
         else:
             labels = labels.to(device=batch["inputs"].device, dtype=torch.long)
+            if labels.numel() == answer_mask.numel():
+                answer_labels = labels[answer_mask]
+            elif labels.numel() == answer_count:
+                answer_labels = labels
+            else:
+                answer_labels = torch.zeros((answer_count,), dtype=torch.long, device=batch["inputs"].device)
 
         answer_indices = token_indices[answer_mask]
-        mixed = self._label_separate_C_mixed_embeddings(labels[answer_mask])
+        mixed = self._label_separate_C_mixed_embeddings(answer_labels)
         embedding = embedding.clone()
         embedding[answer_indices] = mixed.to(embedding.dtype)
         return embedding

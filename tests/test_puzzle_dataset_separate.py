@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+from models.losses import IGNORE_LABEL_ID  # noqa: E402
 from puzzle_dataset import PuzzleDatasetConfig, PuzzleDatasetSeparate  # noqa: E402
 
 
@@ -43,6 +44,35 @@ def _write_variable_dataset(root: Path) -> None:
     np.save(split_dir / "all__seq_shapes.npy", np.array([[2, 2], [2, 2]], dtype=np.int32))
     np.save(split_dir / "all__label_seq_shapes.npy", np.array([[2, 2], [2, 2]], dtype=np.int32))
     np.save(split_dir / "all__puzzle_indices.npy", np.array([0, 2], dtype=np.int32))
+    np.save(split_dir / "all__group_indices.npy", np.array([0, 1], dtype=np.int32))
+    np.save(split_dir / "all__puzzle_identifiers.npy", np.array([1], dtype=np.int32))
+
+
+def _write_mismatched_variable_dataset(root: Path) -> None:
+    split_dir = root / "train"
+    split_dir.mkdir(parents=True)
+    metadata = {
+        "pad_id": 0,
+        "ignore_label_id": 0,
+        "blank_identifier_id": 0,
+        "vocab_size": 12,
+        "seq_len": 9,
+        "num_puzzle_identifiers": 2,
+        "total_groups": 1,
+        "mean_puzzle_examples": 1.0,
+        "sets": ["all"],
+        "variable_seq_lengths": True,
+        "position_id_shape": None,
+    }
+    (split_dir / "dataset.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    np.save(split_dir / "all__inputs.npy", np.array([2, 3, 4, 5], dtype=np.uint8))
+    np.save(split_dir / "all__labels.npy", np.array([6, 7, 0, 9, 10, 11], dtype=np.uint8))
+    np.save(split_dir / "all__seq_offsets.npy", np.array([0, 4], dtype=np.int64))
+    np.save(split_dir / "all__label_seq_offsets.npy", np.array([0, 6], dtype=np.int64))
+    np.save(split_dir / "all__seq_shapes.npy", np.array([[2, 2]], dtype=np.int32))
+    np.save(split_dir / "all__label_seq_shapes.npy", np.array([[3, 2]], dtype=np.int32))
+    np.save(split_dir / "all__puzzle_indices.npy", np.array([0, 1], dtype=np.int32))
     np.save(split_dir / "all__group_indices.npy", np.array([0, 1], dtype=np.int32))
     np.save(split_dir / "all__puzzle_identifiers.npy", np.array([1], dtype=np.int32))
 
@@ -106,6 +136,44 @@ class PuzzleDatasetSeparateTests(unittest.TestCase):
             )
 
             self.assertEqual(set(answer_tokens.tolist()), {3, 9})
+
+    def test_answer_only_labels_keep_mismatched_problem_and_answer_lengths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dataset_path = Path(tmp_dir)
+            _write_mismatched_variable_dataset(dataset_path)
+
+            dataset = PuzzleDatasetSeparate(
+                _separate_config(dataset_path, answer_only_labels=True),
+                split="train",
+            )
+
+            _set_name, batch, _effective_batch_size = next(iter(dataset))
+            self.assertEqual(tuple(batch["inputs"].shape), (10,))
+            self.assertEqual(tuple(batch["labels"].shape), (6,))
+            self.assertEqual(batch["labels"].tolist(), [6, 7, IGNORE_LABEL_ID, 9, 10, 11])
+            self.assertEqual(batch["seq_lengths"].tolist(), [10])
+            self.assertEqual(batch["seq_offsets"].tolist(), [0, 10])
+            self.assertEqual(batch["label_seq_lengths"].tolist(), [6])
+            self.assertEqual(batch["label_seq_offsets"].tolist(), [0, 6])
+            self.assertEqual(
+                batch["answer_mask"].tolist(),
+                [False, False, False, False, True, True, True, True, True, True],
+            )
+            self.assertEqual(
+                batch["position_ids"].tolist(),
+                [
+                    [0, 0, 0],
+                    [0, 0, 1],
+                    [0, 1, 0],
+                    [0, 1, 1],
+                    [1, 0, 0],
+                    [1, 0, 1],
+                    [1, 1, 0],
+                    [1, 1, 1],
+                    [1, 2, 0],
+                    [1, 2, 1],
+                ],
+            )
 
 
 if __name__ == "__main__":

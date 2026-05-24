@@ -359,6 +359,22 @@ class PuzzleDataset(IterableDataset):
             )
         raise ValueError(f"Unsupported position_ids shape for padding: {position_ids.shape}.")
 
+    def _should_pad_variable_inputs_and_labels(
+        self,
+        dataset: dict,
+        input_shapes: np.ndarray,
+        label_shapes: np.ndarray,
+    ) -> bool:
+        return (
+            "labels" in dataset
+            and "seq_shapes" in dataset
+            and "label_seq_shapes" in dataset
+            and input_shapes.ndim == 2
+            and label_shapes.ndim == 2
+            and input_shapes.shape[1] == 2
+            and label_shapes.shape[1] == 2
+        )
+
     def _select_examples(self, dataset: dict, indices: np.ndarray) -> dict:
         if not self.metadata.variable_seq_lengths:
             batch = {
@@ -381,14 +397,10 @@ class PuzzleDataset(IterableDataset):
             if "labels" in dataset
             else None
         )
-        pad_inputs_and_labels = (
-            "labels" in dataset
-            and "seq_shapes" in dataset
-            and "label_seq_shapes" in dataset
-            and shapes.ndim == 2
-            and selected_label_shapes.ndim == 2
-            and shapes.shape[1] == 2
-            and selected_label_shapes.shape[1] == 2
+        pad_inputs_and_labels = self._should_pad_variable_inputs_and_labels(
+            dataset,
+            shapes,
+            selected_label_shapes,
         )
         if pad_inputs_and_labels:
             target_shapes = np.maximum(shapes, selected_label_shapes).astype(np.int32, copy=False)
@@ -1116,6 +1128,41 @@ class PuzzleDatasetSeparate(PuzzleDataset):
             return position_ids
         return self._add_separate_slot_axis(position_ids, slot_id)
 
+    def _should_pad_variable_inputs_and_labels(
+        self,
+        dataset: dict,
+        input_shapes: np.ndarray,
+        label_shapes: np.ndarray,
+    ) -> bool:
+        return False
+
+    @staticmethod
+    def _answer_positions_from_shape(
+        problem_positions: torch.Tensor,
+        label_shape: torch.Tensor,
+        label_length: int,
+    ) -> torch.Tensor:
+        width = (
+            max(int(label_shape.reshape(-1)[-1].item()), 1)
+            if label_shape.numel() >= 2
+            else max(label_length, 1)
+        )
+        positions = torch.arange(
+            label_length,
+            device=problem_positions.device,
+            dtype=problem_positions.dtype,
+        )
+        row_col = torch.stack([positions // width, positions % width], dim=-1)
+        if problem_positions.shape[-1] == 2:
+            return row_col
+
+        leading = torch.zeros(
+            (label_length, problem_positions.shape[-1] - 2),
+            device=problem_positions.device,
+            dtype=problem_positions.dtype,
+        )
+        return torch.cat([leading, row_col], dim=-1)
+
     def _separate_fixed_batch(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1166,6 +1213,8 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         label_offsets = batch.get("label_seq_offsets", batch["seq_offsets"]).to(torch.long)
         seq_lengths = batch["seq_lengths"].to(torch.long)
         label_lengths = batch.get("label_seq_lengths", batch["seq_lengths"]).to(torch.long)
+        label_shapes = batch.get("label_seq_shapes")
+        answer_only_labels = bool(self.config.answer_only_labels)
 
         input_chunks = []
         label_chunks = []
@@ -1193,20 +1242,30 @@ class PuzzleDatasetSeparate(PuzzleDataset):
                 true_labels,
                 torch.full_like(true_labels, self.metadata.pad_id),
             )
+            answer_span_mask = torch.ones_like(true_labels, dtype=torch.bool)
 
             input_chunks.extend([problem_tokens, answer_tokens])
-            label_chunks.extend([torch.full_like(problem_tokens, IGNORE_LABEL_ID), true_labels])
+            if answer_only_labels:
+                label_chunks.append(true_labels)
+            else:
+                label_chunks.extend([torch.full_like(problem_tokens, IGNORE_LABEL_ID), true_labels])
             answer_mask_chunks.extend(
                 [
                     torch.zeros_like(problem_tokens, dtype=torch.bool),
-                    valid_answer,
+                    answer_span_mask if answer_only_labels else valid_answer,
                 ]
             )
             source_chunks.extend([batch.get("source_inputs", batch["inputs"])[input_start:input_end], safe_labels])
 
             if position_chunks is not None:
                 problem_positions = batch["position_ids"][input_start:input_end]
-                if true_labels.shape[0] == problem_positions.shape[0]:
+                if label_shapes is not None:
+                    answer_positions = self._answer_positions_from_shape(
+                        problem_positions,
+                        label_shapes[sample_idx],
+                        int(true_labels.shape[0]),
+                    )
+                elif true_labels.shape[0] == problem_positions.shape[0]:
                     answer_positions = problem_positions
                 else:
                     answer_positions = torch.zeros(
@@ -1227,6 +1286,7 @@ class PuzzleDatasetSeparate(PuzzleDataset):
                 )
 
         new_seq_lengths = (seq_lengths + label_lengths).to(torch.int32)
+        new_label_lengths = label_lengths.to(torch.int32) if answer_only_labels else new_seq_lengths
         batch["inputs"] = torch.cat(input_chunks, dim=0) if input_chunks else batch["inputs"].new_empty((0,))
         batch["labels"] = torch.cat(label_chunks, dim=0) if label_chunks else batch["labels"].new_empty((0,))
         batch["answer_mask"] = (
@@ -1253,8 +1313,13 @@ class PuzzleDatasetSeparate(PuzzleDataset):
                 torch.cumsum(new_seq_lengths.to(batch["seq_offsets"].dtype), dim=0),
             ]
         )
-        batch["label_seq_lengths"] = new_seq_lengths.clone()
-        batch["label_seq_offsets"] = batch["seq_offsets"].clone()
+        batch["label_seq_lengths"] = new_label_lengths
+        batch["label_seq_offsets"] = torch.cat(
+            [
+                torch.zeros((1,), dtype=batch["seq_offsets"].dtype, device=batch["seq_offsets"].device),
+                torch.cumsum(new_label_lengths.to(batch["seq_offsets"].dtype), dim=0),
+            ]
+        )
         if "label_seq_shapes" in batch:
             del batch["label_seq_shapes"]
         return batch

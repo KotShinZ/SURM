@@ -230,6 +230,39 @@ class URMAnswerInitialTests(unittest.TestCase):
         non_answer_hidden = carry.current_hidden[~answer_mask]
         self.assertTrue(torch.equal(non_answer_hidden, torch.zeros_like(non_answer_hidden)))
 
+    def test_label_separate_c_packed_uses_answer_only_labels(self) -> None:
+        model = URM(
+            _urm_config(
+                seq_len=5,
+                variable_seq_lengths=True,
+                label_separate=True,
+                SeparateMode="C",
+            )
+        )
+        answer_mask = torch.tensor([True, False, True, True, False], dtype=torch.bool)
+        answer_labels = torch.tensor([2, 4, 5], dtype=torch.int32)
+        batch = {
+            "inputs": torch.tensor([2, 3, 4, 5, 2], dtype=torch.int32),
+            "labels": answer_labels,
+            "answer_mask": answer_mask,
+            "seq_lengths": torch.tensor([3, 2], dtype=torch.int32),
+            "seq_offsets": torch.tensor([0, 3, 5], dtype=torch.int32),
+            "label_seq_lengths": torch.tensor([2, 1], dtype=torch.int32),
+            "label_seq_offsets": torch.tensor([0, 2, 3], dtype=torch.int32),
+            "puzzle_identifiers": torch.zeros((2,), dtype=torch.int64),
+        }
+
+        def fake_mixed_embeddings(labels: torch.Tensor) -> torch.Tensor:
+            return labels.to(torch.float32).unsqueeze(-1).expand(-1, model.config.hidden_size)
+
+        model.inner._label_separate_C_mixed_embeddings = fake_mixed_embeddings
+        embeddings = torch.zeros((5, model.config.hidden_size), dtype=torch.float32)
+        mixed = model.inner._apply_label_separate_C_packed(embeddings, batch, torch.arange(5))
+
+        expected = torch.zeros_like(embeddings)
+        expected[answer_mask] = fake_mixed_embeddings(answer_labels)
+        torch.testing.assert_close(mixed, expected)
+
     def test_eval_noised_label_c_uses_continuous_noise_without_labels(self) -> None:
         model = URM(
             _urm_config(
