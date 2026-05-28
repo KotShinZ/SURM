@@ -54,6 +54,7 @@ class DataProcessConfig(BaseModel):
     num_aug: SourceNumAugConfig = Field(default_factory=SourceNumAugConfig)
     num_aug_gen: Optional[int] = None
     no_padding: bool = False
+    no_eos: bool = False
     include_arc_gen: bool = False
     arc_gen_dir: Optional[str] = "data/arc-gen"
     arc_gen2_dir: Optional[str] = None
@@ -96,19 +97,28 @@ ARC_AGI2_SOURCE = "ARC-AGI2"
 ARC_GEN1_SOURCE = "ARC-GEN1"
 ARC_GEN2_SOURCE = "ARC-GEN2"
 ARC_SOURCES = {ARC_AGI1_SOURCE, ARC_AGI2_SOURCE, ARC_GEN1_SOURCE, ARC_GEN2_SOURCE}
+ARCColorCount = 10
+ARCColorOffsetWithEos = 2
+ARCColorOffsetNoEos = 1
 
-_ARC_TOKEN_BG_COLORS = {
-    2: 16,   # ARC color 0: black
-    3: 21,   # ARC color 1: blue
-    4: 196,  # ARC color 2: red
-    5: 46,   # ARC color 3: green
-    6: 226,  # ARC color 4: yellow
-    7: 244,  # ARC color 5: gray
-    8: 201,  # ARC color 6: magenta
-    9: 208,  # ARC color 7: orange
-    10: 51,  # ARC color 8: cyan
-    11: 88,  # ARC color 9: dark red
+_ARC_COLOR_BG_COLORS = {
+    0: 16,   # ARC color 0: black
+    1: 21,   # ARC color 1: blue
+    2: 196,  # ARC color 2: red
+    3: 46,   # ARC color 3: green
+    4: 226,  # ARC color 4: yellow
+    5: 244,  # ARC color 5: gray
+    6: 201,  # ARC color 6: magenta
+    7: 208,  # ARC color 7: orange
+    8: 51,   # ARC color 8: cyan
+    9: 88,   # ARC color 9: dark red
 }
+
+
+def _arc_color_offset(include_eos: bool, color_offset: Optional[int] = None) -> int:
+    if color_offset is not None:
+        return color_offset
+    return ARCColorOffsetWithEos if include_eos else ARCColorOffsetNoEos
     
 
 @dataclass
@@ -204,56 +214,93 @@ def filter_puzzles_by_size(
     return filtered_puzzles
 
 
-def np_grid_to_fixed_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_translation: bool):
-    # PAD: 0, <eos>: 1, digits: 2 ... 11
+def np_grid_to_fixed_seq_translational_augment(
+    inp: np.ndarray,
+    out: np.ndarray,
+    do_translation: bool,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+):
+    # With EOS: PAD: 0, <eos>: 1, digits: 2 ... 11.
+    # Without EOS: PAD: 0, digits: 1 ... 10.
     # Compute random top-left pad
     if do_translation:
         pad_r = np.random.randint(0, ARCMaxGridSize - max(inp.shape[0], out.shape[0]) + 1)
         pad_c = np.random.randint(0, ARCMaxGridSize - max(inp.shape[1], out.shape[1]) + 1)
     else:
         pad_r = pad_c = 0
+    color_offset = _arc_color_offset(include_eos, color_offset)
 
     # Pad grid
     result = []
     for grid in [inp, out]:
         nrow, ncol = grid.shape
-        grid = np.pad(grid + 2, ((pad_r, ARCMaxGridSize - pad_r - nrow), (pad_c, ARCMaxGridSize - pad_c - ncol)), constant_values=0)
+        grid = np.pad(
+            grid + color_offset,
+            (
+                (pad_r, ARCMaxGridSize - pad_r - nrow),
+                (pad_c, ARCMaxGridSize - pad_c - ncol),
+            ),
+            constant_values=0,
+        )
 
-        # Add <eos>
-        eos_row, eos_col = pad_r + nrow, pad_c + ncol
-        if eos_row < ARCMaxGridSize:
-            grid[eos_row, pad_c:eos_col] = 1
-        if eos_col < ARCMaxGridSize:
-            grid[pad_r:eos_row, eos_col] = 1
+        if include_eos:
+            # Add <eos>
+            eos_row, eos_col = pad_r + nrow, pad_c + ncol
+            if eos_row < ARCMaxGridSize:
+                grid[eos_row, pad_c:eos_col] = 1
+            if eos_col < ARCMaxGridSize:
+                grid[pad_r:eos_row, eos_col] = 1
 
         result.append(grid.flatten())
 
     return result
 
 
-def _np_grid_to_unpadded_seq(grid: np.ndarray):
-    # PAD: 0, <eos>: 1, digits: 2 ... 11
+def _np_grid_to_unpadded_seq(
+    grid: np.ndarray,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+):
+    # With EOS: PAD: 0, <eos>: 1, digits: 2 ... 11.
+    # Without EOS: PAD: 0, digits: 1 ... 10.
     canvas_h, canvas_w = grid.shape
-    if canvas_h < ARCMaxGridSize:
+    if include_eos and canvas_h < ARCMaxGridSize:
         canvas_h += 1
-    if canvas_w < ARCMaxGridSize:
+    if include_eos and canvas_w < ARCMaxGridSize:
         canvas_w += 1
+    color_offset = _arc_color_offset(include_eos, color_offset)
 
     nrow, ncol = grid.shape
     canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-    canvas[:nrow, :ncol] = grid + 2
+    canvas[:nrow, :ncol] = grid + color_offset
 
-    if nrow < canvas_h:
-        canvas[nrow, :ncol] = 1
-    if ncol < canvas_w:
-        canvas[:nrow, ncol] = 1
+    if include_eos:
+        if nrow < canvas_h:
+            canvas[nrow, :ncol] = 1
+        if ncol < canvas_w:
+            canvas[:nrow, ncol] = 1
 
     return canvas.flatten(), (canvas_h, canvas_w)
 
 
-def np_grids_to_unpadded_seq(inp: np.ndarray, out: np.ndarray):
-    inp_seq, inp_shape = _np_grid_to_unpadded_seq(inp)
-    out_seq, out_shape = _np_grid_to_unpadded_seq(out)
+def np_grids_to_unpadded_seq(
+    inp: np.ndarray,
+    out: np.ndarray,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+):
+    color_offset = _arc_color_offset(include_eos, color_offset)
+    inp_seq, inp_shape = _np_grid_to_unpadded_seq(
+        inp,
+        include_eos=include_eos,
+        color_offset=color_offset,
+    )
+    out_seq, out_shape = _np_grid_to_unpadded_seq(
+        out,
+        include_eos=include_eos,
+        color_offset=color_offset,
+    )
     return [inp_seq, out_seq], (inp_shape, out_shape)
 
 
@@ -266,27 +313,49 @@ def _display_window(length: int, max_items: int):
     return [*range(head), None, *range(length - tail, length)]
 
 
-def _format_arc_token(token: int):
+def _format_arc_token(
+    token: int,
+    *,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+):
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if token == 0:
         return "."
-    if token == 1:
+    if include_eos and token == 1:
         return "E"
-    if 2 <= token <= 11:
-        return str(token - 2)
+    arc_color = token - color_offset
+    if 0 <= arc_color < ARCColorCount:
+        return str(arc_color)
     return f"?{token}"
 
 
-def _color_cell(token: int) -> str:
+def _color_cell(
+    token: int,
+    *,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+) -> str:
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if token == 0:
         return "\033[48;5;235m  \033[0m"
-    if token == 1:
+    if include_eos and token == 1:
         return "\033[48;5;15;30mEE\033[0m"
-    if token in _ARC_TOKEN_BG_COLORS:
-        return f"\033[48;5;{_ARC_TOKEN_BG_COLORS[token]}m  \033[0m"
+    arc_color = token - color_offset
+    if arc_color in _ARC_COLOR_BG_COLORS:
+        return f"\033[48;5;{_ARC_COLOR_BG_COLORS[arc_color]}m  \033[0m"
     return "\033[48;5;15;31m??\033[0m"
 
 
-def _format_color_grid_lines(grid: np.ndarray, max_rows: int, max_cols: int):
+def _format_color_grid_lines(
+    grid: np.ndarray,
+    max_rows: int,
+    max_cols: int,
+    *,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
+):
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if grid.size == 0:
         return ["<empty>"]
 
@@ -304,7 +373,13 @@ def _format_color_grid_lines(grid: np.ndarray, max_rows: int, max_cols: int):
             if col_idx is None:
                 cells.append("...")
             else:
-                cells.append(_color_cell(int(grid[row_idx, col_idx])))
+                cells.append(
+                    _color_cell(
+                        int(grid[row_idx, col_idx]),
+                        include_eos=include_eos,
+                        color_offset=color_offset,
+                    )
+                )
         lines.append(f"r{row_idx:02d} |{''.join(cells)}")
 
     return lines
@@ -329,7 +404,10 @@ def print_data(
     title: str = "",
     max_rows: int = 31,
     max_cols: int = 31,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
 ):
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if data.ndim != 1:
         raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
 
@@ -347,10 +425,26 @@ def print_data(
     grid = data.reshape(height, width)
     cropped = grid.shape[0] > max_rows or grid.shape[1] > max_cols
     crop_suffix = " (cropped)" if cropped else ""
+    color_token_end = color_offset + ARCColorCount - 1
 
     print(f"{title or 'sample'}: canvas={height}x{width}{crop_suffix}")
-    print("legend: dark gray = blank/pad, EE = eos, colored blocks = ARC colors")
-    for line in _format_color_grid_lines(grid, max_rows=max_rows, max_cols=max_cols):
+    if include_eos:
+        print(
+            "legend: dark gray = blank/pad, EE = eos, "
+            f"colored blocks = ARC colors ({color_offset}-{color_token_end})"
+        )
+    else:
+        print(
+            "legend: dark gray = blank/pad, "
+            f"colored blocks = ARC colors ({color_offset}-{color_token_end})"
+        )
+    for line in _format_color_grid_lines(
+        grid,
+        max_rows=max_rows,
+        max_cols=max_cols,
+        include_eos=include_eos,
+        color_offset=color_offset,
+    ):
         print(line)
     print()
 
@@ -379,7 +473,10 @@ def _print_color_data(
     title: str,
     max_rows: int = 21,
     max_cols: int = 21,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
 ) -> None:
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if data.ndim != 1:
         raise ValueError(f"Expected 1D token sequence, got shape={data.shape}")
     if position_ids.ndim != 2 or position_ids.shape[1] != 4:
@@ -393,15 +490,37 @@ def _print_color_data(
         return
 
     num_pairs = int(position_ids[:, 0].max()) + 1
+    color_token_end = color_offset + ARCColorCount - 1
     print(f"{title}: tokens={data.shape[0]}, pairs={num_pairs}")
-    print("legend: dark gray = blank/pad, EE = eos, colored blocks = ARC colors")
+    if include_eos:
+        print(
+            "legend: dark gray = blank/pad, EE = eos, "
+            f"colored blocks = ARC colors ({color_offset}-{color_token_end})"
+        )
+    else:
+        print(
+            "legend: dark gray = blank/pad, "
+            f"colored blocks = ARC colors ({color_offset}-{color_token_end})"
+        )
 
     for pair_idx in range(num_pairs):
         input_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=0)
         output_grid = _extract_pair_grid(data, position_ids, pair_idx, io_id=1)
 
-        input_lines = _format_color_grid_lines(input_grid, max_rows=max_rows, max_cols=max_cols)
-        output_lines = _format_color_grid_lines(output_grid, max_rows=max_rows, max_cols=max_cols)
+        input_lines = _format_color_grid_lines(
+            input_grid,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            include_eos=include_eos,
+            color_offset=color_offset,
+        )
+        output_lines = _format_color_grid_lines(
+            output_grid,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            include_eos=include_eos,
+            color_offset=color_offset,
+        )
         left_width = max(_visible_len(line) for line in input_lines)
         pair_shape = (
             f"input={input_grid.shape[0]}x{input_grid.shape[1]} "
@@ -431,14 +550,24 @@ def encode_arc_example_pair(
     *,
     no_padding: bool,
     do_translation: bool,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
 ):
+    color_offset = _arc_color_offset(include_eos, color_offset)
     if no_padding:
-        return np_grids_to_unpadded_seq(inp, out)
+        return np_grids_to_unpadded_seq(
+            inp,
+            out,
+            include_eos=include_eos,
+            color_offset=color_offset,
+        )
 
     return np_grid_to_fixed_seq_translational_augment(
         inp,
         out,
         do_translation=do_translation,
+        include_eos=include_eos,
+        color_offset=color_offset,
     ), None
 
 
@@ -446,7 +575,10 @@ def encode_context_examples(
     examples: Optional[List[Tuple[np.ndarray, np.ndarray]]],
     *,
     no_padding: bool,
+    include_eos: bool = True,
+    color_offset: Optional[int] = None,
 ):
+    color_offset = _arc_color_offset(include_eos, color_offset)
     examples = examples or []
     shape_dims = (2, 2) if no_padding else (2,)
     example_shapes = np.empty((len(examples), *shape_dims), dtype=np.int32)
@@ -459,6 +591,8 @@ def encode_context_examples(
                 out,
                 no_padding=True,
                 do_translation=False,
+                include_eos=include_eos,
+                color_offset=color_offset,
             )
             encoded_examples[example_idx, 0] = encoded_inp.astype(np.uint8, copy=False)
             encoded_examples[example_idx, 1] = encoded_out.astype(np.uint8, copy=False)
@@ -472,6 +606,8 @@ def encode_context_examples(
             out,
             no_padding=False,
             do_translation=False,
+            include_eos=include_eos,
+            color_offset=color_offset,
         )
         encoded_pairs.append(
             np.stack(
@@ -1109,6 +1245,8 @@ def load_puzzles_arcagi(config: DataProcessConfig):
 
 def convert_dataset(config: DataProcessConfig):
     np.random.seed(config.seed)
+    include_eos = not config.no_eos
+    color_offset = ARCColorOffsetWithEos if include_eos else ARCColorOffsetNoEos
     
     # Read dataset
     data, test_puzzles = load_puzzles_arcagi(config)
@@ -1174,6 +1312,8 @@ def convert_dataset(config: DataProcessConfig):
                                 out,
                                 no_padding=True,
                                 do_translation=False,
+                                include_eos=include_eos,
+                                color_offset=color_offset,
                             )
                             input_seq_shape, label_seq_shape = pair_seq_shape
                             results.setdefault("seq_shapes", []).append(input_seq_shape)
@@ -1184,6 +1324,8 @@ def convert_dataset(config: DataProcessConfig):
                                 out,
                                 no_padding=False,
                                 do_translation=enable_translational_augment and _idx_ex != no_aug_id,
+                                include_eos=include_eos,
+                                color_offset=color_offset,
                             )
                             
                         results["inputs"].append(inp)
@@ -1192,6 +1334,8 @@ def convert_dataset(config: DataProcessConfig):
                             context_examples, context_shapes = encode_context_examples(
                                 puzzle.context_examples,
                                 no_padding=config.no_padding,
+                                include_eos=include_eos,
+                                color_offset=color_offset,
                             )
                             results["examples"].append(context_examples)
                             results["example_shapes"].append(context_shapes)
@@ -1229,6 +1373,8 @@ def convert_dataset(config: DataProcessConfig):
                             v[target_id],
                             results[shape_key][target_id],
                             title=f"{split_name}/{subset_name} {k}[{target_id}]",
+                            include_eos=include_eos,
+                            color_offset=color_offset,
                         )
                         if split_name == "test" and k == "inputs" and "examples" in results:
                             context_examples = results["examples"][target_id]
@@ -1241,6 +1387,8 @@ def convert_dataset(config: DataProcessConfig):
                                         f"{split_name}/{subset_name} examples[{target_id}]"
                                         f"[{example_idx}].input"
                                     ),
+                                    include_eos=include_eos,
+                                    color_offset=color_offset,
                                 )
                                 print_data(
                                     np.asarray(context_examples[example_idx][1], dtype=np.uint8),
@@ -1249,6 +1397,8 @@ def convert_dataset(config: DataProcessConfig):
                                         f"{split_name}/{subset_name} examples[{target_id}]"
                                         f"[{example_idx}].output"
                                     ),
+                                    include_eos=include_eos,
+                                    color_offset=color_offset,
                                 )
                     seq_lengths = np.array([seq.shape[0] for seq in v], dtype=np.int64)
                     seq_offsets = np.concatenate(
@@ -1303,7 +1453,7 @@ def convert_dataset(config: DataProcessConfig):
         # Metadata
         metadata = PuzzleDatasetMetadata(
             seq_len=ARCMaxGridSize * ARCMaxGridSize,
-            vocab_size=10 + 2,  # PAD + EOS + "0" ... "9"
+            vocab_size=ARCColorCount + color_offset,
             
             pad_id=0,
             ignore_label_id=0,

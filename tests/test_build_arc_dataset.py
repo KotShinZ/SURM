@@ -32,36 +32,42 @@ if "argdantic" not in sys.modules:
 from data.build_arc_dataset import DataProcessConfig, convert_dataset  # noqa: E402
 
 
-def _encode_fixed_canvas(grid: list[list[int]]) -> np.ndarray:
+def _encode_fixed_canvas(grid: list[list[int]], include_eos: bool = True) -> np.ndarray:
     arr = np.array(grid, dtype=np.uint8)
     canvas = np.zeros((30, 30), dtype=np.uint8)
     h, w = arr.shape
-    canvas[:h, :w] = arr + 2
-    if h < 30:
+    color_offset = 2 if include_eos else 1
+    canvas[:h, :w] = arr + color_offset
+    if include_eos and h < 30:
         canvas[h, :w] = 1
-    if w < 30:
+    if include_eos and w < 30:
         canvas[:h, w] = 1
     return canvas.reshape(-1)
 
 
-def _encode_unpadded_canvas(grid: list[list[int]], canvas_shape: tuple[int, int]) -> np.ndarray:
+def _encode_unpadded_canvas(
+    grid: list[list[int]],
+    canvas_shape: tuple[int, int],
+    include_eos: bool = True,
+) -> np.ndarray:
     arr = np.array(grid, dtype=np.uint8)
     canvas = np.zeros(canvas_shape, dtype=np.uint8)
     h, w = arr.shape
-    canvas[:h, :w] = arr + 2
-    if h < canvas_shape[0]:
+    color_offset = 2 if include_eos else 1
+    canvas[:h, :w] = arr + color_offset
+    if include_eos and h < canvas_shape[0]:
         canvas[h, :w] = 1
-    if w < canvas_shape[1]:
+    if include_eos and w < canvas_shape[1]:
         canvas[:h, w] = 1
     return canvas.reshape(-1)
 
 
-def _grid_canvas_shape(grid: list[list[int]]) -> tuple[int, int]:
+def _grid_canvas_shape(grid: list[list[int]], include_eos: bool = True) -> tuple[int, int]:
     arr = np.array(grid, dtype=np.uint8)
     height, width = arr.shape
-    if height < 30:
+    if include_eos and height < 30:
         height += 1
-    if width < 30:
+    if include_eos and width < 30:
         width += 1
     return height, width
 
@@ -540,6 +546,156 @@ class BuildARCDatasetTests(unittest.TestCase):
             np.testing.assert_array_equal(first_examples[0, 1], _encode_unpadded_canvas([[2]], first_label_shape))
             np.testing.assert_array_equal(first_examples[1, 0], _encode_unpadded_canvas([[3, 3]], second_input_shape))
             np.testing.assert_array_equal(first_examples[1, 1], _encode_unpadded_canvas([[4], [4]], second_label_shape))
+
+    def test_no_eos_fixed_dataset_uses_compact_color_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+
+            training_puzzles = {
+                "p_train": {
+                    "train": [
+                        {"input": [[1, 0], [2, 9]], "output": [[4]]},
+                    ],
+                    "test": [
+                        {"input": [[5]]},
+                    ],
+                }
+            }
+
+            self._write_subset(
+                input_prefix,
+                "training",
+                training_puzzles,
+                {"p_train": [[[6]]]},
+            )
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["training"],
+                    test_set_name="evaluation",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=False,
+                    no_eos=True,
+                )
+            )
+
+            inputs = np.load(output_dir / "train" / "all__inputs.npy")
+            labels = np.load(output_dir / "train" / "all__labels.npy")
+            with open(output_dir / "train" / "dataset.json", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            self.assertEqual(inputs.shape, (2, 900))
+            self.assertEqual(metadata["vocab_size"], 11)
+            self.assertTrue(np.any(inputs == 1))
+            self.assertTrue(np.any(inputs == 10))
+            self.assertFalse(np.any(inputs == 11))
+            self.assertFalse(np.any(labels == 11))
+            np.testing.assert_array_equal(
+                inputs[0],
+                _encode_fixed_canvas([[1, 0], [2, 9]], include_eos=False),
+            )
+            np.testing.assert_array_equal(
+                labels[0],
+                _encode_fixed_canvas([[4]], include_eos=False),
+            )
+
+    def test_no_eos_no_padding_dataset_and_context_examples_use_compact_color_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_prefix = tmp_path / "arc"
+            output_dir = tmp_path / "dataset"
+
+            evaluation_puzzles = {
+                "p_eval": {
+                    "train": [
+                        {"input": [[0]], "output": [[2]]},
+                        {"input": [[3, 3]], "output": [[4], [4]]},
+                    ],
+                    "test": [
+                        {"input": [[5]]},
+                    ],
+                }
+            }
+
+            self._write_subset(
+                input_prefix,
+                "evaluation",
+                evaluation_puzzles,
+                {"p_eval": [[[9], [6]]]},
+            )
+
+            convert_dataset(
+                DataProcessConfig(
+                    input_file_prefix=str(input_prefix),
+                    output_dir=str(output_dir),
+                    subsets=["evaluation"],
+                    test_set_name="evaluation",
+                    seed=0,
+                    num_aug=0,
+                    no_padding=True,
+                    no_eos=True,
+                )
+            )
+
+            examples = np.load(output_dir / "test" / "all__examples.npy", allow_pickle=True)
+            example_shapes = np.load(output_dir / "test" / "all__example_shapes.npy", allow_pickle=True)
+            inputs = np.load(output_dir / "test" / "all__inputs.npy")
+            labels = np.load(output_dir / "test" / "all__labels.npy")
+            seq_shapes = np.load(output_dir / "test" / "all__seq_shapes.npy")
+            label_seq_shapes = np.load(output_dir / "test" / "all__label_seq_shapes.npy")
+            with open(output_dir / "test" / "dataset.json", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            self.assertEqual(metadata["vocab_size"], 11)
+            self.assertTrue(np.any(labels == 10))
+            self.assertFalse(np.any(inputs == 11))
+            self.assertFalse(np.any(labels == 11))
+            np.testing.assert_array_equal(seq_shapes, np.array([[1, 1]], dtype=np.int32))
+            np.testing.assert_array_equal(label_seq_shapes, np.array([[2, 1]], dtype=np.int32))
+            np.testing.assert_array_equal(
+                inputs,
+                _encode_unpadded_canvas([[5]], (1, 1), include_eos=False),
+            )
+            np.testing.assert_array_equal(
+                labels,
+                _encode_unpadded_canvas([[9], [6]], (2, 1), include_eos=False),
+            )
+
+            first_examples = examples[0]
+            first_example_shapes = example_shapes[0]
+            np.testing.assert_array_equal(
+                first_example_shapes,
+                np.array(
+                    [
+                        [
+                            _grid_canvas_shape([[0]], include_eos=False),
+                            _grid_canvas_shape([[2]], include_eos=False),
+                        ],
+                        [
+                            _grid_canvas_shape([[3, 3]], include_eos=False),
+                            _grid_canvas_shape([[4], [4]], include_eos=False),
+                        ],
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+            self.assertFalse(
+                any(np.any(np.asarray(part) == 11) for part in first_examples.reshape(-1))
+            )
+            self.assertTrue(np.any(np.asarray(first_examples[0, 0]) == 1))
+            np.testing.assert_array_equal(
+                first_examples[0, 0],
+                _encode_unpadded_canvas([[0]], (1, 1), include_eos=False),
+            )
+            np.testing.assert_array_equal(
+                first_examples[0, 1],
+                _encode_unpadded_canvas([[2]], (1, 1), include_eos=False),
+            )
 
 
 if __name__ == "__main__":
