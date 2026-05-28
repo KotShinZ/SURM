@@ -83,7 +83,7 @@ class PuzzleFullDatasetSamplingTests(unittest.TestCase):
         puzzle_start = int(np.array([0, 2, 8, 11], dtype=np.int32)[selected_puzzle])
         puzzle_end = int(np.array([0, 2, 8, 11], dtype=np.int32)[selected_puzzle + 1])
 
-        self.assertGreaterEqual(selected_examples.size, 3)
+        self.assertGreaterEqual(selected_examples.size, 2)
         self.assertLessEqual(selected_examples.size, 5)
         self.assertEqual(np.unique(selected_examples).size, selected_examples.size)
         self.assertTrue(np.all((puzzle_start <= selected_examples) & (selected_examples < puzzle_end)))

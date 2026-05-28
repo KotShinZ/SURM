@@ -158,7 +158,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     arc_output_mask: Optional[ARCOutputMaskConfig] = None
 
     # ARC full-context training built from one-pair examples.
-    full_min_pairs: int = 3
+    full_min_pairs: int = 2
     full_max_pairs: int = 8
     full_answer_initial_mode: Literal["black", "noised_label"] = "black"
     full_answer_initial_black_token_id: int = 2

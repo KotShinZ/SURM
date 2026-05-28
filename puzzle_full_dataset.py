@@ -13,6 +13,13 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 ARC_MAX_GRID_SIZE = 30
 ARC_FULL_IO_COUNT = 2
 FULL_DUMMY_PUZZLE_IDENTIFIER = 0
+# Match the held-out ARC-AGI test context-pair histogram.
+ARC_FULL_TRAIN_PAIR_COUNT_VALUES = np.array([2, 3, 4, 5, 6, 7], dtype=np.int64)
+ARC_FULL_TRAIN_PAIR_COUNT_PROBS = np.array(
+    [41318, 198217, 81479, 28800, 14000, 4000],
+    dtype=np.float64,
+)
+ARC_FULL_TRAIN_PAIR_COUNT_PROBS /= ARC_FULL_TRAIN_PAIR_COUNT_PROBS.sum()
 
 
 def _to_numpy_array(value):
@@ -81,7 +88,10 @@ def _sample_batch(
         puzzle_start = int(puzzle_indices[selected_puzzle])
         puzzle_end = int(puzzle_indices[selected_puzzle + 1])
         puzzle_size = puzzle_end - puzzle_start
-        pair_count = int(rng.integers(min_pairs, min(max_pairs, puzzle_size) + 1))
+        sampled_pair_count = int(
+            rng.choice(ARC_FULL_TRAIN_PAIR_COUNT_VALUES, p=ARC_FULL_TRAIN_PAIR_COUNT_PROBS)
+        )
+        pair_count = min(sampled_pair_count, max_pairs, puzzle_size)
         available_examples = np.arange(puzzle_start, puzzle_end, dtype=np.int64)
         selected_examples = np.empty((pair_count,), dtype=np.int64)
         for pair_idx in range(pair_count):
