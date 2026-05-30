@@ -204,8 +204,9 @@ def maybe_create_arc_evaluator(config: PretrainConfig, eval_metadata):
 class ARCThirtyByThirtyAdapter:
     required_outputs = ARC.required_outputs
 
-    def __init__(self, evaluator: ARC):
+    def __init__(self, evaluator: ARC, *, drop_labels: bool = False):
         self.evaluator = evaluator
+        self.drop_labels = drop_labels
 
     def begin_eval(self):
         self.evaluator.begin_eval()
@@ -276,7 +277,9 @@ class ARCThirtyByThirtyAdapter:
         batch: Dict[str, torch.Tensor],
         preds: Dict[str, torch.Tensor],
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        labels = batch["labels"]
+        labels = batch.get("labels")
+        if labels is None:
+            return batch, preds
         pred_tokens = preds["preds"]
         if (
             "label_seq_offsets" not in batch
@@ -350,6 +353,9 @@ class ARCThirtyByThirtyAdapter:
 
     def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
         fixed_batch, fixed_preds = self._to_fixed_30x30(batch, preds)
+        if self.drop_labels:
+            fixed_batch = dict(fixed_batch)
+            fixed_batch["labels"] = None
         self.evaluator.update_batch(fixed_batch, fixed_preds)
 
 
@@ -409,6 +415,7 @@ def main() -> None:
         world_size=1,
     )
     eval_loader = MaxProblemsDataLoader(eval_loader, args.max_problems)
+    padding_eval_without_labels = bool(config.padding and eval_metadata.variable_seq_lengths)
 
     train_state = init_train_state(config, train_metadata, rank=0, world_size=1)
     _load_weights_only(train_state, config, checkpoint_path)
@@ -429,7 +436,9 @@ def main() -> None:
             print("Detected ARC-AGI dataset; enabling ARC augment consensus evaluator.")
             evaluators.append(arc_evaluator)
     evaluators = [
-        ARCThirtyByThirtyAdapter(evaluator) if isinstance(evaluator, ARC) else evaluator
+        ARCThirtyByThirtyAdapter(evaluator, drop_labels=padding_eval_without_labels)
+        if isinstance(evaluator, ARC)
+        else evaluator
         for evaluator in evaluators
     ]
 

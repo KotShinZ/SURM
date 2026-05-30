@@ -156,6 +156,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
     examples_per_puzzle: Optional[int] = 1
+    padding: bool = False
 
     # Online augmentation (applied per batch during training only)
     online_aug: Optional[OnlineAugConfig] = None
@@ -190,6 +191,14 @@ class PretrainConfig(pydantic.BaseModel):
     # Training path that probes halting without gradients, then replays only
     # halted samples with gradients so backward kernels run on a smaller batch.
     halted_replay_training: bool = False
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _translate_legacy_nopadding(cls, values):
+        if isinstance(values, dict) and "padding" not in values and "nopadding" in values:
+            values = dict(values)
+            values["padding"] = not pydantic.TypeAdapter(bool).validate_python(values.pop("nopadding"))
+        return values
 
 
 
@@ -339,6 +348,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
+            padding=config.padding,
             data_fraction=data_fraction,
             grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,

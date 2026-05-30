@@ -44,6 +44,7 @@ class ARC:
         "inputs",
         "labels",
         "source_inputs",
+        "answer_mask",
         "position_ids",
         "puzzle_identifiers",
         "arc_identifiers",
@@ -148,35 +149,79 @@ class ARC:
         q_values: torch.Tensor,
         q_log_probs: torch.Tensor,
     ) -> None:
-        identifiers = outputs.get("arc_identifiers")
+        identifiers = outputs.get("arc_identifiers", outputs.get("puzzle_identifiers"))
         if identifiers is None:
             return
 
         seq_offsets = outputs["seq_offsets"].numpy()
-        labels = outputs["labels"].numpy()
+        labels_tensor = outputs.get("labels")
+        labels = labels_tensor.numpy() if labels_tensor is not None else None
         position_ids = outputs["position_ids"].numpy()
         source_inputs = outputs.get("source_inputs", outputs["inputs"]).numpy()
         preds = outputs["preds"].numpy()
+        inputs = outputs["inputs"].numpy()
+        answer_mask = outputs.get("answer_mask")
+        answer_mask = answer_mask.numpy() if answer_mask is not None else None
 
         for sample_idx, identifier in enumerate(identifiers.numpy()):
             start = int(seq_offsets[sample_idx])
             end = int(seq_offsets[sample_idx + 1])
-            sample_labels = labels[start:end]
+            sample_labels = labels[start:end] if labels is not None else None
             sample_positions = position_ids[start:end]
-            target_mask = sample_labels != IGNORE_LABEL_ID
+            sample_inputs = inputs[start:end]
+            sample_source_inputs = source_inputs[start:end]
+            sample_answer_mask = answer_mask[start:end] if answer_mask is not None else None
+            target_mask = self._packed_target_mask(
+                sample_inputs=sample_inputs,
+                sample_source_inputs=sample_source_inputs,
+                sample_positions=sample_positions,
+                sample_labels=sample_labels,
+                sample_answer_mask=sample_answer_mask,
+            )
             if not np.any(target_mask):
                 continue
 
-            target_pair_id = int(sample_positions[target_mask][0, 0])
-            input_mask = (sample_positions[:, 0] == target_pair_id) & (sample_positions[:, 1] == 0)
+            if sample_positions.shape[1] >= 4:
+                target_pair_id = int(sample_positions[target_mask][0, 0])
+                input_mask = (sample_positions[:, 0] == target_pair_id) & (sample_positions[:, 1] == 0)
+            else:
+                input_mask = np.ones((end - start,), dtype=np.bool_)
 
             self._record_prediction(
                 int(identifier),
-                self._grid_from_tokens(source_inputs[start:end][input_mask], sample_positions[input_mask]),
+                self._grid_from_tokens(sample_source_inputs[input_mask], sample_positions[input_mask]),
                 self._grid_from_tokens(preds[start:end][target_mask], sample_positions[target_mask]),
                 float(q_values[sample_idx]),
                 float(q_log_probs[sample_idx]),
             )
+
+    @staticmethod
+    def _packed_target_mask(
+        *,
+        sample_inputs: np.ndarray,
+        sample_source_inputs: np.ndarray,
+        sample_positions: np.ndarray,
+        sample_labels: Optional[np.ndarray],
+        sample_answer_mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        if sample_labels is not None:
+            return sample_labels != IGNORE_LABEL_ID
+
+        if sample_answer_mask is not None and np.any(sample_answer_mask):
+            return sample_answer_mask.astype(np.bool_, copy=False)
+
+        if sample_positions.shape[1] >= 4:
+            output_mask = sample_positions[:, 1] == 1
+            changed_output = output_mask & (sample_inputs != sample_source_inputs)
+            if np.any(changed_output):
+                target_pair_id = int(sample_positions[changed_output][0, 0])
+                return output_mask & (sample_positions[:, 0] == target_pair_id)
+
+            output_pair_ids = np.unique(sample_positions[output_mask, 0])
+            if output_pair_ids.size:
+                return output_mask & (sample_positions[:, 0] == output_pair_ids[-1])
+
+        return np.ones((sample_inputs.shape[0],), dtype=np.bool_)
 
     def update_batch(self, batch: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]):
         # Collect required outputs to CPU
@@ -187,7 +232,9 @@ class ARC:
         for collection in (batch, preds):
             for k, v in collection.items():
                 if k in self.required_outputs:
-                    if k == "q_halt_logits":
+                    if v is None:
+                        outputs[k] = None
+                    elif k == "q_halt_logits":
                         q_values = v.to(torch.float64).sigmoid().cpu()
                         q_log_probs = F.logsigmoid(v.to(torch.float64)).cpu()
                     else:
@@ -195,7 +242,8 @@ class ARC:
 
         assert q_values is not None and q_log_probs is not None
 
-        if "seq_offsets" in outputs and outputs["labels"].ndim == 1:
+        labels = outputs.get("labels")
+        if "seq_offsets" in outputs and (labels is None or labels.ndim == 1):
             self._update_packed_full_batch(outputs, q_values, q_log_probs)
         else:
             self._update_fixed_batch(outputs, q_values, q_log_probs)

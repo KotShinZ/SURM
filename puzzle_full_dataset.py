@@ -269,6 +269,17 @@ class PuzzleFullDataset(PuzzleDataset):
                     f"got shape={label_shape} length={solution.size} for pair {pair_pos}."
                 )
 
+            slot_solution = solution
+            slot_label_shape = label_shape
+            if pair_pos == target_pair_index and self.config.padding:
+                slot_label_shape = (ARC_MAX_GRID_SIZE, ARC_MAX_GRID_SIZE)
+                slot_solution = self._pad_flat_2d_tokens(
+                    solution,
+                    label_shape,
+                    slot_label_shape,
+                    self.metadata.pad_id,
+                )
+
             input_chunks.append(problem)
             if not answer_only_labels:
                 label_chunks.append(np.full_like(problem, IGNORE_LABEL_ID))
@@ -277,14 +288,14 @@ class PuzzleFullDataset(PuzzleDataset):
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
-                input_solution = self._make_answer_initial_tokens(solution, rng)
-                label_solution = solution
-                answer_mask = np.ones(solution.shape, dtype=np.bool_)
-                label_seq_shape = label_shape
+                input_solution = self._make_answer_initial_tokens(slot_solution, rng)
+                label_solution = slot_solution
+                answer_mask = np.ones(slot_solution.shape, dtype=np.bool_)
+                label_seq_shape = slot_label_shape
             else:
-                input_solution = solution
-                label_solution = np.full_like(solution, IGNORE_LABEL_ID)
-                answer_mask = np.zeros(solution.shape, dtype=np.bool_)
+                input_solution = slot_solution
+                label_solution = np.full_like(slot_solution, IGNORE_LABEL_ID)
+                answer_mask = np.zeros(slot_solution.shape, dtype=np.bool_)
 
             input_chunks.append(input_solution)
             if answer_only_labels:
@@ -293,8 +304,8 @@ class PuzzleFullDataset(PuzzleDataset):
             else:
                 label_chunks.append(label_solution)
             answer_mask_chunks.append(answer_mask)
-            source_chunks.append(solution)
-            position_chunks.append(self._make_position_ids(pair_pos, 1, label_shape))
+            source_chunks.append(slot_solution)
+            position_chunks.append(self._make_position_ids(pair_pos, 1, slot_label_shape))
 
         inputs = np.concatenate(input_chunks).astype(np.int32, copy=False)
         labels = np.concatenate(label_chunks).astype(np.int32, copy=False)

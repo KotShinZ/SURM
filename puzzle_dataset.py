@@ -14,6 +14,9 @@ from data.common import PuzzleDatasetMetadata
 from data.online_aug import OnlineAugConfig, apply_online_aug
 
 
+ARC_MAX_GRID_SIZE = 30
+
+
 class MaskedInputConfig(pydantic.BaseModel):
     enabled: bool = False
     apply_probability: float = 1.0
@@ -135,6 +138,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     dataset_path: str
     global_batch_size: int
     test_set_mode: bool
+    padding: bool = False
 
     epochs_per_iter: int  # Batch X epochs in an iteration to reduce overhead.
     grad_accum_steps: int = 1
@@ -176,6 +180,14 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     separate_mode: Optional[str] = None
     label_separate_noise_token_min: int = 2
     label_separate_noise_token_max: Optional[int] = None
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _translate_legacy_nopadding(cls, values):
+        if isinstance(values, dict) and "padding" not in values and "nopadding" in values:
+            values = dict(values)
+            values["padding"] = not pydantic.TypeAdapter(bool).validate_python(values.pop("nopadding"))
+        return values
 
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
@@ -403,7 +415,10 @@ class PuzzleDataset(IterableDataset):
             selected_label_shapes,
         )
         if pad_inputs_and_labels:
-            target_shapes = np.maximum(shapes, selected_label_shapes).astype(np.int32, copy=False)
+            if self.config.padding:
+                target_shapes = np.full(shapes.shape, ARC_MAX_GRID_SIZE, dtype=np.int32)
+            else:
+                target_shapes = np.maximum(shapes, selected_label_shapes).astype(np.int32, copy=False)
 
         input_chunks = []
         position_chunks = []
