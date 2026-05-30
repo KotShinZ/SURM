@@ -240,7 +240,7 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertEqual(int(target_positions[:, 3].max()), 29)
         target_labels = sample["labels"][target_answer_mask].reshape(30, 30)
         self.assertEqual(int(target_labels[0, 0]), 10)
-        self.assertEqual(int(target_labels.sum()), 10)
+        self.assertTrue(np.all(target_labels.reshape(-1)[1:] == IGNORE_LABEL_ID))
 
     def test_padding_false_keeps_target_answer_slot_shape(self) -> None:
         sample = self._dataset(padding=False)._build_pairs_sample(

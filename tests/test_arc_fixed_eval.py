@@ -116,7 +116,7 @@ class ARCFixedEvalTests(unittest.TestCase):
         self.assertEqual(int(sample["seq_lengths"].item()), ARC_FIXED_TOKEN_COUNT + 3)
         self.assertTrue(np.all(sample["inputs"][target_mask] == 2))
         self.assertEqual(int(sample["labels"][target_mask][0]), 9)
-        self.assertTrue(np.all(sample["labels"][target_mask][1:] == 0))
+        self.assertTrue(np.all(sample["labels"][target_mask][1:] == IGNORE_LABEL_ID))
         self.assertEqual(sample["position_ids"][target_mask][-1].tolist(), [1, 1, 29, 29])
 
     def test_puzzle_full_padding_false_eval_keeps_target_answer_slot_shape(self) -> None:

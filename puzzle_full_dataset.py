@@ -270,6 +270,7 @@ class PuzzleFullDataset(PuzzleDataset):
                 )
 
             slot_solution = solution
+            slot_labels = solution
             slot_label_shape = label_shape
             if pair_pos == target_pair_index and self.config.padding:
                 slot_label_shape = (ARC_MAX_GRID_SIZE, ARC_MAX_GRID_SIZE)
@@ -278,6 +279,12 @@ class PuzzleFullDataset(PuzzleDataset):
                     label_shape,
                     slot_label_shape,
                     self.metadata.pad_id,
+                )
+                slot_labels = self._pad_flat_2d_tokens(
+                    solution,
+                    label_shape,
+                    slot_label_shape,
+                    IGNORE_LABEL_ID,
                 )
 
             input_chunks.append(problem)
@@ -289,7 +296,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
             if pair_pos == target_pair_index:
                 input_solution = self._make_answer_initial_tokens(slot_solution, rng)
-                label_solution = slot_solution
+                label_solution = slot_labels
                 answer_mask = np.ones(slot_solution.shape, dtype=np.bool_)
                 label_seq_shape = slot_label_shape
             else:
