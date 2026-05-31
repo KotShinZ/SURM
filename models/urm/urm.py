@@ -112,6 +112,7 @@ class URMConfig(BaseModel):
     grad_logging_enabled: bool = True
     answer_only: bool = False
     answer_only_context_layers: int = 0
+    prefix_lm: bool = False
     label_separate: bool = False
     SeparateMode: str = "D"
     separate_mode: Optional[str] = None
@@ -213,6 +214,7 @@ class URMBlock(nn.Module):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         attn_output = self.self_attn.forward_cross_packed(
             query_cos_sin=query_cos_sin,
@@ -223,6 +225,7 @@ class URMBlock(nn.Module):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            causal=causal,
         )
         query_states = rms_norm(query_states + attn_output, variance_epsilon=self.norm_eps)
         mlp_output = self.mlp.forward_packed(query_states, cu_seqlens_q)
@@ -1153,6 +1156,96 @@ class URM_Inner(nn.Module):
             )
         return hidden_states
 
+    @torch.compiler.disable
+    def _prefix_lm_key_value_indices(
+        self,
+        context_indices: torch.Tensor,
+        answer_indices: torch.Tensor,
+        cu_context: torch.Tensor,
+        cu_answer: torch.Tensor,
+    ) -> torch.Tensor:
+        context_offsets = cu_context.detach().cpu().tolist()
+        answer_offsets = cu_answer.detach().cpu().tolist()
+        chunks = []
+        for sample_idx in range(len(context_offsets) - 1):
+            context_start, context_end = int(context_offsets[sample_idx]), int(context_offsets[sample_idx + 1])
+            answer_start, answer_end = int(answer_offsets[sample_idx]), int(answer_offsets[sample_idx + 1])
+            if context_end > context_start:
+                chunks.append(context_indices[context_start:context_end])
+            if answer_end > answer_start:
+                chunks.append(answer_indices[answer_start:answer_end])
+        if not chunks:
+            return context_indices.new_empty((0,))
+        return torch.cat(chunks, dim=0)
+
+    def _run_prefix_lm_token_layers_packed(
+        self,
+        hidden_states: torch.Tensor,
+        layers: nn.ModuleList,
+        cos_sin: CosSin,
+        context_indices: torch.Tensor,
+        answer_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_context: torch.Tensor,
+        cu_answer: torch.Tensor,
+        max_seqlen: int,
+        max_context_len: int,
+        max_answer_len: int,
+        add_noise: bool = False,
+    ) -> torch.Tensor:
+        if len(layers) == 0:
+            return hidden_states
+        if answer_indices.numel() == 0:
+            return self._run_token_layers_packed(
+                hidden_states=hidden_states,
+                layers=layers,
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+
+        context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
+        answer_cos_sin = self._slice_packed_cos_sin(cos_sin, answer_indices)
+        key_value_indices = self._prefix_lm_key_value_indices(
+            context_indices,
+            answer_indices,
+            cu_context,
+            cu_answer,
+        )
+        key_value_cos_sin = self._slice_packed_cos_sin(cos_sin, key_value_indices)
+
+        for layer in layers:
+            next_states = hidden_states.clone()
+            context_states = hidden_states[context_indices]
+            if context_states.numel() > 0:
+                context_states = layer.forward_packed(
+                    cos_sin=context_cos_sin,
+                    hidden_states=context_states,
+                    cu_seqlens=cu_context,
+                    max_seqlen=max_context_len,
+                )
+                next_states[context_indices] = context_states
+
+            answer_states = hidden_states[answer_indices]
+            if answer_states.numel() > 0:
+                key_value_states = next_states[key_value_indices]
+                answer_states = layer.forward_cross_packed(
+                    query_cos_sin=answer_cos_sin,
+                    key_value_cos_sin=key_value_cos_sin,
+                    query_states=answer_states,
+                    key_value_states=key_value_states,
+                    cu_seqlens_q=cu_answer,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_answer_len,
+                    max_seqlen_k=max_seqlen,
+                    causal=True,
+                )
+                next_states[answer_indices] = answer_states
+
+            hidden_states = self._add_noise(next_states) if add_noise else next_states
+
+        return hidden_states
+
     def forward(
         self,
         carry: URMCarry,
@@ -1423,6 +1516,114 @@ class URM_Inner(nn.Module):
         q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
+    def forward_prefix_lm_packed(
+        self,
+        carry: URMCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+        if not self.config.variable_seq_lengths:
+            raise ValueError("prefix_lm is currently implemented for packed variable-length batches only.")
+        if self.use_hrm:
+            raise ValueError("prefix_lm packed mode is not supported when H_layers > 0.")
+
+        input_embeddings, token_indices = self._input_embeddings_packed(batch)
+        cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
+        cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+        (
+            _answer_data_mask,
+            answer_indices,
+            _answer_labels,
+            _answer_lengths,
+            cu_answer,
+            cu_context,
+            max_answer_len,
+            max_context_len,
+        ) = self._packed_answer_metadata(batch, token_indices)
+        context_indices = self._packed_context_indices(input_embeddings, answer_indices)
+
+        input_embeddings = self._run_prefix_lm_token_layers_packed(
+            hidden_states=input_embeddings,
+            layers=self.prelude_layers,
+            cos_sin=cos_sin,
+            context_indices=context_indices,
+            answer_indices=answer_indices,
+            cu_seqlens=cu_seqlens,
+            cu_context=cu_context,
+            cu_answer=cu_answer,
+            max_seqlen=max_seqlen,
+            max_context_len=max_context_len,
+            max_answer_len=max_answer_len,
+        )
+
+        hidden_states = carry.current_hidden
+        if hidden_states.shape[0] != input_embeddings.shape[0]:
+            raise RuntimeError(
+                f"Packed carry/input length mismatch: carry={hidden_states.shape[0]} input={input_embeddings.shape[0]}"
+            )
+
+        if len(self.context_layers) > 0 and context_indices.numel() > 0:
+            context_states = self._inject_inputs(
+                hidden_states[context_indices],
+                input_embeddings[context_indices],
+            )
+            context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
+            for layer in self.context_layers:
+                context_states = layer.forward_packed(
+                    cos_sin=context_cos_sin,
+                    hidden_states=context_states,
+                    cu_seqlens=cu_context,
+                    max_seqlen=max_context_len,
+                )
+            hidden_states = hidden_states.clone()
+            hidden_states[context_indices] = context_states
+
+        def run_cycles(states: torch.Tensor, *, add_noise: bool) -> torch.Tensor:
+            for _ in range(self.config.L_cycles):
+                states = self._inject_inputs(states, input_embeddings)
+                states = self._run_prefix_lm_token_layers_packed(
+                    hidden_states=states,
+                    layers=self.layers,
+                    cos_sin=cos_sin,
+                    context_indices=context_indices,
+                    answer_indices=answer_indices,
+                    cu_seqlens=cu_seqlens,
+                    cu_context=cu_context,
+                    cu_answer=cu_answer,
+                    max_seqlen=max_seqlen,
+                    max_context_len=max_context_len,
+                    max_answer_len=max_answer_len,
+                    add_noise=add_noise,
+                )
+            return states
+
+        no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
+        if no_grad_H_cycles > 0:
+            with torch.no_grad():
+                for _ in range(no_grad_H_cycles):
+                    hidden_states = run_cycles(hidden_states, add_noise=False)
+                    hidden_states = self._add_noise(hidden_states)
+
+        for _ in range(self.config.grad_H_cycles):
+            hidden_states = run_cycles(hidden_states, add_noise=True)
+
+        new_carry = replace(carry, current_hidden=hidden_states.detach())
+        head_hidden_states = self._run_prefix_lm_token_layers_packed(
+            hidden_states=hidden_states,
+            layers=self.coda_layers,
+            cos_sin=cos_sin,
+            context_indices=context_indices,
+            answer_indices=answer_indices,
+            cu_seqlens=cu_seqlens,
+            cu_context=cu_context,
+            cu_answer=cu_answer,
+            max_seqlen=max_seqlen,
+            max_context_len=max_context_len,
+            max_answer_len=max_answer_len,
+        )
+        output = self.lm_head(head_hidden_states[answer_indices])
+        q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
+
     def forward_answer_only_packed(
         self,
         carry: URMCarry,
@@ -1432,6 +1633,8 @@ class URM_Inner(nn.Module):
             raise ValueError("answer_only is currently implemented for packed variable-length batches only.")
         if self.use_hrm:
             raise ValueError("answer_only packed mode is not supported when H_layers > 0.")
+        if self.config.prefix_lm:
+            return self.forward_prefix_lm_packed(carry, batch)
 
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)

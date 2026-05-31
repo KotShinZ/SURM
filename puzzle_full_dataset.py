@@ -229,6 +229,15 @@ class PuzzleFullDataset(PuzzleDataset):
         keep_solution = rng.random(solution.shape) < gamma
         return np.where(keep_solution, solution, epsilon).astype(np.int32, copy=False)
 
+    def _make_causal_answer_inputs(self, solution: np.ndarray) -> np.ndarray:
+        start_token = int(self.config.causal_lm_start_token_id)
+        shifted = np.empty_like(solution)
+        if shifted.size == 0:
+            return shifted
+        shifted[0] = start_token
+        shifted[1:] = solution[:-1]
+        return shifted
+
     def _build_pairs_sample(
         self,
         pairs: Sequence[Tuple[np.ndarray, np.ndarray]],
@@ -242,6 +251,7 @@ class PuzzleFullDataset(PuzzleDataset):
             raise ValueError(f"pairs and shapes length mismatch: {len(pairs)} != {len(shapes)}")
 
         answer_only_labels = bool(self.config.answer_only_labels)
+        causal_lm = bool(self.config.casual)
 
         input_chunks = []
         label_chunks = []
@@ -272,7 +282,7 @@ class PuzzleFullDataset(PuzzleDataset):
             slot_solution = solution
             slot_labels = solution
             slot_label_shape = label_shape
-            if pair_pos == target_pair_index and self.config.padding:
+            if pair_pos == target_pair_index and self.config.padding and not causal_lm:
                 slot_label_shape = (ARC_MAX_GRID_SIZE, ARC_MAX_GRID_SIZE)
                 slot_solution = self._pad_flat_2d_tokens(
                     solution,
@@ -295,7 +305,11 @@ class PuzzleFullDataset(PuzzleDataset):
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
-                input_solution = self._make_answer_initial_tokens(slot_solution, rng)
+                input_solution = (
+                    self._make_causal_answer_inputs(slot_solution)
+                    if causal_lm
+                    else self._make_answer_initial_tokens(slot_solution, rng)
+                )
                 label_solution = slot_labels
                 answer_mask = np.ones(slot_solution.shape, dtype=np.bool_)
                 label_seq_shape = slot_label_shape

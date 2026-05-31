@@ -936,6 +936,7 @@ class Attention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         if self.attention_type != "full":
             raise ValueError(
@@ -976,7 +977,7 @@ class Attention(nn.Module):
             cu_seqlens_k=cu_seqlens_k.to(torch.int32),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            causal=False,
+            causal=causal,
             window_size=(-1, -1),
             dropout_p=self.attn_dropout if self.training else 0.0,
         )

@@ -254,6 +254,32 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         target_answer_mask = (position_ids[:, 0] == 0) & (position_ids[:, 1] == 1)
         self.assertEqual(int(target_answer_mask.sum()), 1)
 
+    def test_casual_mode_uses_shifted_answer_inputs_without_30x30_padding(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            casual=True,
+            answer_only_labels=True,
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        dataset.split = "train"
+
+        sample = dataset._build_pairs_sample(
+            [(np.array([2], dtype=np.int32), np.array([9, 10], dtype=np.int32))],
+            [((1, 1), (1, 2))],
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+
+        answer_tokens = sample["inputs"][sample["answer_mask"]]
+        self.assertEqual(answer_tokens.tolist(), [1, 9])
+        self.assertEqual(sample["labels"].tolist(), [9, 10])
+        self.assertEqual(int(sample["answer_mask"].sum()), 2)
+        self.assertEqual(int(sample["seq_lengths"].item()), 3)
+        self.assertEqual(int(sample["label_seq_lengths"].item()), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

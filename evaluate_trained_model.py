@@ -10,6 +10,7 @@ from typing import Dict, Iterator, Optional, Tuple
 import torch
 
 from evaluators.arc import ARC
+from models.losses import IGNORE_LABEL_ID
 from pretrain import (
     PretrainConfig,
     TrainState,
@@ -102,6 +103,114 @@ def _truncate_batch(batch: Dict[str, torch.Tensor], sample_count: int) -> Dict[s
             truncated[key] = value
 
     return truncated
+
+
+def _valid_example_mask(batch_or_labels) -> torch.Tensor:
+    if isinstance(batch_or_labels, dict):
+        labels = batch_or_labels["labels"]
+        if labels is None:
+            return torch.ones(
+                _sample_count(batch_or_labels),
+                dtype=torch.bool,
+                device=batch_or_labels["inputs"].device,
+            )
+        if labels.ndim == 1 and "label_seq_offsets" in batch_or_labels:
+            offsets = batch_or_labels["label_seq_offsets"]
+            valid = []
+            for idx in range(offsets.shape[0] - 1):
+                start = int(offsets[idx].item())
+                end = int(offsets[idx + 1].item())
+                valid.append(bool((labels[start:end] != IGNORE_LABEL_ID).any().item()))
+            return torch.tensor(valid, dtype=torch.bool, device=labels.device)
+    else:
+        labels = batch_or_labels
+
+    if labels.ndim == 1:
+        return labels != IGNORE_LABEL_ID
+    return (labels != IGNORE_LABEL_ID).any(dim=tuple(range(1, labels.ndim)))
+
+
+def _select_prediction_examples(
+    preds: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    indices: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    if "label_seq_offsets" not in batch:
+        return {
+            key: value.index_select(0, indices.to(value.device))
+            if value.shape[:1] == (batch["puzzle_identifiers"].shape[0],)
+            else value
+            for key, value in preds.items()
+        }
+
+    label_offsets = batch["label_seq_offsets"].detach().cpu().tolist()
+    selected = {}
+    for key, value in preds.items():
+        if value.shape[:1] != (int(batch["label_seq_offsets"][-1].item()),):
+            selected[key] = value.index_select(0, indices.to(value.device)) if value.shape[:1] == (batch["puzzle_identifiers"].shape[0],) else value
+            continue
+
+        chunks = []
+        for idx in indices.detach().cpu().tolist():
+            start = int(label_offsets[int(idx)])
+            end = int(label_offsets[int(idx) + 1])
+            chunks.append(value[start:end])
+        selected[key] = torch.cat(chunks, dim=0) if chunks else value.new_empty((0,) + value.shape[1:])
+    return selected
+
+
+def _compute_batch_metric_sums(
+    model,
+    batch: Dict[str, torch.Tensor],
+    preds: Dict[str, torch.Tensor],
+    final_steps: torch.Tensor,
+    keep_mask: torch.Tensor,
+) -> Dict[str, float]:
+    labels = batch["labels"]
+    pred_tokens = preds["preds"]
+    selected_indices = torch.nonzero(keep_mask, as_tuple=False).flatten()
+
+    count = 0.0
+    accuracy = 0.0
+    exact_accuracy = 0.0
+    steps = 0.0
+
+    if labels.ndim == 1 and "label_seq_offsets" in batch:
+        offsets = batch["label_seq_offsets"].detach().cpu().tolist()
+        for idx in selected_indices.detach().cpu().tolist():
+            start = int(offsets[int(idx)])
+            end = int(offsets[int(idx) + 1])
+            sample_labels = labels[start:end]
+            sample_preds = pred_tokens[start:end]
+            mask = sample_labels != IGNORE_LABEL_ID
+            valid_count = int(mask.sum().item())
+            if valid_count == 0:
+                continue
+            correct = (sample_preds == sample_labels) & mask
+            count += 1.0
+            accuracy += float(correct.sum().item()) / valid_count
+            exact_accuracy += 1.0 if int(correct.sum().item()) == valid_count else 0.0
+            steps += float(final_steps[int(idx)].item())
+    else:
+        for idx in selected_indices.detach().cpu().tolist():
+            sample_labels = labels[int(idx)]
+            sample_preds = pred_tokens[int(idx)]
+            mask = sample_labels != IGNORE_LABEL_ID
+            valid_count = int(mask.sum().item())
+            if valid_count == 0:
+                continue
+            correct = (sample_preds == sample_labels) & mask
+            count += 1.0
+            accuracy += float(correct.sum().item()) / valid_count
+            exact_accuracy += 1.0 if int(correct.sum().item()) == valid_count else 0.0
+            steps += float(final_steps[int(idx)].item())
+
+    return {
+        "count": count,
+        "accuracy": accuracy,
+        "exact_accuracy": exact_accuracy,
+        "steps": steps,
+    }
 
 
 class MaxProblemsDataLoader:

@@ -173,6 +173,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     # Emit labels as only the answer tokens while keeping inputs full-length.
     answer_only_labels: bool = False
+    casual: bool = False
+    causal_lm_start_token_id: int = 1
 
     # Separate problem and answer tokens in the model input.
     label_separate: bool = False
@@ -231,6 +233,11 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
             raise ValueError(
                 "full_answer_initial_noise_token_max must be >= full_answer_initial_noise_token_min, "
                 f"got {self.full_answer_initial_noise_token_max} < {self.full_answer_initial_noise_token_min}"
+            )
+        if self.causal_lm_start_token_id < 0:
+            raise ValueError(
+                "causal_lm_start_token_id must be >= 0, "
+                f"got {self.causal_lm_start_token_id}"
             )
         if self.label_separate_noise_token_min < 0:
             raise ValueError(

@@ -157,6 +157,8 @@ class PretrainConfig(pydantic.BaseModel):
     data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
     examples_per_puzzle: Optional[int] = 1
     padding: bool = False
+    casual: bool = False
+    causal: Optional[bool] = None
 
     # Online augmentation (applied per batch during training only)
     online_aug: Optional[OnlineAugConfig] = None
@@ -199,6 +201,12 @@ class PretrainConfig(pydantic.BaseModel):
             values = dict(values)
             values["padding"] = not pydantic.TypeAdapter(bool).validate_python(values.pop("nopadding"))
         return values
+
+    @pydantic.model_validator(mode="after")
+    def _normalize_casual_alias(self):
+        if self.causal is not None:
+            self.casual = bool(self.causal)
+        return self
 
 
 
@@ -327,14 +335,27 @@ def _separate_mode(config: PretrainConfig) -> str:
     return str(mode).upper()
 
 
+def _casual_prefix_lm_enabled(config: PretrainConfig) -> bool:
+    return bool(
+        config.casual
+        or (config.causal if config.causal is not None else False)
+        or getattr(config.arch, "casual", False)
+        or getattr(config.arch, "causal", False)
+        or getattr(config.arch, "prefix_lm", False)
+    )
+
+
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_test = kwargs.get("test_set_mode", False)
     label_separate = _label_separate_enabled(config)
+    casual_prefix_lm = _casual_prefix_lm_enabled(config)
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
+    if casual_prefix_lm and not config.mask_full_training:
+        raise ValueError("casual/prefix-LM mode currently requires mask_full_training=True.")
     if config.mask_full_training and label_separate:
         raise ValueError("label_separate cannot be combined with mask_full_training.")
     if label_separate and online_aug is not None and online_aug.enabled:
@@ -348,7 +369,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            padding=config.padding,
+            padding=bool(config.padding and not casual_prefix_lm),
+            casual=casual_prefix_lm,
             data_fraction=data_fraction,
             grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,
@@ -363,7 +385,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
             full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
             full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
-            answer_only_labels=bool(getattr(config.arch, "answer_only", False)),
+            answer_only_labels=bool(getattr(config.arch, "answer_only", False) or casual_prefix_lm),
             label_separate=label_separate,
             SeparateMode=_separate_mode(config),
             label_separate_noise_token_min=int(_config_or_arch_extra(config, "label_separate_noise_token_min")),
@@ -375,6 +397,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
     if is_test and label_separate:
         print("Evaluation split uses PuzzleDatasetSeparate with fully noised answer tokens.")
+    elif casual_prefix_lm:
+        print("Dataset uses prefix-LM ARC answer tokens without 30x30 answer padding.")
     elif is_test and not config.mask_full_training:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
     elif is_test:
@@ -439,8 +463,12 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
         variable_seq_lengths=train_metadata.variable_seq_lengths,
         grad_logging_enabled=not config.halted_replay_training,
-        causal=False,  # Non-autoregressive
+        causal=False,  # Full-context paths are non-autoregressive.
     )
+    casual_prefix_lm = _casual_prefix_lm_enabled(config)
+    if casual_prefix_lm:
+        model_cfg["answer_only"] = True
+        model_cfg["prefix_lm"] = True
     model_cfg["label_separate"] = _label_separate_enabled(config)
     model_cfg["SeparateMode"] = _separate_mode(config)
     model_cfg["label_separate_C_noise_scale"] = float(_config_or_arch_extra(config, "label_separate_C_noise_scale"))
@@ -1490,6 +1518,26 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
     early_eval: bool = False,
 ):
+    if _casual_prefix_lm_enabled(config):
+        from autoregressive_eval import evaluate_autoregressive
+
+        original_is_log = global_logger.is_log
+        global_logger.is_log = False
+        try:
+            return evaluate_autoregressive(
+                config=config,
+                train_state=train_state,
+                eval_loader=eval_loader,
+                eval_metadata=eval_metadata,
+                evaluators=evaluators,
+                rank=rank,
+                world_size=world_size,
+                cpu_group=cpu_group,
+                early_eval=early_eval,
+            )
+        finally:
+            global_logger.is_log = original_is_log
+
     reduced_metrics = None
     original_is_log = global_logger.is_log
     global_logger.is_log = False
