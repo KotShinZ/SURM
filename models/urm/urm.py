@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from models.common import packed_norm_ratio_from_lengths, trunc_normal_init_
 from models.layers import (
     rms_norm,
@@ -63,6 +63,9 @@ def _normalize_attention_window_sizes(
     return normalized_window_sizes
 
 
+ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+
+
 class URMConfig(BaseModel):
     batch_size: int
     seq_len: int
@@ -110,6 +113,7 @@ class URMConfig(BaseModel):
     variable_seq_lengths: bool = False
     profile: bool = False
     grad_logging_enabled: bool = True
+    forward_mode: ForwardMode = "standard"
     answer_only: bool = False
     answer_only_context_layers: int = 0
     prefix_lm: bool = False
@@ -136,6 +140,22 @@ class URMConfig(BaseModel):
     answer_initial_pad_token_id: int = 0
     answer_initial_eos_token_id: int = 1
     answer_initial_use_labels_in_eval: bool = False
+
+    @model_validator(mode="after")
+    def _normalize_forward_mode(self):
+        if self.forward_mode == "standard":
+            if self.prefix_lm:
+                self.forward_mode = "prefix_lm"
+            elif self.answer_only:
+                self.forward_mode = "answer_only"
+
+        if self.forward_mode == "prefix_lm":
+            self.answer_only = True
+            self.prefix_lm = True
+        elif self.forward_mode == "answer_only":
+            self.answer_only = True
+            self.prefix_lm = False
+        return self
 
 
 class URMBlock(nn.Module):
@@ -1375,7 +1395,9 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if self.config.answer_only:
+        if self.config.forward_mode == "prefix_lm":
+            return self.forward_prefix_lm_packed(carry, batch)
+        if self.config.forward_mode == "answer_only":
             return self.forward_answer_only_packed(carry, batch)
 
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
@@ -1633,8 +1655,6 @@ class URM_Inner(nn.Module):
             raise ValueError("answer_only is currently implemented for packed variable-length batches only.")
         if self.use_hrm:
             raise ValueError("answer_only packed mode is not supported when H_layers > 0.")
-        if self.config.prefix_lm:
-            return self.forward_prefix_lm_packed(carry, batch)
 
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
@@ -2411,7 +2431,7 @@ class URM(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
         }
-        if self.config.answer_only:
+        if self.config.forward_mode in {"answer_only", "prefix_lm"}:
             token_indices = self.inner._packed_data_token_indices(new_current_data)
             (
                 _answer_data_mask,

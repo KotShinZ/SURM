@@ -15,6 +15,7 @@ from data.online_aug import OnlineAugConfig, apply_online_aug
 
 
 ARC_MAX_GRID_SIZE = 30
+ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
 
 
 class MaskedInputConfig(pydantic.BaseModel):
@@ -171,6 +172,9 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     full_answer_initial_noise_token_min: int = 2
     full_answer_initial_noise_token_max: int = 11
 
+    # Forward/data mode. Legacy aliases below are kept for older configs.
+    forward_mode: ForwardMode = "standard"
+
     # Emit labels as only the answer tokens while keeping inputs full-length.
     answer_only_labels: bool = False
     casual: bool = False
@@ -193,6 +197,13 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
+        if self.forward_mode == "standard" and self.casual:
+            self.forward_mode = "prefix_lm"
+        if self.forward_mode in {"answer_only", "prefix_lm"}:
+            self.answer_only_labels = True
+        if self.forward_mode == "prefix_lm":
+            self.casual = True
+
         if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:
             raise ValueError(
                 "examples_per_puzzle must be a positive integer, or None for full-puzzle sampling; "
@@ -256,6 +267,12 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
         if mode not in {"C", "D"}:
             raise ValueError(f"SeparateMode must be 'C' or 'D', got {self.separate_mode or self.SeparateMode!r}")
         return self
+
+    def emits_answer_only_labels(self) -> bool:
+        return bool(self.answer_only_labels or self.forward_mode in {"answer_only", "prefix_lm"})
+
+    def uses_prefix_lm(self) -> bool:
+        return bool(self.casual or self.forward_mode == "prefix_lm")
 
 
 class PuzzleDataset(IterableDataset):
@@ -1236,7 +1253,7 @@ class PuzzleDatasetSeparate(PuzzleDataset):
         seq_lengths = batch["seq_lengths"].to(torch.long)
         label_lengths = batch.get("label_seq_lengths", batch["seq_lengths"]).to(torch.long)
         label_shapes = batch.get("label_seq_shapes")
-        answer_only_labels = bool(self.config.answer_only_labels)
+        answer_only_labels = self.config.emits_answer_only_labels()
 
         input_chunks = []
         label_chunks = []

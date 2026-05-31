@@ -43,6 +43,9 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from logger import global_logger
 
 
+ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+
+
 class EMAHelper(object):
     def __init__(self, mu=0.999):
         self.mu = mu
@@ -157,6 +160,7 @@ class PretrainConfig(pydantic.BaseModel):
     data_fraction: float = 1.0  # Fraction of training data to use per epoch (1.0 = all, 0.5 = half)
     examples_per_puzzle: Optional[int] = 1
     padding: bool = False
+    forward_mode: Optional[ForwardMode] = None
     casual: bool = False
     causal: Optional[bool] = None
 
@@ -335,27 +339,50 @@ def _separate_mode(config: PretrainConfig) -> str:
     return str(mode).upper()
 
 
-def _casual_prefix_lm_enabled(config: PretrainConfig) -> bool:
-    return bool(
+def _normalize_forward_mode_name(mode: Any) -> ForwardMode:
+    normalized = str(mode).lower()
+    if normalized not in {"standard", "answer_only", "prefix_lm"}:
+        raise ValueError(
+            "forward_mode must be one of standard, answer_only, or prefix_lm, "
+            f"got {mode!r}"
+        )
+    return normalized  # type: ignore[return-value]
+
+
+def _resolve_forward_mode(config: PretrainConfig) -> ForwardMode:
+    mode = getattr(config.arch, "forward_mode", None)
+    if mode is None:
+        mode = config.forward_mode
+    if mode is not None:
+        return _normalize_forward_mode_name(mode)
+
+    legacy_prefix_lm = bool(
         config.casual
         or (config.causal if config.causal is not None else False)
         or getattr(config.arch, "casual", False)
         or getattr(config.arch, "causal", False)
         or getattr(config.arch, "prefix_lm", False)
     )
+    if legacy_prefix_lm:
+        return "prefix_lm"
+    if getattr(config.arch, "answer_only", False):
+        return "answer_only"
+    return "standard"
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_test = kwargs.get("test_set_mode", False)
     label_separate = _label_separate_enabled(config)
-    casual_prefix_lm = _casual_prefix_lm_enabled(config)
+    forward_mode = _resolve_forward_mode(config)
+    prefix_lm_mode = forward_mode == "prefix_lm"
+    answer_only_mode = forward_mode in {"answer_only", "prefix_lm"}
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
-    if casual_prefix_lm and not config.mask_full_training:
-        raise ValueError("casual/prefix-LM mode currently requires mask_full_training=True.")
+    if prefix_lm_mode and not config.mask_full_training:
+        raise ValueError("prefix_lm forward_mode currently requires mask_full_training=True.")
     if config.mask_full_training and label_separate:
         raise ValueError("label_separate cannot be combined with mask_full_training.")
     if label_separate and online_aug is not None and online_aug.enabled:
@@ -369,8 +396,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            padding=bool(config.padding and not casual_prefix_lm),
-            casual=casual_prefix_lm,
+            padding=bool(config.padding and not prefix_lm_mode),
+            forward_mode=forward_mode,
+            casual=prefix_lm_mode,
             data_fraction=data_fraction,
             grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,
@@ -385,7 +413,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
             full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
             full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
-            answer_only_labels=bool(getattr(config.arch, "answer_only", False) or casual_prefix_lm),
+            answer_only_labels=answer_only_mode,
             label_separate=label_separate,
             SeparateMode=_separate_mode(config),
             label_separate_noise_token_min=int(_config_or_arch_extra(config, "label_separate_noise_token_min")),
@@ -397,8 +425,10 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     print(f"Dataset {split} has {dataset.metadata.total_groups} groups.")
     if is_test and label_separate:
         print("Evaluation split uses PuzzleDatasetSeparate with fully noised answer tokens.")
-    elif casual_prefix_lm:
+    elif prefix_lm_mode:
         print("Dataset uses prefix-LM ARC answer tokens without 30x30 answer padding.")
+    elif answer_only_mode:
+        print("Dataset emits answer-only labels for the target answer slots.")
     elif is_test and not config.mask_full_training:
         print(f"Shuffling evaluation problems with seed {config.seed}.")
     elif is_test:
@@ -465,10 +495,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         grad_logging_enabled=not config.halted_replay_training,
         causal=False,  # Full-context paths are non-autoregressive.
     )
-    casual_prefix_lm = _casual_prefix_lm_enabled(config)
-    if casual_prefix_lm:
-        model_cfg["answer_only"] = True
-        model_cfg["prefix_lm"] = True
+    model_cfg["forward_mode"] = _resolve_forward_mode(config)
     model_cfg["label_separate"] = _label_separate_enabled(config)
     model_cfg["SeparateMode"] = _separate_mode(config)
     model_cfg["label_separate_C_noise_scale"] = float(_config_or_arch_extra(config, "label_separate_C_noise_scale"))
@@ -1518,7 +1545,7 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
     early_eval: bool = False,
 ):
-    if _casual_prefix_lm_enabled(config):
+    if _resolve_forward_mode(config) == "prefix_lm":
         from autoregressive_eval import evaluate_autoregressive
 
         original_is_log = global_logger.is_log

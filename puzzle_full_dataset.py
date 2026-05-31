@@ -250,8 +250,8 @@ class PuzzleFullDataset(PuzzleDataset):
         if len(pairs) != len(shapes):
             raise ValueError(f"pairs and shapes length mismatch: {len(pairs)} != {len(shapes)}")
 
-        answer_only_labels = bool(self.config.answer_only_labels)
-        causal_lm = bool(self.config.casual)
+        answer_only_labels = self.config.emits_answer_only_labels()
+        causal_lm = self.config.uses_prefix_lm()
 
         input_chunks = []
         label_chunks = []

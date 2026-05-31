@@ -36,7 +36,7 @@ grid_width: 0
 
 # Enable timing profile output during training for debugging
 profile: true
-answer_only: false
+forward_mode: standard  # standard | answer_only | prefix_lm
 answer_only_context_layers: 0
 label_separate: false
 SeparateMode: D  # C | D

@@ -51,8 +51,7 @@ def _urm_config(**overrides):
         profile=False,
         use_act=False,
         variable_seq_lengths=True,
-        answer_only=True,
-        prefix_lm=True,
+        forward_mode="prefix_lm",
     )
     config.update(overrides)
     return config
@@ -73,6 +72,30 @@ class FakePrefixLayer:
 
 
 class PrefixLMTests(unittest.TestCase):
+    def test_forward_mode_dispatches_packed_paths(self) -> None:
+        calls = []
+        model = URM(_urm_config(forward_mode="prefix_lm"))
+        model.inner.forward_prefix_lm_packed = lambda carry, batch: calls.append("prefix_lm")
+        model.inner.forward_answer_only_packed = lambda carry, batch: calls.append("answer_only")
+
+        model.inner.forward_packed(None, {})
+        self.assertEqual(calls, ["prefix_lm"])
+
+        calls.clear()
+        model = URM(_urm_config(forward_mode="answer_only"))
+        model.inner.forward_prefix_lm_packed = lambda carry, batch: calls.append("prefix_lm")
+        model.inner.forward_answer_only_packed = lambda carry, batch: calls.append("answer_only")
+
+        model.inner.forward_packed(None, {})
+        self.assertEqual(calls, ["answer_only"])
+
+    def test_legacy_forward_flags_normalize_to_forward_mode(self) -> None:
+        answer_model = URM(_urm_config(forward_mode="standard", answer_only=True))
+        prefix_model = URM(_urm_config(forward_mode="standard", prefix_lm=True))
+
+        self.assertEqual(answer_model.config.forward_mode, "answer_only")
+        self.assertEqual(prefix_model.config.forward_mode, "prefix_lm")
+
     def test_prefix_lm_layers_use_context_then_causal_answer_attention(self) -> None:
         model = URM(_urm_config())
         layer = FakePrefixLayer()
