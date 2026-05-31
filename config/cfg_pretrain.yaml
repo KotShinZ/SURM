@@ -19,6 +19,7 @@ grad_accum_steps: 1
 
 epochs: 200000
 eval_interval: 10
+# Run one evaluation at step 0 before the first training step.
 eval_first: false
 checkpoint_every_eval: True
 
