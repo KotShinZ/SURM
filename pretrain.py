@@ -149,6 +149,7 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     eval_first: bool = False
     eval_save_outputs: List[str] = []
+    autoregressive_eval_batch_size: Optional[int] = None
 
     loop_deltas: List[str] = []
 

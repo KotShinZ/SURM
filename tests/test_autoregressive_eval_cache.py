@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from autoregressive_eval import (  # noqa: E402
+    _generate_batch_parallel_cached,
     _generate_sample_cached,
     _generate_sample_slow,
     _supports_prefix_lm_kv_cache,
@@ -100,6 +101,66 @@ class AutoregressiveEvalCacheTests(unittest.TestCase):
 
         self.assertEqual(slow_preds["preds"].tolist(), cached_preds["preds"].tolist())
         self.assertEqual(slow_metrics, cached_metrics)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for flash-attention decode")
+    def test_batched_cached_prefix_lm_decode_matches_per_sample_cached_decode(self) -> None:
+        torch.manual_seed(0)
+        model = URM(_urm_config(seq_len=10)).cuda().eval()
+        batch = {
+            "inputs": torch.tensor([2, 3, 4, 1, 9, 10, 5, 6, 1, 7], dtype=torch.int32, device="cuda"),
+            "labels": torch.tensor([9, 10, 11, 7, 8], dtype=torch.int32, device="cuda"),
+            "answer_mask": torch.tensor(
+                [False, False, False, True, True, True, False, False, True, True],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+            "source_inputs": torch.tensor([2, 3, 4, 9, 10, 11, 5, 6, 7, 8], dtype=torch.int32, device="cuda"),
+            "position_ids": torch.cat(
+                [
+                    torch.stack(
+                        [
+                            torch.zeros(6, dtype=torch.int32, device="cuda"),
+                            torch.zeros(6, dtype=torch.int32, device="cuda"),
+                            torch.arange(6, dtype=torch.int32, device="cuda"),
+                            torch.zeros(6, dtype=torch.int32, device="cuda"),
+                        ],
+                        dim=1,
+                    ),
+                    torch.stack(
+                        [
+                            torch.ones(4, dtype=torch.int32, device="cuda"),
+                            torch.zeros(4, dtype=torch.int32, device="cuda"),
+                            torch.arange(4, dtype=torch.int32, device="cuda"),
+                            torch.zeros(4, dtype=torch.int32, device="cuda"),
+                        ],
+                        dim=1,
+                    ),
+                ],
+                dim=0,
+            ),
+            "seq_lengths": torch.tensor([6, 4], dtype=torch.int32, device="cuda"),
+            "seq_offsets": torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda"),
+            "label_seq_lengths": torch.tensor([3, 2], dtype=torch.int32, device="cuda"),
+            "label_seq_offsets": torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda"),
+            "puzzle_identifiers": torch.tensor([0, 0], dtype=torch.int64, device="cuda"),
+        }
+
+        self.assertTrue(_supports_prefix_lm_kv_cache(model))
+        with torch.inference_mode():
+            single_results = [
+                _generate_sample_cached(model, batch, sample_idx, start_token_id=1)
+                for sample_idx in range(2)
+            ]
+            parallel_results = _generate_batch_parallel_cached(model, batch, start_token_id=1)
+
+        self.assertEqual(len(single_results), len(parallel_results))
+        for (_single_batch, single_preds, single_metrics), (_parallel_batch, parallel_preds, parallel_metrics) in zip(
+            single_results,
+            parallel_results,
+        ):
+            self.assertEqual(single_preds["preds"].tolist(), parallel_preds["preds"].tolist())
+            self.assertTrue(torch.allclose(single_preds["q_halt_logits"], parallel_preds["q_halt_logits"]))
+            self.assertEqual(single_metrics, parallel_metrics)
 
 
 if __name__ == "__main__":

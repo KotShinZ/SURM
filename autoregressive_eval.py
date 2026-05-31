@@ -23,6 +23,88 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
     return {key: value.to(device) for key, value in batch.items()}
 
 
+def _resolve_autoregressive_eval_batch_size(config: Any) -> Optional[int]:
+    value = getattr(config, "autoregressive_eval_batch_size", None)
+    if value is None:
+        value = getattr(config, "autoregressive_eval_micro_batch_size", None)
+    if value is None:
+        value = getattr(getattr(config, "arch", None), "autoregressive_eval_batch_size", None)
+    if value is None:
+        return None
+
+    batch_size = int(value)
+    if batch_size <= 0:
+        raise ValueError("autoregressive_eval_batch_size must be positive when provided.")
+    return batch_size
+
+
+def _slice_packed_batch_samples(
+    batch: Dict[str, torch.Tensor],
+    sample_start: int,
+    sample_end: int,
+) -> Dict[str, torch.Tensor]:
+    sample_count = int(batch["puzzle_identifiers"].shape[0])
+    if sample_start <= 0 and sample_end >= sample_count:
+        return batch
+
+    seq_offsets = batch["seq_offsets"].to(torch.long)
+    label_offsets = batch.get("label_seq_offsets", batch["seq_offsets"]).to(torch.long)
+    token_start = int(seq_offsets[sample_start].item())
+    token_end = int(seq_offsets[sample_end].item())
+    label_start = int(label_offsets[sample_start].item())
+    label_end = int(label_offsets[sample_end].item())
+    token_count = int(seq_offsets[-1].item())
+    label_count = int(label_offsets[-1].item())
+    selected_count = sample_end - sample_start
+
+    sliced: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if key == "seq_offsets":
+            lengths = batch["seq_lengths"][sample_start:sample_end]
+            offsets = torch.zeros((selected_count + 1,), dtype=value.dtype, device=value.device)
+            offsets[1:] = torch.cumsum(lengths.to(value.dtype), dim=0)
+            sliced[key] = offsets
+        elif key == "label_seq_offsets":
+            lengths = batch["label_seq_lengths"][sample_start:sample_end]
+            offsets = torch.zeros((selected_count + 1,), dtype=value.dtype, device=value.device)
+            offsets[1:] = torch.cumsum(lengths.to(value.dtype), dim=0)
+            sliced[key] = offsets
+        elif key in {"seq_lengths", "label_seq_lengths", "seq_shapes", "label_seq_shapes"}:
+            sliced[key] = value[sample_start:sample_end]
+        elif key == "labels" and value.ndim == 1 and value.numel() != token_count:
+            sliced[key] = value[label_start:label_end]
+        elif value.ndim > 0 and value.shape[0] == sample_count:
+            sliced[key] = value[sample_start:sample_end]
+        elif value.ndim > 0 and value.shape[0] == token_count:
+            sliced[key] = value[token_start:token_end]
+        elif value.ndim > 0 and value.shape[0] == label_count:
+            sliced[key] = value[label_start:label_end]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _iter_autoregressive_eval_batches(
+    batch: Dict[str, torch.Tensor],
+    eval_batch_size: Optional[int],
+) -> List[Tuple[int, int, Dict[str, torch.Tensor]]]:
+    sample_count = int(batch["puzzle_identifiers"].shape[0])
+    if eval_batch_size is None or sample_count <= eval_batch_size:
+        return [(0, sample_count, batch)]
+
+    micro_batches = []
+    for sample_start in range(0, sample_count, eval_batch_size):
+        sample_end = min(sample_start + eval_batch_size, sample_count)
+        micro_batches.append(
+            (
+                sample_start,
+                sample_end,
+                _slice_packed_batch_samples(batch, sample_start, sample_end),
+            )
+        )
+    return micro_batches
+
+
 def _sample_ranges(batch: Dict[str, torch.Tensor], sample_idx: int) -> Tuple[int, int, int, int]:
     seq_offsets = batch["seq_offsets"]
     label_offsets = batch.get("label_seq_offsets", seq_offsets)
@@ -196,6 +278,17 @@ class _KVCacheEntry:
         self.answer_value[self.answer_len : self.answer_len + 1] = current_value
         self.answer_ffn[self.answer_len : self.answer_len + 1] = current_ffn
         self.answer_len += 1
+
+
+@dataclass
+class _ParallelSampleState:
+    sample_idx: int
+    target_tokens: torch.Tensor
+    target_positions: torch.Tensor
+    sample_answer_mask: torch.Tensor
+    generated_tokens: torch.Tensor
+    q_halt_logits: torch.Tensor
+    steps: float = 0.0
 
 
 def _run_base_model_to_halt(base_model: Any, batch: Dict[str, torch.Tensor]) -> Tuple[Any, Dict[str, torch.Tensor]]:
@@ -384,6 +477,111 @@ def _build_full_position_batch(
     }
 
 
+def _build_parallel_context_batch(
+    batch: Dict[str, torch.Tensor],
+    states: List[_ParallelSampleState],
+) -> Dict[str, torch.Tensor]:
+    input_chunks = []
+    source_chunks = []
+    position_chunks = []
+    seq_lengths = []
+    puzzle_identifiers = []
+
+    for state in states:
+        start, end, _label_start, _label_end = _sample_ranges(batch, state.sample_idx)
+        context_mask = ~state.sample_answer_mask
+        context_inputs = batch["inputs"][start:end][context_mask]
+        input_chunks.append(context_inputs)
+        source_chunks.append(batch.get("source_inputs", batch["inputs"])[start:end][context_mask])
+        position_chunks.append(batch["position_ids"][start:end][context_mask])
+        seq_lengths.append(context_inputs.numel())
+        puzzle_identifiers.append(batch["puzzle_identifiers"][state.sample_idx : state.sample_idx + 1])
+
+    device = batch["inputs"].device
+    seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+    inputs = torch.cat(input_chunks, dim=0) if input_chunks else batch["inputs"].new_empty((0,))
+    context_batch = {
+        "inputs": inputs,
+        "labels": torch.full((inputs.numel(),), IGNORE_LABEL_ID, dtype=torch.int32, device=device),
+        "answer_mask": torch.zeros((inputs.numel(),), dtype=torch.bool, device=device),
+        "source_inputs": torch.cat(source_chunks, dim=0) if source_chunks else batch["inputs"].new_empty((0,)),
+        "position_ids": (
+            torch.cat(position_chunks, dim=0)
+            if position_chunks
+            else batch["position_ids"].new_empty((0,) + batch["position_ids"].shape[1:])
+        ),
+        "seq_lengths": seq_lengths_tensor,
+        "seq_offsets": F.pad(torch.cumsum(seq_lengths_tensor, dim=0), (1, 0)).to(torch.int32),
+        "puzzle_identifiers": (
+            torch.cat(puzzle_identifiers, dim=0)
+            if puzzle_identifiers
+            else batch["puzzle_identifiers"].new_empty((0,))
+        ),
+    }
+    return context_batch
+
+
+def _build_parallel_full_position_batch(
+    batch: Dict[str, torch.Tensor],
+    states: List[_ParallelSampleState],
+) -> Dict[str, torch.Tensor]:
+    input_chunks = []
+    position_chunks = []
+    answer_mask_chunks = []
+    seq_lengths = []
+    puzzle_identifiers = []
+
+    for state in states:
+        start, end, _label_start, _label_end = _sample_ranges(batch, state.sample_idx)
+        context_mask = ~state.sample_answer_mask
+        context_inputs = batch["inputs"][start:end][context_mask]
+        context_positions = batch["position_ids"][start:end][context_mask]
+        answer_placeholders = torch.zeros(
+            (int(state.target_positions.shape[0]),),
+            dtype=context_inputs.dtype,
+            device=context_inputs.device,
+        )
+        inputs = torch.cat([context_inputs, answer_placeholders], dim=0)
+        input_chunks.append(inputs)
+        position_chunks.append(torch.cat([context_positions, state.target_positions], dim=0))
+        answer_mask_chunks.append(
+            torch.cat(
+                [
+                    torch.zeros((context_inputs.numel(),), dtype=torch.bool, device=context_inputs.device),
+                    torch.ones((state.target_positions.shape[0],), dtype=torch.bool, device=context_inputs.device),
+                ],
+                dim=0,
+            )
+        )
+        seq_lengths.append(inputs.numel())
+        puzzle_identifiers.append(batch["puzzle_identifiers"][state.sample_idx : state.sample_idx + 1])
+
+    device = batch["inputs"].device
+    seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+    inputs = torch.cat(input_chunks, dim=0) if input_chunks else batch["inputs"].new_empty((0,))
+    return {
+        "inputs": inputs,
+        "labels": torch.full((inputs.numel(),), IGNORE_LABEL_ID, dtype=torch.int32, device=device),
+        "answer_mask": (
+            torch.cat(answer_mask_chunks, dim=0)
+            if answer_mask_chunks
+            else torch.empty((0,), dtype=torch.bool, device=device)
+        ),
+        "position_ids": (
+            torch.cat(position_chunks, dim=0)
+            if position_chunks
+            else batch["position_ids"].new_empty((0,) + batch["position_ids"].shape[1:])
+        ),
+        "seq_lengths": seq_lengths_tensor,
+        "seq_offsets": F.pad(torch.cumsum(seq_lengths_tensor, dim=0), (1, 0)).to(torch.int32),
+        "puzzle_identifiers": (
+            torch.cat(puzzle_identifiers, dim=0)
+            if puzzle_identifiers
+            else batch["puzzle_identifiers"].new_empty((0,))
+        ),
+    }
+
+
 def _precompute_context_cache(
     base_model: Any,
     context_batch: Dict[str, torch.Tensor],
@@ -419,10 +617,84 @@ def _precompute_context_cache(
     return context_states, caches
 
 
+def _new_parallel_cache_entries(
+    layer: Any,
+    context_states: torch.Tensor,
+    context_key: torch.Tensor,
+    context_value: torch.Tensor,
+    cu_context: torch.Tensor,
+    max_answer_lens: List[int],
+) -> List[_KVCacheEntry]:
+    attn = layer.self_attn
+    mlp = layer.mlp
+    entries = []
+    for sample_idx, max_answer_len in enumerate(max_answer_lens):
+        start = int(cu_context[sample_idx].item())
+        end = int(cu_context[sample_idx + 1].item())
+        sample_context_states = context_states[start:end]
+        sample_context_key = context_key[start:end]
+        sample_context_value = context_value[start:end]
+        entries.append(
+            _KVCacheEntry(
+                context_key=sample_context_key,
+                context_value=sample_context_value,
+                answer_key=sample_context_key.new_empty((max_answer_len, attn.num_key_value_heads, attn.head_dim)),
+                answer_value=sample_context_value.new_empty((max_answer_len, attn.num_key_value_heads, attn.head_dim)),
+                answer_ffn=sample_context_states.new_empty((max_answer_len, mlp.inter)),
+            )
+        )
+    return entries
+
+
+def _precompute_context_cache_parallel(
+    base_model: Any,
+    context_batch: Dict[str, torch.Tensor],
+    context_cos_sin: Tuple[torch.Tensor, ...],
+    max_answer_lens: List[int],
+) -> Tuple[torch.Tensor, List[List[_KVCacheEntry]], torch.Tensor]:
+    inner = base_model.inner
+    context_embeddings, _token_indices = inner._input_embeddings_packed(context_batch)
+    context_states = base_model._make_packed_initial_hidden(context_batch)
+    context_lengths = context_batch["seq_lengths"].to(torch.int32) + int(inner.prefix_seq_len)
+    cu_context = F.pad(torch.cumsum(context_lengths, dim=0), (1, 0)).to(torch.int32)
+    max_context_len = int(context_lengths.max().item()) if context_lengths.numel() else 0
+    caches: List[List[_KVCacheEntry]] = []
+
+    for _outer_step in range(int(base_model.config.loops)):
+        for _h_cycle in range(int(base_model.config.H_cycles)):
+            for _l_cycle in range(int(base_model.config.L_cycles)):
+                context_states = inner._inject_inputs(context_states, context_embeddings)
+                for layer in inner.layers:
+                    context_states = layer.forward_packed(
+                        cos_sin=context_cos_sin,
+                        hidden_states=context_states,
+                        cu_seqlens=cu_context,
+                        max_seqlen=max_context_len,
+                    )
+                    context_key, context_value = _project_key_value(layer, context_states, context_cos_sin)
+                    caches.append(
+                        _new_parallel_cache_entries(
+                            layer,
+                            context_states,
+                            context_key,
+                            context_value,
+                            cu_context,
+                            max_answer_lens,
+                        )
+                    )
+    return context_states, caches, cu_context
+
+
 def _answer_input_embedding(base_model: Any, token: torch.Tensor) -> torch.Tensor:
     inner = base_model.inner
     token = token.view(1).to(device=inner.embed_tokens.embedding_weight.device, dtype=torch.int32)
     return inner.embed_scale * inner.embed_tokens(token)
+
+
+def _answer_input_embeddings(base_model: Any, tokens: torch.Tensor) -> torch.Tensor:
+    inner = base_model.inner
+    tokens = tokens.to(device=inner.embed_tokens.embedding_weight.device, dtype=torch.int32)
+    return inner.embed_scale * inner.embed_tokens(tokens)
 
 
 def _decode_next_token_logits(
@@ -445,6 +717,132 @@ def _decode_next_token_logits(
                     state = _run_cached_answer_layer(layer, state, token_cos_sin, caches[cache_idx])
                     cache_idx += 1
     return base_model.inner.lm_head(state).squeeze(0)
+
+
+def _run_cached_mlp_batched(
+    layer: Any,
+    states: torch.Tensor,
+    entries: List[_KVCacheEntry],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mlp = layer.mlp
+    gate, up = mlp.gate_up_proj(states).chunk(2, dim=-1)
+    current_ffn = F.silu(gate) * up
+    if entries and entries[0].answer_len > 0:
+        previous_ffn = torch.cat([entry.previous_ffn() for entry in entries], dim=0)
+        conv_input = torch.stack([previous_ffn, current_ffn], dim=1)
+    else:
+        conv_input = current_ffn.unsqueeze(1)
+
+    conv_output = mlp.dwconv(conv_input.transpose(1, 2).to(mlp.dwconv.weight.dtype))
+    conv_output = conv_output[..., : conv_input.shape[1]]
+    conv_output = mlp.act(conv_output[..., -1:].transpose(1, 2)).squeeze(1).contiguous()
+    return mlp.down_proj(mlp.mlp_dropout(conv_output)), current_ffn
+
+
+def _run_cached_answer_layer_batched(
+    layer: Any,
+    states: torch.Tensor,
+    token_cos_sin: Tuple[torch.Tensor, ...],
+    entries: List[_KVCacheEntry],
+) -> torch.Tensor:
+    query, current_key, current_value = _project_query_key_value(layer, states, token_cos_sin)
+    key_chunks = []
+    value_chunks = []
+    key_lengths = []
+    for sample_idx, entry in enumerate(entries):
+        key, value = entry.key_value_with_current(
+            current_key[sample_idx : sample_idx + 1],
+            current_value[sample_idx : sample_idx + 1],
+        )
+        key_chunks.append(key)
+        value_chunks.append(value)
+        key_lengths.append(key.shape[0])
+
+    key = torch.cat(key_chunks, dim=0)
+    value = torch.cat(value_chunks, dim=0)
+    cu_q = torch.arange(query.shape[0] + 1, dtype=torch.int32, device=query.device)
+    key_lengths_tensor = torch.tensor(key_lengths, dtype=torch.int32, device=query.device)
+    cu_k = F.pad(torch.cumsum(key_lengths_tensor, dim=0), (1, 0)).to(torch.int32)
+    attn_output = flash_attn_varlen_func(
+        q=query.contiguous(),
+        k=key.contiguous(),
+        v=value.contiguous(),
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=1,
+        max_seqlen_k=int(key_lengths_tensor.max().item()) if key_lengths_tensor.numel() else 0,
+        causal=False,
+        window_size=(-1, -1),
+        dropout_p=0.0,
+    )
+    if isinstance(attn_output, tuple):
+        attn_output = attn_output[0]
+
+    states = rms_norm(
+        states + layer.self_attn.o_proj(attn_output.reshape(states.shape[0], layer.self_attn.output_size)),
+        variance_epsilon=layer.norm_eps,
+    )
+    mlp_output, current_ffn = _run_cached_mlp_batched(layer, states, entries)
+    states = rms_norm(states + mlp_output, variance_epsilon=layer.norm_eps)
+    for sample_idx, entry in enumerate(entries):
+        entry.append(
+            current_key[sample_idx : sample_idx + 1],
+            current_value[sample_idx : sample_idx + 1],
+            current_ffn[sample_idx : sample_idx + 1],
+        )
+    return states
+
+
+def _decode_next_token_logits_batched(
+    base_model: Any,
+    caches: List[List[_KVCacheEntry]],
+    cache_indices: List[int],
+    tokens: torch.Tensor,
+    token_cos_sin: Tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    state = base_model._empty_initial_hidden(
+        (tokens.shape[0], base_model.config.hidden_size),
+        tokens.device,
+    )
+    token_embeddings = _answer_input_embeddings(base_model, tokens)
+    cache_idx = 0
+    for _outer_step in range(int(base_model.config.loops)):
+        for _h_cycle in range(int(base_model.config.H_cycles)):
+            for _l_cycle in range(int(base_model.config.L_cycles)):
+                state = base_model.inner._inject_inputs(state, token_embeddings)
+                for layer in base_model.inner.layers:
+                    entries = [caches[cache_idx][sample_idx] for sample_idx in cache_indices]
+                    state = _run_cached_answer_layer_batched(layer, state, token_cos_sin, entries)
+                    cache_idx += 1
+    return base_model.inner.lm_head(state)
+
+
+def _parallel_context_and_answer_indices(
+    base_model: Any,
+    states: List[_ParallelSampleState],
+) -> Tuple[torch.Tensor, List[List[int]]]:
+    device = states[0].target_tokens.device if states else torch.device("cpu")
+    prefix_len = int(base_model.inner.prefix_seq_len)
+    context_indices = []
+    answer_indices_by_sample = []
+    offset = 0
+    for state in states:
+        context_len = int((~state.sample_answer_mask).sum().item())
+        answer_len = int(state.target_positions.shape[0])
+        context_total_len = prefix_len + context_len
+        if context_total_len > 0:
+            context_indices.append(
+                torch.arange(offset, offset + context_total_len, dtype=torch.long, device=device)
+            )
+        answer_start = offset + context_total_len
+        answer_indices_by_sample.append(
+            [answer_start + token_idx for token_idx in range(answer_len)]
+        )
+        offset += context_total_len + answer_len
+
+    if context_indices:
+        return torch.cat(context_indices, dim=0), answer_indices_by_sample
+    return torch.empty((0,), dtype=torch.long, device=device), answer_indices_by_sample
 
 
 def _generate_sample_cached(
@@ -518,6 +916,111 @@ def _generate_sample_cached(
     return final_batch, preds, metrics
 
 
+def _generate_batch_parallel_cached(
+    base_model: Any,
+    batch: Dict[str, torch.Tensor],
+    *,
+    start_token_id: int,
+) -> List[Tuple[Dict[str, Optional[torch.Tensor]], Dict[str, torch.Tensor], Dict[str, float]]]:
+    device = batch["inputs"].device
+    states: List[_ParallelSampleState] = []
+    sample_count = int(batch["puzzle_identifiers"].shape[0])
+    for sample_idx in range(sample_count):
+        target_tokens, target_positions, sample_answer_mask = _target_tokens_and_positions(batch, sample_idx)
+        states.append(
+            _ParallelSampleState(
+                sample_idx=sample_idx,
+                target_tokens=target_tokens,
+                target_positions=target_positions,
+                sample_answer_mask=sample_answer_mask,
+                generated_tokens=torch.empty((0,), dtype=torch.long, device=device),
+                q_halt_logits=torch.zeros((1,), dtype=torch.float32, device=device),
+            )
+        )
+
+    max_answer_len = max((int(state.target_tokens.numel()) for state in states), default=0)
+    if max_answer_len > 0:
+        context_batch = _build_parallel_context_batch(batch, states)
+        full_position_batch = _build_parallel_full_position_batch(batch, states)
+        token_indices = base_model.inner._packed_data_token_indices(full_position_batch)
+        cos_sin = base_model.inner._rotary_cos_sin_packed(full_position_batch, token_indices)
+        context_indices, answer_indices_by_sample = _parallel_context_and_answer_indices(base_model, states)
+        context_cos_sin = base_model.inner._slice_packed_cos_sin(cos_sin, context_indices)
+        context_states, caches, cu_context = _precompute_context_cache_parallel(
+            base_model,
+            context_batch,
+            context_cos_sin,
+            max_answer_lens=[int(state.target_tokens.numel()) for state in states],
+        )
+        q_logits = base_model.inner.q_head(context_states[cu_context[:-1].to(torch.long)]).to(torch.float32)
+        for state, q_logit in zip(states, q_logits[..., 0]):
+            if state.target_tokens.numel() > 0:
+                state.q_halt_logits = q_logit.view(1)
+                state.steps = float(base_model.config.loops)
+
+        for decode_step in range(max_answer_len):
+            active = [
+                (sample_idx, state)
+                for sample_idx, state in enumerate(states)
+                if state.generated_tokens.numel() < state.target_tokens.numel()
+            ]
+            if not active:
+                break
+
+            cache_indices = [sample_idx for sample_idx, _state in active]
+            input_tokens = torch.cat(
+                [
+                    torch.tensor([start_token_id], dtype=torch.long, device=device)
+                    if state.generated_tokens.numel() == 0
+                    else state.generated_tokens[-1:]
+                    for _sample_idx, state in active
+                ],
+                dim=0,
+            )
+            answer_indices = torch.tensor(
+                [answer_indices_by_sample[sample_idx][decode_step] for sample_idx, _state in active],
+                dtype=torch.long,
+                device=device,
+            )
+            token_cos_sin = base_model.inner._slice_packed_cos_sin(cos_sin, answer_indices)
+            logits = _decode_next_token_logits_batched(
+                base_model,
+                caches,
+                cache_indices,
+                input_tokens,
+                token_cos_sin,
+            )
+            next_tokens = torch.argmax(logits, dim=-1).to(torch.long)
+            for local_idx, (_sample_idx, state) in enumerate(active):
+                state.generated_tokens = torch.cat(
+                    [state.generated_tokens, next_tokens[local_idx : local_idx + 1]],
+                    dim=0,
+                )
+
+    results = []
+    for state in states:
+        final_batch, preds = _final_prediction_batch(
+            batch,
+            state.sample_idx,
+            state.generated_tokens,
+            state.target_positions,
+            state.sample_answer_mask,
+        )
+        preds["q_halt_logits"] = state.q_halt_logits
+        results.append(
+            (
+                final_batch,
+                preds,
+                _sample_metrics_from_generation(
+                    state.target_tokens,
+                    state.generated_tokens,
+                    steps=state.steps,
+                ),
+            )
+        )
+    return results
+
+
 def _generate_sample_slow(
     base_model: Any,
     batch: Dict[str, torch.Tensor],
@@ -574,6 +1077,188 @@ def _generate_sample_slow(
     return final_batch, preds, metrics
 
 
+def _parallel_generation_batch(
+    batch: Dict[str, torch.Tensor],
+    states: List[_ParallelSampleState],
+    *,
+    start_token_id: int,
+) -> Dict[str, torch.Tensor]:
+    input_chunks = []
+    source_chunks = []
+    position_chunks = []
+    answer_mask_chunks = []
+    label_chunks = []
+    seq_lengths = []
+    label_lengths = []
+    puzzle_identifiers = []
+    arc_identifiers = []
+    has_arc_identifiers = "arc_identifiers" in batch
+
+    for state in states:
+        start, end, _label_start, _label_end = _sample_ranges(batch, state.sample_idx)
+        sample_inputs = batch["inputs"][start:end]
+        sample_source_inputs = batch.get("source_inputs", batch["inputs"])[start:end]
+        sample_positions = batch["position_ids"][start:end]
+        context_mask = ~state.sample_answer_mask
+
+        answer_len = int(state.generated_tokens.numel()) + 1
+        answer_input = torch.empty((answer_len,), dtype=sample_inputs.dtype, device=sample_inputs.device)
+        answer_input[0] = int(start_token_id)
+        if state.generated_tokens.numel() > 0:
+            answer_input[1:] = state.generated_tokens.to(dtype=sample_inputs.dtype)
+
+        answer_positions = state.target_positions[:answer_len]
+        inputs = torch.cat([sample_inputs[context_mask], answer_input], dim=0)
+        source_inputs = torch.cat([sample_source_inputs[context_mask], answer_input], dim=0)
+        position_ids = torch.cat([sample_positions[context_mask], answer_positions], dim=0)
+        answer_mask = torch.cat(
+            [
+                torch.zeros((int(context_mask.sum().item()),), dtype=torch.bool, device=sample_inputs.device),
+                torch.ones((answer_len,), dtype=torch.bool, device=sample_inputs.device),
+            ],
+            dim=0,
+        )
+
+        input_chunks.append(inputs)
+        source_chunks.append(source_inputs)
+        position_chunks.append(position_ids)
+        answer_mask_chunks.append(answer_mask)
+        label_chunks.append(torch.full((answer_len,), IGNORE_LABEL_ID, dtype=torch.int32, device=sample_inputs.device))
+        seq_lengths.append(inputs.numel())
+        label_lengths.append(answer_len)
+        puzzle_identifiers.append(batch["puzzle_identifiers"][state.sample_idx : state.sample_idx + 1])
+        if has_arc_identifiers:
+            arc_identifiers.append(batch["arc_identifiers"][state.sample_idx : state.sample_idx + 1])
+
+    device = batch["inputs"].device
+    seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
+    label_lengths_tensor = torch.tensor(label_lengths, dtype=torch.int32, device=device)
+    gen_batch: Dict[str, torch.Tensor] = {
+        "inputs": torch.cat(input_chunks, dim=0),
+        "labels": torch.cat(label_chunks, dim=0),
+        "answer_mask": torch.cat(answer_mask_chunks, dim=0),
+        "source_inputs": torch.cat(source_chunks, dim=0),
+        "position_ids": torch.cat(position_chunks, dim=0),
+        "seq_lengths": seq_lengths_tensor,
+        "seq_offsets": F.pad(torch.cumsum(seq_lengths_tensor, dim=0), (1, 0)).to(torch.int32),
+        "label_seq_lengths": label_lengths_tensor,
+        "label_seq_offsets": F.pad(torch.cumsum(label_lengths_tensor, dim=0), (1, 0)).to(torch.int32),
+        "puzzle_identifiers": torch.cat(puzzle_identifiers, dim=0),
+    }
+    if has_arc_identifiers:
+        gen_batch["arc_identifiers"] = torch.cat(arc_identifiers, dim=0)
+    return gen_batch
+
+
+def _sample_metrics_from_generation(
+    target_tokens: torch.Tensor,
+    generated_tokens: torch.Tensor,
+    *,
+    steps: float,
+) -> Dict[str, float]:
+    valid = target_tokens != IGNORE_LABEL_ID
+    correct = (generated_tokens.to(target_tokens.dtype) == target_tokens) & valid
+    valid_count = int(valid.sum().item())
+    exact = bool(valid_count > 0 and correct.sum().item() == valid_count)
+    return {
+        "count": 1.0 if valid_count > 0 else 0.0,
+        "accuracy": float(correct.sum().item()) / max(valid_count, 1),
+        "exact_accuracy": 1.0 if exact else 0.0,
+        "steps": steps if valid_count > 0 else 0.0,
+    }
+
+
+def _generate_batch_parallel_slow(
+    base_model: Any,
+    batch: Dict[str, torch.Tensor],
+    *,
+    start_token_id: int,
+) -> List[Tuple[Dict[str, Optional[torch.Tensor]], Dict[str, torch.Tensor], Dict[str, float]]]:
+    device = batch["inputs"].device
+    states: List[_ParallelSampleState] = []
+    sample_count = int(batch["puzzle_identifiers"].shape[0])
+    for sample_idx in range(sample_count):
+        target_tokens, target_positions, sample_answer_mask = _target_tokens_and_positions(batch, sample_idx)
+        states.append(
+            _ParallelSampleState(
+                sample_idx=sample_idx,
+                target_tokens=target_tokens,
+                target_positions=target_positions,
+                sample_answer_mask=sample_answer_mask,
+                generated_tokens=torch.empty((0,), dtype=torch.long, device=device),
+                q_halt_logits=torch.zeros((1,), dtype=torch.float32, device=device),
+            )
+        )
+
+    max_answer_len = max((int(state.target_tokens.numel()) for state in states), default=0)
+    for _decode_step in range(max_answer_len):
+        active_states = [
+            state
+            for state in states
+            if state.generated_tokens.numel() < state.target_tokens.numel()
+        ]
+        if not active_states:
+            break
+
+        gen_batch = _parallel_generation_batch(
+            batch,
+            active_states,
+            start_token_id=start_token_id,
+        )
+        final_carry, final_outputs = _run_base_model_to_halt(base_model, gen_batch)
+        label_offsets = gen_batch["label_seq_offsets"].to(torch.long)
+        logits = final_outputs["logits"]
+        next_tokens = torch.argmax(logits[label_offsets[1:] - 1], dim=-1).to(torch.long)
+        q_halt_logits = final_outputs.get("q_halt_logits")
+        if q_halt_logits is None:
+            q_halt_logits = torch.zeros((len(active_states),), dtype=torch.float32, device=device)
+
+        steps = None if final_carry is None else final_carry.steps
+        for local_idx, state in enumerate(active_states):
+            state.generated_tokens = torch.cat(
+                [state.generated_tokens, next_tokens[local_idx : local_idx + 1]],
+                dim=0,
+            )
+            state.q_halt_logits = q_halt_logits[local_idx : local_idx + 1].to(torch.float32)
+            if steps is not None:
+                state.steps = float(steps[local_idx].item())
+
+    results = []
+    for state in states:
+        final_batch, preds = _final_prediction_batch(
+            batch,
+            state.sample_idx,
+            state.generated_tokens,
+            state.target_positions,
+            state.sample_answer_mask,
+        )
+        preds["q_halt_logits"] = state.q_halt_logits
+        results.append(
+            (
+                final_batch,
+                preds,
+                _sample_metrics_from_generation(
+                    state.target_tokens,
+                    state.generated_tokens,
+                    steps=state.steps,
+                ),
+            )
+        )
+    return results
+
+
+def _generate_batch_parallel(
+    base_model: Any,
+    batch: Dict[str, torch.Tensor],
+    *,
+    start_token_id: int,
+    use_kv_cache: bool,
+) -> List[Tuple[Dict[str, Optional[torch.Tensor]], Dict[str, torch.Tensor], Dict[str, float]]]:
+    if use_kv_cache and "position_ids" in batch:
+        return _generate_batch_parallel_cached(base_model, batch, start_token_id=start_token_id)
+    return _generate_batch_parallel_slow(base_model, batch, start_token_id=start_token_id)
+
+
 def _generate_sample(
     base_model: Any,
     batch: Dict[str, torch.Tensor],
@@ -604,11 +1289,17 @@ def evaluate_autoregressive(
     base_model.eval()
     start_token_id = int(getattr(config.arch, "causal_lm_start_token_id", 1))
     use_kv_cache = _supports_prefix_lm_kv_cache(base_model)
+    eval_batch_size = _resolve_autoregressive_eval_batch_size(config)
     if rank == 0:
         if use_kv_cache:
-            print("Autoregressive prefix-LM evaluation uses KV cache.")
+            print("Autoregressive prefix-LM evaluation uses batch-parallel KV-cache decode.")
         else:
-            print("Autoregressive prefix-LM KV cache is not supported for this model; using full-prefix decode.")
+            print(
+                "Autoregressive prefix-LM KV cache is not supported for this model; "
+                "using batch-parallel full-prefix decode."
+            )
+        if eval_batch_size is not None:
+            print(f"Autoregressive inference batch size = {eval_batch_size}.")
 
     for evaluator in evaluators:
         evaluator.begin_eval()
@@ -631,22 +1322,44 @@ def evaluate_autoregressive(
             sample_count = int(batch["puzzle_identifiers"].shape[0])
             set_id = set_ids[set_name]
 
-            for sample_idx in range(sample_count):
-                print(f"    Generating sample {sample_idx + 1}/{sample_count}...")
-                final_batch, preds, sample_metrics = _generate_sample(
-                    base_model,
-                    batch,
-                    sample_idx,
-                    start_token_id=start_token_id,
-                    use_kv_cache=use_kv_cache,
-                )
-                for evaluator in evaluators:
-                    evaluator.update_batch(final_batch, preds)
-                metric_values[set_id] += torch.tensor(
-                    [sample_metrics[key] for key in metric_keys],
-                    dtype=torch.float64,
-                    device=device,
-                )
+            for micro_start, micro_end, micro_batch in _iter_autoregressive_eval_batches(batch, eval_batch_size):
+                micro_sample_count = int(micro_batch["puzzle_identifiers"].shape[0])
+                if micro_sample_count == 0:
+                    sample_results = []
+                elif micro_sample_count > 1:
+                    if rank == 0:
+                        decode_mode = "KV-cache" if use_kv_cache and "position_ids" in micro_batch else "full-prefix"
+                        print(
+                            f"    Generating samples {micro_start + 1}-{micro_end}/{sample_count} "
+                            f"with batch-parallel {decode_mode} decode..."
+                        )
+                    sample_results = _generate_batch_parallel(
+                        base_model,
+                        micro_batch,
+                        start_token_id=start_token_id,
+                        use_kv_cache=use_kv_cache,
+                    )
+                else:
+                    if rank == 0:
+                        print(f"    Generating sample {micro_start + 1}/{sample_count}...")
+                    sample_results = [
+                        _generate_sample(
+                            base_model,
+                            micro_batch,
+                            0,
+                            start_token_id=start_token_id,
+                            use_kv_cache=use_kv_cache,
+                        )
+                    ]
+
+                for final_batch, preds, sample_metrics in sample_results:
+                    for evaluator in evaluators:
+                        evaluator.update_batch(final_batch, preds)
+                    metric_values[set_id] += torch.tensor(
+                        [sample_metrics[key] for key in metric_keys],
+                        dtype=torch.float64,
+                        device=device,
+                    )
 
     if world_size > 1:
         dist.reduce(metric_values, dst=0)
