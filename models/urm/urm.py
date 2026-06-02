@@ -290,18 +290,7 @@ class URM_Inner(nn.Module):
         self.padded_seq_len = self.config.seq_len
         self.use_hrm = self.config.H_layers > 0
         self.L_layers = self.config.L_layers if self.use_hrm and self.config.L_layers > 0 else self.config.num_layers
-
-        if self.config.patch_io_enabled:
-            if self.config.grid_height > 0 or self.config.grid_width > 0:
-                self.inner_grid_height = -(self.config.grid_height // -self.config.patch_height)
-                self.inner_grid_width = -(self.config.grid_width // -self.config.patch_width)
-                self.inner_seq_len = self.inner_grid_height * self.inner_grid_width
-                self.padded_grid_height = self.inner_grid_height * self.config.patch_height
-                self.padded_grid_width = self.inner_grid_width * self.config.patch_width
-            else:
-                self.inner_seq_len = -(self.config.seq_len // -self.patch_area)
-                self.padded_seq_len = self.inner_seq_len * self.patch_area
-
+            
         config_updates = dict(
             seq_len=self.inner_seq_len,
             grid_depth=self.inner_grid_depth,
@@ -315,20 +304,13 @@ class URM_Inner(nn.Module):
             else self.config.copy(update=config_updates)
         )
 
-        if self.config.patch_io_enabled:
-            patch_dim = self.patch_area * self.config.patch_pre_embedding_size
-            self.pre_embedding = CastedLinear(self.config.vocab_size, self.config.patch_pre_embedding_size, bias=False)
-            self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
-            self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
-            self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
-        else:
-            self.embed_tokens = CastedEmbedding(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                init_std=embed_init_std,
-                cast_to=self.forward_dtype,
-            )
-            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.embed_tokens = CastedEmbedding(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            init_std=embed_init_std,
+            cast_to=self.forward_dtype,
+        )
+        self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
         self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
@@ -336,11 +318,7 @@ class URM_Inner(nn.Module):
         if self.config.num_memory_tokens > 0:
             self.memory_tokens = nn.Parameter(
                 trunc_normal_init_(
-                    torch.empty(
-                        self.config.num_memory_tokens,
-                        self.config.hidden_size,
-                        dtype=self.forward_dtype,
-                    ),
+                    torch.empty(self.config.num_memory_tokens,self.config.hidden_size,dtype=self.forward_dtype,),
                     std=embed_init_std,
                 )
             )
@@ -366,19 +344,13 @@ class URM_Inner(nn.Module):
                 for layer_idx in range(self.L_layers)
             ]
         )
-        self.H_layer_attention_window_sizes = []
-        self.H_layers = nn.ModuleList()
+        
         if self.use_hrm:
-            self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
-                self.inner_config.attention_window_size,
-                self.config.H_layers,
-            )
-            self.H_layers = nn.ModuleList(
-                [
-                    URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
-                    for layer_idx in range(self.config.H_layers)
-                ]
-            )
+            self.init_hrm()
+            
+        if self.config.patch_io_enabled:
+            self.init_patch_io()
+            
         self.prelude_layers = nn.ModuleList(
             [
                 URMBlock(self.inner_config, attention_window_size=-1)
@@ -402,11 +374,6 @@ class URM_Inner(nn.Module):
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
-        if self.use_hrm:
-            self.low_init_hidden = nn.Buffer(
-                trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
-                persistent=True,
-            )
 
         with torch.no_grad():
             self.q_head.weight.zero_()
@@ -454,11 +421,43 @@ class URM_Inner(nn.Module):
                 base=self.inner_config.rope_theta,
             )
 
-    def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
-        if input.ndim == 3:
-            return input.to(self.forward_dtype)
-        return F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
+    def init_hrm(self):
+        self.H_layer_attention_window_sizes = []
+        self.H_layers = nn.ModuleList()
+        self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
+                self.inner_config.attention_window_size,
+                self.config.H_layers,
+            )
+        self.H_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
+                for layer_idx in range(self.config.H_layers)
+            ]
+        )
+        self.low_init_hidden = nn.Buffer(
+            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
+            persistent=True,
+        )
 
+    def init_patch_io(self):
+        if self.config.grid_height > 0 or self.config.grid_width > 0:
+            self.inner_grid_height = -(self.config.grid_height // -self.config.patch_height)
+            self.inner_grid_width = -(self.config.grid_width // -self.config.patch_width)
+            self.inner_seq_len = self.inner_grid_height * self.inner_grid_width
+            self.padded_grid_height = self.inner_grid_height * self.config.patch_height
+            self.padded_grid_width = self.inner_grid_width * self.config.patch_width
+        else:
+            self.inner_seq_len = -(self.config.seq_len // -self.patch_area)
+            self.padded_seq_len = self.inner_seq_len * self.patch_area
+            
+        patch_dim = self.patch_area * self.config.patch_pre_embedding_size
+        self.pre_embedding = CastedLinear(self.config.vocab_size, self.config.patch_pre_embedding_size, bias=False)
+        self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
+        self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
+        self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
+
+
+    ### convert (B, T, C) to (B, T // patch_size, C)
     def _patchify(self, pixels: torch.Tensor) -> torch.Tensor:
         batch_size, _, channels = pixels.shape
 
@@ -487,6 +486,7 @@ class URM_Inner(nn.Module):
             pixels = F.pad(pixels, (0, 0, 0, self.padded_seq_len - self.config.seq_len))
         return pixels.reshape(batch_size, self.inner_seq_len, self.patch_area * channels)
 
+    ### unconvert (B, T, C) to (B, T // patch_size, C)
     def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         batch_size = patches.shape[0]
         channels = self.config.patch_pre_embedding_size
@@ -513,12 +513,6 @@ class URM_Inner(nn.Module):
             )
 
         return patches.reshape(batch_size, self.padded_seq_len, channels)[:, : self.config.seq_len]
-
-    def _output_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        output = self.lm_head(hidden_states)[:, self.prefix_seq_len:]
-        if self.config.patch_io_enabled:
-            output = self.post_head(self._unpatchify(output))
-        return output
 
     def _memory_embeddings(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
         if self.config.num_memory_tokens == 0:
@@ -647,7 +641,11 @@ class URM_Inner(nn.Module):
         batch: Optional[Dict[str, torch.Tensor]] = None,
     ):
         if self.config.patch_io_enabled:
-            pixels = self.pre_embedding(self._one_hot_inputs(input))
+            if input.ndim == 3:
+                _input = input.to(self.forward_dtype)
+            else:
+                _input = F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
+            pixels = self.pre_embedding(_input)
             embedding = self.embed_tokens(self._patchify(pixels))
         else:
             embedding = self.embed_tokens(input.to(torch.int32))
@@ -1290,7 +1288,11 @@ class URM_Inner(nn.Module):
             layers=self.coda_layers,
             **seq_info,
         )
-        output = self._output_logits(head_hidden_states)
+        output = self.lm_head(head_hidden_states)[:, self.prefix_seq_len:]
+        
+        if self.config.patch_io_enabled:
+            output = self.post_head(self._unpatchify(output))
+            
         q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
