@@ -972,6 +972,7 @@ class URM_Inner(nn.Module):
             return None
         return batch["seq_lengths"].to(torch.int32) + self.prefix_seq_len
 
+#region loops
     def _inject_inputs(self, hidden_states: torch.Tensor, input_embeddings: torch.Tensor) -> torch.Tensor:
         if not self.config.input_injection_enabled:
             return hidden_states
@@ -998,7 +999,8 @@ class URM_Inner(nn.Module):
         cache: Optional[List[URMLayerInferenceCache]] = None,
     ) -> torch.Tensor:
         for i, layer in enumerate(layers):
-            hidden_states = layer(
+            forward_func = layer.forward_packed if self.config.variable_seq_lengths else layer.forward
+            hidden_states = forward_func(
                 cos_sin=cos_sin,
                 hidden_states=hidden_states,
                 sequence_lengths=sequence_lengths,
@@ -1021,8 +1023,9 @@ class URM_Inner(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
         for layer in layers:
+            forward_func = layer.forward_packed if self.config.variable_seq_lengths else layer.forward
             pre_hidden_states = hidden_states
-            hidden_states = layer(
+            hidden_states = forward_func(
                 cos_sin=cos_sin,
                 hidden_states=pre_hidden_states,
                 sequence_lengths=sequence_lengths,
@@ -1036,56 +1039,52 @@ class URM_Inner(nn.Module):
                 unrolled_idx += 1
         return hidden_states, diff_L, unrolled_idx
 
-    def _run_recurrent_layers_packed(
+    def _loop_layers(
         self,
         hidden_states: torch.Tensor,
+        low_hidden_states: torch.Tensor,
         input_embeddings: torch.Tensor,
-        layers: nn.ModuleList,
-        cos_sin: CosSin,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        diff_L: Optional[torch.Tensor] = None,
-        grad_hook_factory=None,
-        unrolled_idx: int = 0,
-        force_injection: bool = False,
-        add_noise: bool = True,
+        H_layers: Optional[nn.ModuleList],
+        L_layers: nn.ModuleList,
+        H_cycles: int,
+        L_cycles: int,
+        seq_info: Dict[str, Optional[torch.Tensor]],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
-        hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
-        for i, layer in enumerate(layers):
-            pre_hidden_states = hidden_states
-            hidden_states, cache = layer.forward_packed(
-                cos_sin=cos_sin,
-                hidden_states=pre_hidden_states,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
+        no_grad_H_cycles = H_cycles - self.config.grad_H_cycles
+        with torch.no_grad():
+            for _ in range(no_grad_H_cycles):
+                for _ in range(L_cycles):
+                    low_hidden_states, _, _ = self._run_recurrent_layers(
+                        hidden_states=low_hidden_states,
+                        input_embeddings=hidden_states + input_embeddings,
+                        layers=L_layers,
+                        **seq_info,
+                )
+                if H_layers is not None:
+                    hidden_states, _, _ = self._run_recurrent_layers(
+                        hidden_states=hidden_states,
+                        input_embeddings=low_hidden_states,
+                        layers=H_layers,
+                        **seq_info,
             )
-            if diff_L is not None:
-                diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
-            if add_noise:
-                hidden_states = self._add_noise(hidden_states)
-            if grad_hook_factory is not None:
-                hidden_states.register_hook(grad_hook_factory(unrolled_idx))
-                unrolled_idx += 1
-        return hidden_states, diff_L, unrolled_idx
-
-    def _run_token_layers_packed(
-        self,
-        hidden_states: torch.Tensor,
-        layers: nn.ModuleList,
-        cos_sin: CosSin,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        for i, layer in enumerate(layers):
-            hidden_states, cache = layer.forward_packed(
-                cos_sin=cos_sin,
-                hidden_states=hidden_states,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
+            for _ in range(no_grad_H_cycles):
+                for _ in range(L_cycles):
+                    low_hidden_states, _, _ = self._run_recurrent_layers(
+                        hidden_states=low_hidden_states,
+                        input_embeddings=hidden_states + input_embeddings,
+                        layers=L_layers,
+                        **seq_info,
+                )
+                if H_layers is not None:
+                    hidden_states, _, _ = self._run_recurrent_layers(
+                        hidden_states=hidden_states,
+                        input_embeddings=low_hidden_states,
+                        layers=H_layers,
+                        **seq_info,
             )
-        return hidden_states
-
-    @torch.compiler.disable
+            return low_hidden_states if H_layers is not None else hidden_states
+#endregion
+  
     def _prefix_lm_key_value_indices(
         self,
         context_indices: torch.Tensor,
@@ -1174,6 +1173,26 @@ class URM_Inner(nn.Module):
             hidden_states = self._add_noise(next_states) if add_noise else next_states
 
         return hidden_states
+    
+    def get_grad_hook_factory(self):
+        if not self.config.grad_logging_enabled or not global_logger.is_log or not self.training:
+            return None
+
+        grad_norms = {}
+        layers_per_H_cycle = self.config.L_cycles * len(self.layers)
+        if self.use_hrm:
+            layers_per_H_cycle += len(self.H_layers)
+        total_unrolled = self.config.grad_H_cycles * layers_per_H_cycle
+
+        def make_grad_hook(idx):
+            def hook(grad):
+                grad_norms[idx] = grad.detach().norm().item()
+                if len(grad_norms) == total_unrolled:
+                    norm_tensor = torch.tensor([grad_norms[i] for i in range(total_unrolled)])
+                    global_logger.store("grad_norm_per_layer", norm_tensor)
+            return hook
+
+        return make_grad_hook
 
 #region Some forward 
     def forward(
@@ -1181,276 +1200,83 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if self.config.variable_seq_lengths:
-            return self.forward_packed(carry, batch)
-
-        seq_info = dict(
-            cos_sin=self._rotary_cos_sin(batch),
-            sequence_lengths=self._sequence_lengths(batch),
-        )
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
-        input_embeddings = self._run_token_layers(
-            hidden_states=input_embeddings,
-            layers=self.prelude_layers,
-            **seq_info,
-        )
-
-        # Gradient norm logging for unrolled layers
-        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
-        grad_hook_factory = None
-        if _log_grads:
-            _grad_norms = {}
-            _layers_per_H_cycle = self.config.L_cycles * len(self.layers)
-            if self.use_hrm:
-                _layers_per_H_cycle += len(self.H_layers)
-            _total_unrolled = self.config.grad_H_cycles * _layers_per_H_cycle
-            def _make_grad_hook(idx):
-                def hook(grad):
-                    _grad_norms[idx] = grad.detach().norm().item()
-                    if len(_grad_norms) == _total_unrolled:
-                        norm_tensor = torch.tensor([_grad_norms[i] for i in range(_total_unrolled)])
-                        global_logger.store("grad_norm_per_layer", norm_tensor)
-                return hook
-            grad_hook_factory = _make_grad_hook
-
-        hidden_states = carry.current_hidden
-        low_hidden_states = carry.current_low_hidden
-        no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
-        _unrolled_idx = 0
-        diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
-
-        if self.use_hrm:
-            if low_hidden_states is None:
-                raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                        low_hidden_states, _, _ = self._run_recurrent_layers(
-                            hidden_states=low_hidden_states,
-                            input_embeddings=L_injection,
-                            layers=self.layers,
-                            force_injection=True,
-                            **seq_info,
-                        )
-                    hidden_states, _, _ = self._run_recurrent_layers(
-                        hidden_states=hidden_states,
-                        input_embeddings=low_hidden_states,
-                        layers=self.H_layers,
-                        force_injection=True,
-                        **seq_info,
-                    )
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                    low_hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers(
-                        hidden_states=low_hidden_states,
-                        input_embeddings=L_injection,
-                        layers=self.layers,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        force_injection=True,
-                        **seq_info,
-                    )
-                hidden_states, _, _unrolled_idx = self._run_recurrent_layers(
-                    hidden_states=hidden_states,
-                    input_embeddings=low_hidden_states,
-                    layers=self.H_layers,
-                    grad_hook_factory=grad_hook_factory,
-                    unrolled_idx=_unrolled_idx,
-                    force_injection=True,
-                    **seq_info,
-                )
-        else:
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        hidden_states, _, _ = self._run_recurrent_layers(
-                            hidden_states=hidden_states,
-                            input_embeddings=input_embeddings,
-                            layers=self.layers,
-                            add_noise=False,
-                            **seq_info,
-                        )
-                        hidden_states = self._add_noise(hidden_states)
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers(
-                        hidden_states=hidden_states,
-                        input_embeddings=input_embeddings,
-                        layers=self.layers,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        **seq_info,
-                    )
-
-        new_carry = replace(
-            carry,
-            current_hidden=hidden_states.detach(),
-            current_low_hidden=low_hidden_states.detach() if low_hidden_states is not None else None,
-        )
-        head_hidden_states = self._run_token_layers(
-            hidden_states=hidden_states,
-            layers=self.coda_layers,
-            **seq_info,
-        )
-        output = self.lm_head(head_hidden_states)[:, self.prefix_seq_len:]
-        
-        if self.config.patch_io_enabled:
-            output = self.post_head(self._unpatchify(output))
-            
-        q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
-
-    def forward_packed(
-        self,
-        carry: URMCarry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         if self.config.forward_mode == "prefix_lm":
             return self.forward_prefix_lm_packed(carry, batch)
         if self.config.forward_mode == "answer_only":
             return self.forward_answer_only_packed(carry, batch)
-
-        input_embeddings, token_indices = self._input_embeddings_packed(batch)
-        cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
-        cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
-        input_embeddings = self._run_token_layers_packed(
-            hidden_states=input_embeddings,
-            layers=self.prelude_layers,
+        
+        # create input
+        is_packed = self.config.variable_seq_lengths
+        if is_packed:
+            input_embeddings, token_indices = self._input_embeddings_packed(batch)
+            cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
+            cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+        else:
+            input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
+            token_indices, cu_seqlens = None, None
+            cos_sin = self._rotary_cos_sin(batch)
+        grad_hook_factory = self.get_grad_hook_factory()
+        seq_info = dict(
             cos_sin=cos_sin,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            grad_hook_factory=grad_hook_factory,
         )
 
+        # prelude layers
+        input_embeddings = self._run_token_layers(hidden_states=input_embeddings, layers=self.prelude_layers, **seq_info)
+
         hidden_states = carry.current_hidden
-        if hidden_states.shape[0] != input_embeddings.shape[0]:
-            raise RuntimeError(
-                f"Packed carry/input length mismatch: carry={hidden_states.shape[0]} input={input_embeddings.shape[0]}"
-            )
-
-        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
-        grad_hook_factory = None
-        if _log_grads:
-            _grad_norms = {}
-            _layers_per_H_cycle = self.config.L_cycles * len(self.layers)
-            if self.use_hrm:
-                _layers_per_H_cycle += len(self.H_layers)
-            _total_unrolled = self.config.grad_H_cycles * _layers_per_H_cycle
-            def _make_grad_hook(idx):
-                def hook(grad):
-                    _grad_norms[idx] = grad.detach().norm().item()
-                    if len(_grad_norms) == _total_unrolled:
-                        norm_tensor = torch.tensor([_grad_norms[i] for i in range(_total_unrolled)])
-                        global_logger.store("grad_norm_per_layer", norm_tensor)
-                return hook
-            grad_hook_factory = _make_grad_hook
-
         low_hidden_states = carry.current_low_hidden
         no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
         if self.use_hrm:
-            if low_hidden_states is None:
-                raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
-            if low_hidden_states.shape[0] != input_embeddings.shape[0]:
-                raise RuntimeError(
-                    f"Packed carry/input length mismatch: low_carry={low_hidden_states.shape[0]} input={input_embeddings.shape[0]}"
-                )
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                        low_hidden_states, _, _ = self._run_recurrent_layers_packed(
-                            hidden_states=low_hidden_states,
-                            input_embeddings=L_injection,
-                            layers=self.layers,
-                            cos_sin=cos_sin,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
-                            force_injection=True,
-                        )
-                    hidden_states, _, _ = self._run_recurrent_layers_packed(
-                        hidden_states=hidden_states,
-                        input_embeddings=low_hidden_states,
-                        layers=self.H_layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        force_injection=True,
-                    )
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                    low_hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers_packed(
-                        hidden_states=low_hidden_states,
-                        input_embeddings=L_injection,
-                        layers=self.layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        force_injection=True,
-                    )
-                hidden_states, _, _unrolled_idx = self._run_recurrent_layers_packed(
-                    hidden_states=hidden_states,
-                    input_embeddings=low_hidden_states,
-                    layers=self.H_layers,
-                    cos_sin=cos_sin,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    grad_hook_factory=grad_hook_factory,
-                    unrolled_idx=_unrolled_idx,
-                    force_injection=True,
-                )
+            self._loop_layers(
+                hidden_states=hidden_states,
+                low_hidden_states=low_hidden_states,
+                input_embeddings=input_embeddings,
+                H_layers=self.H_layers,
+                L_layers=self.layers,
+                H_cycles=self.config.H_cycles,
+                L_cycles=self.config.L_cycles,
+                seq_info=seq_info,
+            )
         else:
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        hidden_states, _, _ = self._run_recurrent_layers_packed(
-                            hidden_states=hidden_states,
-                            input_embeddings=input_embeddings,
-                            layers=self.layers,
-                            cos_sin=cos_sin,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
-                            add_noise=False,
-                        )
-                        hidden_states = self._add_noise(hidden_states)
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers_packed(
-                        hidden_states=hidden_states,
-                        input_embeddings=input_embeddings,
-                        layers=self.layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                    )
+            self._loop_layers(
+                hidden_states=None,
+                low_hidden_states=hidden_states,
+                input_embeddings=input_embeddings,
+                H_layers=None,
+                L_layers=self.layers,
+                H_cycles=self.config.H_cycles,
+                L_cycles=self.config.L_cycles,
+                seq_info=seq_info,
+            )
 
+        # detach and store carry
         new_carry = replace(
             carry,
             current_hidden=hidden_states.detach(),
             current_low_hidden=low_hidden_states.detach() if low_hidden_states is not None else None,
         )
-        head_hidden_states = self._run_token_layers_packed(
-            hidden_states=hidden_states,
-            layers=self.coda_layers,
-            cos_sin=cos_sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        output = self.lm_head(head_hidden_states[token_indices])
-        q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        
+        # coda layers
+        head_hidden_states = run_token_layers(hidden_states=hidden_states,layers=self.coda_layers,**seq_info)
+
+        if is_packed:
+            output = self.lm_head(head_hidden_states[token_indices])
+            q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        else:
+            output = self.lm_head(head_hidden_states)[:, self.prefix_seq_len:]
+            q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
+
+        if self.config.patch_io_enabled:
+            output = self.post_head(self._unpatchify(output))
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
+
+    forward_packed = forward
 
     def forward_prefix_lm_packed(
         self,
