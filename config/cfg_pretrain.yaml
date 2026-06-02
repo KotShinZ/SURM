@@ -23,7 +23,7 @@ eval_interval: 10
 eval_first: false
 # Optional cap for autoregressive decoding during eval. Set lower than
 # global_batch_size to reduce inference memory use.
-autoregressive_eval_batch_size: 64
+# autoregressive_eval_batch_size: None
 checkpoint_every_eval: True
 
 lr: 1e-4

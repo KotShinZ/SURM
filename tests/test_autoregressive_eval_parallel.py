@@ -34,8 +34,6 @@ from autoregressive_eval import (  # noqa: E402
     _generate_casual_no_size_batch,
     _generate_batch_parallel_slow,
     _generate_sample_slow,
-    _iter_autoregressive_eval_batches,
-    _resolve_autoregressive_eval_batch_size,
 )
 
 
@@ -241,27 +239,6 @@ class AutoregressiveEvalParallelTests(unittest.TestCase):
             for key in ("preds", "q_halt_logits"):
                 self.assertTrue(torch.equal(single_preds[key], parallel_preds[key]), key)
 
-    def test_parallel_decode_can_be_microbatched(self) -> None:
-        batch = _build_packed_batch()
-        full_model = _ToyAutoregressiveModel()
-        full_results = _generate_batch_parallel_slow(full_model, batch, start_token_id=1)
-
-        micro_model = _ToyAutoregressiveModel()
-        micro_results = []
-        spans = []
-        for sample_start, sample_end, micro_batch in _iter_autoregressive_eval_batches(batch, 2):
-            spans.append((sample_start, sample_end))
-            micro_results.extend(_generate_batch_parallel_slow(micro_model, micro_batch, start_token_id=1))
-
-        self.assertEqual(spans, [(0, 2), (2, 3)])
-        self.assertEqual(len(micro_results), len(full_results))
-        for (_full_batch, full_preds, full_metrics), (_micro_batch, micro_preds, micro_metrics) in zip(
-            full_results,
-            micro_results,
-        ):
-            self.assertEqual(full_metrics, micro_metrics)
-            self.assertTrue(torch.equal(full_preds["preds"], micro_preds["preds"]))
-
     def test_casual_parallel_full_prefix_decode_matches_single_sample_decode(self) -> None:
         batch = _build_packed_batch()
 
@@ -314,30 +291,6 @@ class AutoregressiveEvalParallelTests(unittest.TestCase):
         for final_batch, _preds, _metrics in results:
             self.assertIsNone(final_batch["labels"])
             self.assertIn("position_ids", final_batch)
-
-    def test_autoregressive_eval_batch_size_config_resolution(self) -> None:
-        self.assertIsNone(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(arch=SimpleNamespace())
-            )
-        )
-        self.assertEqual(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(autoregressive_eval_batch_size=2, arch=SimpleNamespace())
-            ),
-            2,
-        )
-        self.assertEqual(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(arch=SimpleNamespace(autoregressive_eval_batch_size=3))
-            ),
-            3,
-        )
-        with self.assertRaises(ValueError):
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(autoregressive_eval_batch_size=0, arch=SimpleNamespace())
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

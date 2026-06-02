@@ -27,21 +27,6 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
     return {key: value.to(device) for key, value in batch.items()}
 
 
-def _resolve_autoregressive_eval_batch_size(config: Any) -> Optional[int]:
-    value = getattr(config, "autoregressive_eval_batch_size", None)
-    if value is None:
-        value = getattr(config, "autoregressive_eval_micro_batch_size", None)
-    if value is None:
-        value = getattr(getattr(config, "arch", None), "autoregressive_eval_batch_size", None)
-    if value is None:
-        return None
-
-    batch_size = int(value)
-    if batch_size <= 0:
-        raise ValueError("autoregressive_eval_batch_size must be positive when provided.")
-    return batch_size
-
-
 def _resolve_casual_max_new_tokens(config: Any) -> int:
     value = getattr(config, "autoregressive_eval_max_new_tokens", None)
     if value is None:
@@ -53,73 +38,6 @@ def _resolve_casual_max_new_tokens(config: Any) -> int:
     if max_new_tokens <= 0:
         raise ValueError("autoregressive_eval_max_new_tokens must be positive when provided.")
     return max_new_tokens
-
-
-def _slice_packed_batch_samples(
-    batch: Dict[str, torch.Tensor],
-    sample_start: int,
-    sample_end: int,
-) -> Dict[str, torch.Tensor]:
-    sample_count = int(batch["puzzle_identifiers"].shape[0])
-    if sample_start <= 0 and sample_end >= sample_count:
-        return batch
-
-    seq_offsets = batch["seq_offsets"].to(torch.long)
-    label_offsets = batch.get("label_seq_offsets", batch["seq_offsets"]).to(torch.long)
-    token_start = int(seq_offsets[sample_start].item())
-    token_end = int(seq_offsets[sample_end].item())
-    label_start = int(label_offsets[sample_start].item())
-    label_end = int(label_offsets[sample_end].item())
-    token_count = int(seq_offsets[-1].item())
-    label_count = int(label_offsets[-1].item())
-    selected_count = sample_end - sample_start
-
-    sliced: Dict[str, torch.Tensor] = {}
-    for key, value in batch.items():
-        if key == "seq_offsets":
-            lengths = batch["seq_lengths"][sample_start:sample_end]
-            offsets = torch.zeros((selected_count + 1,), dtype=value.dtype, device=value.device)
-            offsets[1:] = torch.cumsum(lengths.to(value.dtype), dim=0)
-            sliced[key] = offsets
-        elif key == "label_seq_offsets":
-            lengths = batch["label_seq_lengths"][sample_start:sample_end]
-            offsets = torch.zeros((selected_count + 1,), dtype=value.dtype, device=value.device)
-            offsets[1:] = torch.cumsum(lengths.to(value.dtype), dim=0)
-            sliced[key] = offsets
-        elif key in {"seq_lengths", "label_seq_lengths", "seq_shapes", "label_seq_shapes"}:
-            sliced[key] = value[sample_start:sample_end]
-        elif key == "labels" and value.ndim == 1 and value.numel() != token_count:
-            sliced[key] = value[label_start:label_end]
-        elif value.ndim > 0 and value.shape[0] == sample_count:
-            sliced[key] = value[sample_start:sample_end]
-        elif value.ndim > 0 and value.shape[0] == token_count:
-            sliced[key] = value[token_start:token_end]
-        elif value.ndim > 0 and value.shape[0] == label_count:
-            sliced[key] = value[label_start:label_end]
-        else:
-            sliced[key] = value
-    return sliced
-
-
-def _iter_autoregressive_eval_batches(
-    batch: Dict[str, torch.Tensor],
-    eval_batch_size: Optional[int],
-) -> List[Tuple[int, int, Dict[str, torch.Tensor]]]:
-    sample_count = int(batch["puzzle_identifiers"].shape[0])
-    if eval_batch_size is None or sample_count <= eval_batch_size:
-        return [(0, sample_count, batch)]
-
-    micro_batches = []
-    for sample_start in range(0, sample_count, eval_batch_size):
-        sample_end = min(sample_start + eval_batch_size, sample_count)
-        micro_batches.append(
-            (
-                sample_start,
-                sample_end,
-                _slice_packed_batch_samples(batch, sample_start, sample_end),
-            )
-        )
-    return micro_batches
 
 
 def _sample_ranges(batch: Dict[str, torch.Tensor], sample_idx: int) -> Tuple[int, int, int, int]:
@@ -1723,7 +1641,6 @@ def evaluate_autoregressive(
     max_new_tokens = _resolve_casual_max_new_tokens(config)
     use_kv_cache = _supports_autoregressive_kv_cache(base_model)
     forward_mode = getattr(getattr(base_model, "config", None), "forward_mode", "autoregressive")
-    eval_batch_size = _resolve_autoregressive_eval_batch_size(config)
     if rank == 0:
         if casual_lm:
             print(
@@ -1737,8 +1654,6 @@ def evaluate_autoregressive(
                 f"Autoregressive {forward_mode} KV cache is not supported for this model; "
                 "using batch-parallel full-prefix decode."
             )
-        if eval_batch_size is not None:
-            print(f"Autoregressive inference batch size = {eval_batch_size}.")
 
     for evaluator in evaluators:
         evaluator.begin_eval()
@@ -1759,65 +1674,64 @@ def evaluate_autoregressive(
 
             batch = _to_device(batch, device)
             sample_count = int(batch["puzzle_identifiers"].shape[0])
+            sample_label = "sample" if sample_count == 1 else "samples"
             set_id = set_ids[set_name]
 
-            for micro_start, micro_end, micro_batch in _iter_autoregressive_eval_batches(batch, eval_batch_size):
-                micro_sample_count = int(micro_batch["puzzle_identifiers"].shape[0])
-                casual_no_size = (
-                    casual_lm
-                    and "labels" not in micro_batch
-                    and "answer_mask" not in micro_batch
-                    and "position_ids" not in micro_batch
-                )
-                if micro_sample_count == 0:
-                    sample_results = []
-                elif casual_no_size:
-                    if rank == 0:
-                        print(
-                            f"    Generating samples {micro_start + 1}-{micro_end}/{sample_count} "
-                            "with END-token casual decode..."
-                        )
-                    sample_results = _generate_casual_no_size_batch(
-                        base_model,
-                        micro_batch,
-                        start_token_id=start_token_id,
-                        end_token_id=end_token_id,
-                        max_new_tokens=max_new_tokens,
+            casual_no_size = (
+                casual_lm
+                and "labels" not in batch
+                and "answer_mask" not in batch
+                and "position_ids" not in batch
+            )
+            if sample_count == 0:
+                sample_results = []
+            elif casual_no_size:
+                if rank == 0:
+                    print(
+                        f"    Generating {sample_count} {sample_label} "
+                        "with END-token casual decode..."
                     )
-                elif micro_sample_count > 1:
-                    if rank == 0:
-                        decode_mode = "KV-cache" if use_kv_cache and "position_ids" in micro_batch else "full-prefix"
-                        print(
-                            f"    Generating samples {micro_start + 1}-{micro_end}/{sample_count} "
-                            f"with batch-parallel {decode_mode} decode..."
-                        )
-                    sample_results = _generate_batch_parallel(
+                sample_results = _generate_casual_no_size_batch(
+                    base_model,
+                    batch,
+                    start_token_id=start_token_id,
+                    end_token_id=end_token_id,
+                    max_new_tokens=max_new_tokens,
+                )
+            elif sample_count > 1:
+                if rank == 0:
+                    decode_mode = "KV-cache" if use_kv_cache and "position_ids" in batch else "full-prefix"
+                    print(
+                        f"    Generating {sample_count} {sample_label} "
+                        f"with batch-parallel {decode_mode} decode..."
+                    )
+                sample_results = _generate_batch_parallel(
+                    base_model,
+                    batch,
+                    start_token_id=start_token_id,
+                    use_kv_cache=use_kv_cache,
+                )
+            else:
+                if rank == 0:
+                    print("    Generating sample 1/1...")
+                sample_results = [
+                    _generate_sample(
                         base_model,
-                        micro_batch,
+                        batch,
+                        0,
                         start_token_id=start_token_id,
                         use_kv_cache=use_kv_cache,
                     )
-                else:
-                    if rank == 0:
-                        print(f"    Generating sample {micro_start + 1}/{sample_count}...")
-                    sample_results = [
-                        _generate_sample(
-                            base_model,
-                            micro_batch,
-                            0,
-                            start_token_id=start_token_id,
-                            use_kv_cache=use_kv_cache,
-                        )
-                    ]
+                ]
 
-                for final_batch, preds, sample_metrics in sample_results:
-                    for evaluator in evaluators:
-                        evaluator.update_batch(final_batch, preds)
-                    metric_values[set_id] += torch.tensor(
-                        [sample_metrics[key] for key in metric_keys],
-                        dtype=torch.float64,
-                        device=device,
-                    )
+            for final_batch, preds, sample_metrics in sample_results:
+                for evaluator in evaluators:
+                    evaluator.update_batch(final_batch, preds)
+                metric_values[set_id] += torch.tensor(
+                    [sample_metrics[key] for key in metric_keys],
+                    dtype=torch.float64,
+                    device=device,
+                )
 
     if world_size > 1:
         dist.reduce(metric_values, dst=0)
