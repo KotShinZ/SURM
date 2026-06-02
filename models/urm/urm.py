@@ -1297,8 +1297,8 @@ class URM_Inner(nn.Module):
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
         hidden_states, low_hidden_states, diff_L, _unrolled_idx = self._loop_layers(
-            hidden_states=hidden_states if self.use_hrm else None,
-            low_hidden_states=low_hidden_states if self.use_hrm else hidden_states,
+            hidden_states=hidden_states,
+            low_hidden_states=low_hidden_states if self.use_hrm else None,
             input_embeddings=input_embeddings,
             H_layers=self.H_layers if self.use_hrm else None,
             L_layers=self.layers,
