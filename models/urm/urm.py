@@ -354,48 +354,7 @@ class URM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        if (
-            self.inner_config.grid_depth > 0
-            and self.inner_config.grid_io > 0
-            and self.inner_config.grid_height > 0
-            and self.inner_config.grid_width > 0
-        ):
-            self.rotary_emb = RotaryEmbedding4D(
-                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
-                grid_depth=self.inner_config.grid_depth,
-                grid_io=self.inner_config.grid_io,
-                grid_height=self.inner_config.grid_height,
-                grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.prefix_seq_len,
-                base=self.inner_config.rope_theta,
-            )
-        elif (
-            self.inner_config.grid_depth > 0
-            and self.inner_config.grid_height > 0
-            and self.inner_config.grid_width > 0
-        ):
-            self.rotary_emb = RotaryEmbedding3D(
-                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
-                grid_depth=self.inner_config.grid_depth,
-                grid_height=self.inner_config.grid_height,
-                grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.prefix_seq_len,
-                base=self.inner_config.rope_theta,
-            )
-        elif self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
-            self.rotary_emb = RotaryEmbedding2D(
-                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
-                grid_height=self.inner_config.grid_height,
-                grid_width=self.inner_config.grid_width,
-                puzzle_emb_len=self.prefix_seq_len,
-                base=self.inner_config.rope_theta,
-            )
-        else:
-            self.rotary_emb = RotaryEmbedding(
-                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
-                max_position_embeddings=self.inner_seq_len + self.prefix_seq_len,
-                base=self.inner_config.rope_theta,
-            )
+        self.init_rope_nD()
 
         self.layer_attention_window_sizes = _normalize_attention_window_sizes(
             self.inner_config.attention_window_size,
@@ -455,6 +414,45 @@ class URM_Inner(nn.Module):
             
         generator_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.generator = torch.Generator(device=generator_device).manual_seed(self.config.noise_seed)
+        
+    def init_rope_nD(self):
+        if (self.inner_config.grid_depth > 0 and self.inner_config.grid_io > 0 and self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0):
+            self.rotary_emb = RotaryEmbedding4D(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_depth=self.inner_config.grid_depth,
+                grid_io=self.inner_config.grid_io,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
+                puzzle_emb_len=self.prefix_seq_len,
+                base=self.inner_config.rope_theta,
+            )
+        elif (
+            self.inner_config.grid_depth > 0
+            and self.inner_config.grid_height > 0
+            and self.inner_config.grid_width > 0
+        ):
+            self.rotary_emb = RotaryEmbedding3D(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_depth=self.inner_config.grid_depth,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
+                puzzle_emb_len=self.prefix_seq_len,
+                base=self.inner_config.rope_theta,
+            )
+        elif self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
+            self.rotary_emb = RotaryEmbedding2D(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                grid_height=self.inner_config.grid_height,
+                grid_width=self.inner_config.grid_width,
+                puzzle_emb_len=self.prefix_seq_len,
+                base=self.inner_config.rope_theta,
+            )
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.inner_config.hidden_size // self.inner_config.num_heads,
+                max_position_embeddings=self.inner_seq_len + self.prefix_seq_len,
+                base=self.inner_config.rope_theta,
+            )
 
     def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim == 3:
@@ -992,12 +990,14 @@ class URM_Inner(nn.Module):
         layers: nn.ModuleList,
         cos_sin: CosSin,
         sequence_lengths: Optional[torch.Tensor] = None,
+        cache: Optional[List[URMLayerInferenceCache]] = None,
     ) -> torch.Tensor:
-        for layer in layers:
+        for i, layer in enumerate(layers):
             hidden_states = layer(
                 cos_sin=cos_sin,
                 hidden_states=hidden_states,
                 sequence_lengths=sequence_lengths,
+                cache=cache[i] if cache is not None else None,
             )
         return hidden_states
 
@@ -1046,7 +1046,7 @@ class URM_Inner(nn.Module):
         add_noise: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
-        for layer in layers:
+        for i, layer in enumerate(layers):
             pre_hidden_states = hidden_states
             hidden_states, cache = layer.forward_packed(
                 cos_sin=cos_sin,
@@ -1071,8 +1071,8 @@ class URM_Inner(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        for layer in layers:
-            hidden_states = layer.forward_packed(
+        for i, layer in enumerate(layers):
+            hidden_states, cache = layer.forward_packed(
                 cos_sin=cos_sin,
                 hidden_states=hidden_states,
                 cu_seqlens=cu_seqlens,
