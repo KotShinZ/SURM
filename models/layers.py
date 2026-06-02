@@ -1077,26 +1077,35 @@ class ConvSwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_ffn = F.silu(gate) * up
+        x_ffn = F.silu(gate) * up # (B, T, inter)
+        token_len = x_ffn.size(1)
+        cache_len = 0
         if hidden_state_cache is not None:
-            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1)
-        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
+            cache_len = hidden_state_cache.size(1)
+            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1) # (B, cache_len + T, inter)
+        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype)) # (B, inter, cache_len + T)
         # x_conv = self.dwattn(cos_sin = None, hidden_states=x_ffn, window_size=self.conv_kernel - 1)
-        x_conv = x_conv[..., :up.size(1)]
+        x_conv = x_conv[..., cache_len:cache_len + token_len] # (B, inter, T)
         x_conv = self.act(x_conv)
-        x_conv = x_conv.transpose(1, 2).contiguous()
-        x_out = self.down_proj(self.mlp_dropout(x_conv))
+        x_conv = x_conv.transpose(1, 2).contiguous() # (B, T, inter)
+        x_out = self.down_proj(self.mlp_dropout(x_conv)) # (B, T, hidden_size)
 
-        return x_out, x_ffn[:, -self.inter:]
+        if self.training:
+            return x_out, None
+        
+        next_hidden_state_cache = x_ffn[:, -self.conv_kernel - 1:]
+        return x_out, next_hidden_state_cache
 
     def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_ffn = F.silu(gate) * up
-        if hidden_state_cache is not None:
-            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1)
+        x_ffn = F.silu(gate) * up # (total_tokens, inter)
+        gap = self.conv_kernel - 1
+        B = int(cu_seqlens.numel()) - 1
 
-        gap = max(0, self.conv_kernel - 1)
-        if gap > 0 and x_ffn.shape[0] > 0:
+        if hidden_state_cache is not None:
+            expanded = torch.stack([hidden_state_cache, x_ffn, torch.zeros_like(x_ffn)], dim=1).reshape(-1, self.inter) # (3*total_tokens, inter)
+        else:
+            
             lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x_ffn.device, dtype=torch.long)
             seq_ids = torch.repeat_interleave(
                 torch.arange(lengths.shape[0], device=x_ffn.device, dtype=torch.long),
@@ -1107,15 +1116,12 @@ class ConvSwiGLU(nn.Module):
             expanded_len = x_ffn.shape[0] + lengths.shape[0] * gap
             expanded = x_ffn.new_zeros((expanded_len, x_ffn.shape[-1]))
             expanded[expanded_positions] = x_ffn
-        else:
-            expanded_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long)
-            expanded = x_ffn
 
         x_conv = self.dwconv(expanded.unsqueeze(0).transpose(1, 2).to(self.dwconv.weight.dtype))
         x_conv = x_conv[..., :expanded.size(0)]
         x_conv = self.act(x_conv).transpose(1, 2).squeeze(0).contiguous()
         x_conv = x_conv[expanded_positions]
-        return self.down_proj(self.mlp_dropout(x_conv)), x_ffn[:, -self.inter:]
+        return self.down_proj(self.mlp_dropout(x_conv)), x_ffn
 
 
 class FullyLinearGLU(nn.Module):
