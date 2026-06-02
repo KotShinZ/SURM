@@ -273,6 +273,8 @@ class URMBlock(nn.Module):
 
 
 class URM_Inner(nn.Module):
+    
+#region Init
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
         self.config = config
@@ -455,8 +457,9 @@ class URM_Inner(nn.Module):
         self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
         self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
         self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
+#endregion
 
-
+#region Patchify
     ### convert (B, T, C) to (B, T // patch_size, C)
     def _patchify(self, pixels: torch.Tensor) -> torch.Tensor:
         batch_size, _, channels = pixels.shape
@@ -513,15 +516,18 @@ class URM_Inner(nn.Module):
             )
 
         return patches.reshape(batch_size, self.padded_seq_len, channels)[:, : self.config.seq_len]
+#endregion
 
     def _memory_embeddings(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
         if self.config.num_memory_tokens == 0:
             return None
         return self.memory_tokens.to(device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
+
+#region Label Embedding Noise
     def _separate_mode(self) -> str:
         return str(self.config.separate_mode or self.config.SeparateMode).upper()
-
+    
     def _label_separate_C_enabled(self) -> bool:
         return bool(self.config.label_separate and self._separate_mode() == "C")
 
@@ -633,6 +639,7 @@ class URM_Inner(nn.Module):
         embedding = embedding.clone()
         embedding[answer_indices] = mixed.to(embedding.dtype)
         return embedding
+#endregion
 
     def _input_embeddings(
         self,
@@ -1168,6 +1175,7 @@ class URM_Inner(nn.Module):
 
         return hidden_states
 
+#region Some forward 
     def forward(
         self,
         carry: URMCarry,
@@ -1660,7 +1668,7 @@ class URM_Inner(nn.Module):
         output = self.lm_head(head_hidden_states[answer_indices])
         q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
-
+#endregion
 
 class URM(nn.Module):
     def __init__(self, config_dict: dict):
