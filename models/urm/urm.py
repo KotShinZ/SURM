@@ -996,16 +996,29 @@ class URM_Inner(nn.Module):
         layers: nn.ModuleList,
         cos_sin: CosSin,
         sequence_lengths: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         cache: Optional[List[URMLayerInferenceCache]] = None,
     ) -> torch.Tensor:
         for i, layer in enumerate(layers):
-            forward_func = layer.forward_packed if self.config.variable_seq_lengths else layer.forward
-            hidden_states = forward_func(
-                cos_sin=cos_sin,
-                hidden_states=hidden_states,
-                sequence_lengths=sequence_lengths,
-                cache=cache[i] if cache is not None else None,
-            )
+            if cu_seqlens is not None:
+                if max_seqlen is None:
+                    raise RuntimeError("Packed token layers require max_seqlen.")
+                hidden_states, _cache = layer.forward_packed(
+                    cos_sin=cos_sin,
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cache=cache[i] if cache is not None else None,
+                )
+            else:
+                if cache is not None:
+                    raise RuntimeError("Fixed-length token layers do not support inference caches.")
+                hidden_states = layer.forward(
+                    cos_sin=cos_sin,
+                    hidden_states=hidden_states,
+                    sequence_lengths=sequence_lengths,
+                )
         return hidden_states
 
     def _run_recurrent_layers(
@@ -1014,7 +1027,9 @@ class URM_Inner(nn.Module):
         input_embeddings: torch.Tensor,
         layers: nn.ModuleList,
         cos_sin: CosSin,
-        sequence_lengths: Optional[torch.Tensor],
+        sequence_lengths: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         diff_L: Optional[torch.Tensor] = None,
         grad_hook_factory=None,
         unrolled_idx: int = 0,
@@ -1023,13 +1038,22 @@ class URM_Inner(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
         for layer in layers:
-            forward_func = layer.forward_packed if self.config.variable_seq_lengths else layer.forward
             pre_hidden_states = hidden_states
-            hidden_states = forward_func(
-                cos_sin=cos_sin,
-                hidden_states=pre_hidden_states,
-                sequence_lengths=sequence_lengths,
-            )
+            if cu_seqlens is not None:
+                if max_seqlen is None:
+                    raise RuntimeError("Packed recurrent layers require max_seqlen.")
+                hidden_states, _cache = layer.forward_packed(
+                    cos_sin=cos_sin,
+                    hidden_states=pre_hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+            else:
+                hidden_states = layer.forward(
+                    cos_sin=cos_sin,
+                    hidden_states=pre_hidden_states,
+                    sequence_lengths=sequence_lengths,
+                )
             if diff_L is not None:
                 diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
             if add_noise:
@@ -1041,48 +1065,84 @@ class URM_Inner(nn.Module):
 
     def _loop_layers(
         self,
-        hidden_states: torch.Tensor,
-        low_hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        low_hidden_states: Optional[torch.Tensor],
         input_embeddings: torch.Tensor,
         H_layers: Optional[nn.ModuleList],
         L_layers: nn.ModuleList,
         H_cycles: int,
         L_cycles: int,
-        seq_info: Dict[str, Optional[torch.Tensor]],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+        seq_info: Dict[str, Union[torch.Tensor, int, CosSin, None]],
+        diff_L: Optional[torch.Tensor] = None,
+        grad_hook_factory=None,
+        unrolled_idx: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
         no_grad_H_cycles = H_cycles - self.config.grad_H_cycles
         with torch.no_grad():
             for _ in range(no_grad_H_cycles):
                 for _ in range(L_cycles):
-                    low_hidden_states, _, _ = self._run_recurrent_layers(
-                        hidden_states=low_hidden_states,
-                        input_embeddings=hidden_states + input_embeddings,
-                        layers=L_layers,
-                        **seq_info,
-                )
+                    if H_layers is not None:
+                        layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
+                        low_hidden_states, _, _ = self._run_recurrent_layers(
+                            hidden_states=low_hidden_states,
+                            input_embeddings=layer_input,
+                            layers=L_layers,
+                            force_injection=True,
+                        )
+                    else:
+                        hidden_states, _, _ = self._run_recurrent_layers(
+                            hidden_states=hidden_states,
+                            input_embeddings=input_embeddings,
+                            layers=L_layers,
+                            add_noise=False,
+                            **seq_info,
+                        )
+                        hidden_states = self._add_noise(hidden_states)
                 if H_layers is not None:
                     hidden_states, _, _ = self._run_recurrent_layers(
                         hidden_states=hidden_states,
                         input_embeddings=low_hidden_states,
                         layers=H_layers,
+                        force_injection=True,
                         **seq_info,
-            )
-            for _ in range(no_grad_H_cycles):
+                    )
+
+        for _ in range(self.config.grad_H_cycles):
+            if H_layers is not None:
                 for _ in range(L_cycles):
-                    low_hidden_states, _, _ = self._run_recurrent_layers(
+                    layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
+                    low_hidden_states, diff_L, unrolled_idx = self._run_recurrent_layers(
                         hidden_states=low_hidden_states,
-                        input_embeddings=hidden_states + input_embeddings,
+                        input_embeddings=layer_input,
                         layers=L_layers,
+                        diff_L=diff_L,
+                        grad_hook_factory=grad_hook_factory,
+                        unrolled_idx=unrolled_idx,
+                        force_injection=True,
                         **seq_info,
+                    )
+                hidden_states, _, unrolled_idx = self._run_recurrent_layers(
+                    hidden_states=hidden_states,
+                    input_embeddings=low_hidden_states,
+                    layers=H_layers,
+                    grad_hook_factory=grad_hook_factory,
+                    unrolled_idx=unrolled_idx,
+                    force_injection=True,
+                    **seq_info,
                 )
-                if H_layers is not None:
-                    hidden_states, _, _ = self._run_recurrent_layers(
+            else:
+                for _ in range(L_cycles):
+                    hidden_states, diff_L, unrolled_idx = self._run_recurrent_layers(
                         hidden_states=hidden_states,
-                        input_embeddings=low_hidden_states,
-                        layers=H_layers,
+                        input_embeddings=input_embeddings,
+                        layers=L_layers,
+                        diff_L=diff_L,
+                        grad_hook_factory=grad_hook_factory,
+                        unrolled_idx=unrolled_idx,
                         **seq_info,
-            )
-            return low_hidden_states if H_layers is not None else hidden_states
+                    )
+
+        return hidden_states, low_hidden_states if H_layers is not None else None, diff_L, unrolled_idx
 #endregion
   
     def _prefix_lm_key_value_indices(
@@ -1124,7 +1184,7 @@ class URM_Inner(nn.Module):
         if len(layers) == 0:
             return hidden_states
         if answer_indices.numel() == 0:
-            return self._run_token_layers_packed(
+            return self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=layers,
                 cos_sin=cos_sin,
@@ -1146,7 +1206,7 @@ class URM_Inner(nn.Module):
             next_states = hidden_states.clone()
             context_states = hidden_states[context_indices]
             if context_states.numel() > 0:
-                context_states = layer.forward_packed(
+                context_states, _cache = layer.forward_packed(
                     cos_sin=context_cos_sin,
                     hidden_states=context_states,
                     cu_seqlens=cu_context,
@@ -1211,49 +1271,44 @@ class URM_Inner(nn.Module):
             input_embeddings, token_indices = self._input_embeddings_packed(batch)
             cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
             cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+            seq_info = dict(
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         else:
             input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
-            token_indices, cu_seqlens = None, None
+            token_indices, cu_seqlens, max_seqlen = None, None, None
             cos_sin = self._rotary_cos_sin(batch)
-        grad_hook_factory = self.get_grad_hook_factory()
-        seq_info = dict(
-            cos_sin=cos_sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            grad_hook_factory=grad_hook_factory,
+            seq_info = dict(
+                cos_sin=cos_sin,
+                sequence_lengths=self._sequence_lengths(batch),
+            )
+        input_embeddings = self._run_token_layers(
+            hidden_states=input_embeddings,
+            layers=self.prelude_layers,
+            **seq_info,
         )
-
-        # prelude layers
-        input_embeddings = self._run_token_layers(hidden_states=input_embeddings, layers=self.prelude_layers, **seq_info)
+        grad_hook_factory = self.get_grad_hook_factory()
 
         hidden_states = carry.current_hidden
         low_hidden_states = carry.current_low_hidden
-        no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
-        if self.use_hrm:
-            self._loop_layers(
-                hidden_states=hidden_states,
-                low_hidden_states=low_hidden_states,
-                input_embeddings=input_embeddings,
-                H_layers=self.H_layers,
-                L_layers=self.layers,
-                H_cycles=self.config.H_cycles,
-                L_cycles=self.config.L_cycles,
-                seq_info=seq_info,
-            )
-        else:
-            self._loop_layers(
-                hidden_states=None,
-                low_hidden_states=hidden_states,
-                input_embeddings=input_embeddings,
-                H_layers=None,
-                L_layers=self.layers,
-                H_cycles=self.config.H_cycles,
-                L_cycles=self.config.L_cycles,
-                seq_info=seq_info,
-            )
+        hidden_states, low_hidden_states, diff_L, _unrolled_idx = self._loop_layers(
+            hidden_states=hidden_states if self.use_hrm else None,
+            low_hidden_states=low_hidden_states if self.use_hrm else hidden_states,
+            input_embeddings=input_embeddings,
+            H_layers=self.H_layers if self.use_hrm else None,
+            L_layers=self.layers,
+            H_cycles=self.config.H_cycles,
+            L_cycles=self.config.L_cycles,
+            seq_info=seq_info,
+            diff_L=diff_L,
+            grad_hook_factory=grad_hook_factory,
+            unrolled_idx=_unrolled_idx,
+        )
 
         # detach and store carry
         new_carry = replace(
@@ -1263,9 +1318,14 @@ class URM_Inner(nn.Module):
         )
         
         # coda layers
-        head_hidden_states = run_token_layers(hidden_states=hidden_states,layers=self.coda_layers,**seq_info)
+        head_hidden_states = self._run_token_layers(
+            hidden_states=hidden_states,
+            layers=self.coda_layers,
+            **seq_info,
+        )
 
         if is_packed:
+            assert token_indices is not None and cu_seqlens is not None
             output = self.lm_head(head_hidden_states[token_indices])
             q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         else:
@@ -1325,7 +1385,7 @@ class URM_Inner(nn.Module):
             )
             context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
             for layer in self.context_layers:
-                context_states = layer.forward_packed(
+                context_states, _cache = layer.forward_packed(
                     cos_sin=context_cos_sin,
                     hidden_states=context_states,
                     cu_seqlens=cu_context,
@@ -1389,7 +1449,7 @@ class URM_Inner(nn.Module):
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
-        input_embeddings = self._run_token_layers_packed(
+        input_embeddings = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
             cos_sin=cos_sin,
@@ -1414,7 +1474,7 @@ class URM_Inner(nn.Module):
             )
         if answer_indices.numel() == 0:
             new_carry = replace(carry, current_hidden=hidden_states.detach())
-            head_hidden_states = self._run_token_layers_packed(
+            head_hidden_states = self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=self.coda_layers,
                 cos_sin=cos_sin,
@@ -1432,7 +1492,7 @@ class URM_Inner(nn.Module):
         )
         context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
         for layer in self.context_layers:
-            context_states = layer.forward_packed(
+            context_states, _cache = layer.forward_packed(
                 cos_sin=context_cos_sin,
                 hidden_states=context_states,
                 cu_seqlens=cu_context,
@@ -1484,7 +1544,7 @@ class URM_Inner(nn.Module):
         for _ in range(self.config.grad_H_cycles):
             hidden_states = run_answer_layers(hidden_states)
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        head_hidden_states = self._run_token_layers_packed(
+        head_hidden_states = self._run_token_layers(
             hidden_states=hidden_states,
             layers=self.coda_layers,
             cos_sin=cos_sin,
