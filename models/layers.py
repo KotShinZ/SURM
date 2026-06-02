@@ -1104,6 +1104,7 @@ class ConvSwiGLU(nn.Module):
 
         if hidden_state_cache is not None:
             expanded = torch.stack([hidden_state_cache, x_ffn, torch.zeros_like(x_ffn)], dim=1).reshape(-1, self.inter) # (3*total_tokens, inter)
+            expanded_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long) * 3 + 1
         else:
             lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x_ffn.device, dtype=torch.long)
             seq_ids = torch.repeat_interleave(

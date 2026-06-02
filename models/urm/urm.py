@@ -41,7 +41,13 @@ class URMLayerInferenceCache:
         updated_key = torch.cat([self.key, key], dim=1)
         updated_value = torch.cat([self.value, value], dim=1)
         updated_seqlens = self.seqlens + key.shape[1]
-        return replace(self, key=updated_key, value=updated_value, seqlens=updated_seqlens, conv_hidden_state=conv_hidden_state or self.conv_hidden_state)
+        return replace(
+            self,
+            key=updated_key,
+            value=updated_value,
+            seqlens=updated_seqlens,
+            conv_hidden_state=conv_hidden_state if conv_hidden_state is not None else self.conv_hidden_state,
+        )
 
 
 @dataclass
@@ -218,13 +224,16 @@ class URMBlock(nn.Module):
         cache: Optional[URMLayerInferenceCache] = None,
     ) -> Tuple[torch.Tensor, Optional[URMLayerInferenceCache]]:
         if cache is not None:
+            decode_hidden_states = hidden_states.unsqueeze(1) if hidden_states.ndim == 2 else hidden_states
             attn_output, key, value = self.self_attn.forward_decode(
                 cos_sin=cos_sin,
-                hidden_states=hidden_states,
+                hidden_states=decode_hidden_states,
                 key_cache=cache.key,
                 value_cache=cache.value,
                 cache_seqlens=cache.seqlens,
             )
+            if hidden_states.ndim == 2 and attn_output.ndim == 3:
+                attn_output = attn_output.squeeze(1)
         else:   
             attn_output, key, value = self.self_attn.forward_packed(
                 cos_sin=cos_sin,
@@ -999,18 +1008,21 @@ class URM_Inner(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         cache: Optional[List[URMLayerInferenceCache]] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[List[URMLayerInferenceCache]]]:
+        new_cache = [] if cache is not None else None
         for i, layer in enumerate(layers):
             if cu_seqlens is not None:
                 if max_seqlen is None:
                     raise RuntimeError("Packed token layers require max_seqlen.")
-                hidden_states, _cache = layer.forward_packed(
+                hidden_states, layer_cache = layer.forward_packed(
                     cos_sin=cos_sin,
                     hidden_states=hidden_states,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     cache=cache[i] if cache is not None else None,
                 )
+                if new_cache is not None:
+                    new_cache.append(layer_cache)
             else:
                 if cache is not None:
                     raise RuntimeError("Fixed-length token layers do not support inference caches.")
@@ -1019,7 +1031,7 @@ class URM_Inner(nn.Module):
                     hidden_states=hidden_states,
                     sequence_lengths=sequence_lengths,
                 )
-        return hidden_states
+        return hidden_states, new_cache
 
     def _run_recurrent_layers(
         self,
@@ -1035,19 +1047,24 @@ class URM_Inner(nn.Module):
         unrolled_idx: int = 0,
         force_injection: bool = False,
         add_noise: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+        cache: Optional[List[URMLayerInferenceCache]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, Optional[List[URMLayerInferenceCache]]]:
+        new_cache = [] if cache is not None else None
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
-        for layer in layers:
+        for layer_idx, layer in enumerate(layers):
             pre_hidden_states = hidden_states
             if cu_seqlens is not None:
                 if max_seqlen is None:
                     raise RuntimeError("Packed recurrent layers require max_seqlen.")
-                hidden_states, _cache = layer.forward_packed(
+                hidden_states, layer_cache = layer.forward_packed(
                     cos_sin=cos_sin,
                     hidden_states=pre_hidden_states,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
+                    cache=cache[layer_idx] if cache is not None else None,
                 )
+                if new_cache is not None:
+                    new_cache.append(layer_cache)
             else:
                 hidden_states = layer.forward(
                     cos_sin=cos_sin,
@@ -1061,7 +1078,7 @@ class URM_Inner(nn.Module):
             if grad_hook_factory is not None:
                 hidden_states.register_hook(grad_hook_factory(unrolled_idx))
                 unrolled_idx += 1
-        return hidden_states, diff_L, unrolled_idx
+        return hidden_states, diff_L, unrolled_idx, new_cache
 
     def _loop_layers(
         self,
@@ -1076,34 +1093,54 @@ class URM_Inner(nn.Module):
         diff_L: Optional[torch.Tensor] = None,
         grad_hook_factory=None,
         unrolled_idx: int = 0,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        cache: Optional[URMInferenceCache] = None,
+        cache_loop_offset: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[URMInferenceCache]]:
+        expected_cache_loops = H_cycles * L_cycles if H_layers is None else H_cycles * (L_cycles + 1)
+
+        loop_cache_idx = 0
+        new_cache_layers = list(cache.layers) if cache is not None else None
+
+        def next_loop_cache() -> Optional[List[URMLayerInferenceCache]]:
+            nonlocal loop_cache_idx
+            if cache is None:
+                return None
+            layer_cache = cache.layers[cache_loop_offset + loop_cache_idx]
+            loop_cache_idx += 1
+            return layer_cache
+
+        def append_loop_cache(layer_cache: Optional[List[URMLayerInferenceCache]]) -> None:
+            if new_cache_layers is None:
+                return
+            new_cache_layers[cache_loop_offset + loop_cache_idx - 1] = layer_cache
+
         no_grad_H_cycles = H_cycles - self.config.grad_H_cycles
         with torch.no_grad():
             for _ in range(no_grad_H_cycles):
                 for _ in range(L_cycles):
                     if H_layers is not None:
                         layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                        low_hidden_states, _, _ = self._run_recurrent_layers(
+                        low_hidden_states, _, _, _ = self._run_recurrent_layers(
                             hidden_states=low_hidden_states,
                             input_embeddings=layer_input,
                             layers=L_layers,
-                            force_injection=True,
                         )
                     else:
-                        hidden_states, _, _ = self._run_recurrent_layers(
+                        hidden_states, _, _, loop_new_cache = self._run_recurrent_layers(
                             hidden_states=hidden_states,
                             input_embeddings=input_embeddings,
                             layers=L_layers,
                             add_noise=False,
+                            cache=next_loop_cache(),
                             **seq_info,
                         )
+                        append_loop_cache(loop_new_cache)
                         hidden_states = self._add_noise(hidden_states)
                 if H_layers is not None:
-                    hidden_states, _, _ = self._run_recurrent_layers(
+                    hidden_states, _, _, _ = self._run_recurrent_layers(
                         hidden_states=hidden_states,
                         input_embeddings=low_hidden_states,
                         layers=H_layers,
-                        force_injection=True,
                         **seq_info,
                     )
 
@@ -1111,38 +1148,39 @@ class URM_Inner(nn.Module):
             if H_layers is not None:
                 for _ in range(L_cycles):
                     layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                    low_hidden_states, diff_L, unrolled_idx = self._run_recurrent_layers(
+                    low_hidden_states, diff_L, unrolled_idx, _ = self._run_recurrent_layers(
                         hidden_states=low_hidden_states,
                         input_embeddings=layer_input,
                         layers=L_layers,
                         diff_L=diff_L,
                         grad_hook_factory=grad_hook_factory,
                         unrolled_idx=unrolled_idx,
-                        force_injection=True,
                         **seq_info,
                     )
-                hidden_states, _, unrolled_idx = self._run_recurrent_layers(
+                hidden_states, _, unrolled_idx, _ = self._run_recurrent_layers(
                     hidden_states=hidden_states,
                     input_embeddings=low_hidden_states,
                     layers=H_layers,
                     grad_hook_factory=grad_hook_factory,
                     unrolled_idx=unrolled_idx,
-                    force_injection=True,
                     **seq_info,
                 )
             else:
                 for _ in range(L_cycles):
-                    hidden_states, diff_L, unrolled_idx = self._run_recurrent_layers(
+                    hidden_states, diff_L, unrolled_idx, loop_new_cache = self._run_recurrent_layers(
                         hidden_states=hidden_states,
                         input_embeddings=input_embeddings,
                         layers=L_layers,
                         diff_L=diff_L,
                         grad_hook_factory=grad_hook_factory,
                         unrolled_idx=unrolled_idx,
+                        cache=next_loop_cache(),
                         **seq_info,
                     )
+                    append_loop_cache(loop_new_cache)
 
-        return hidden_states, low_hidden_states if H_layers is not None else None, diff_L, unrolled_idx
+        new_cache = replace(cache, layers=new_cache_layers) if cache is not None else None
+        return hidden_states, low_hidden_states if H_layers is not None else None, diff_L, unrolled_idx, new_cache
 #endregion
   
     def _prefix_lm_key_value_indices(
@@ -1184,13 +1222,14 @@ class URM_Inner(nn.Module):
         if len(layers) == 0:
             return hidden_states
         if answer_indices.numel() == 0:
-            return self._run_token_layers(
+            hidden_states, _cache = self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=layers,
                 cos_sin=cos_sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
+            return hidden_states
 
         context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
         answer_cos_sin = self._slice_packed_cos_sin(cos_sin, answer_indices)
@@ -1258,8 +1297,13 @@ class URM_Inner(nn.Module):
     def forward(
         self,
         carry: URMCarry,
-        batch: Dict[str, torch.Tensor]
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+        batch: Dict[str, torch.Tensor],
+        cache: Optional[URMInferenceCache] = None,
+        cache_loop_offset: int = 0,
+    ) -> Union[
+        Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]],
+        Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor], Optional[URMInferenceCache]],
+    ]:
         if self.config.forward_mode == "prefix_lm":
             return self.forward_prefix_lm_packed(carry, batch)
         if self.config.forward_mode == "answer_only":
@@ -1284,7 +1328,7 @@ class URM_Inner(nn.Module):
                 cos_sin=cos_sin,
                 sequence_lengths=self._sequence_lengths(batch),
             )
-        input_embeddings = self._run_token_layers(
+        input_embeddings, _prelude_cache = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
             **seq_info,
@@ -1296,7 +1340,7 @@ class URM_Inner(nn.Module):
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
-        hidden_states, low_hidden_states, diff_L, _unrolled_idx = self._loop_layers(
+        hidden_states, low_hidden_states, diff_L, _unrolled_idx, new_cache = self._loop_layers(
             hidden_states=hidden_states,
             low_hidden_states=low_hidden_states if self.use_hrm else None,
             input_embeddings=input_embeddings,
@@ -1308,6 +1352,8 @@ class URM_Inner(nn.Module):
             diff_L=diff_L,
             grad_hook_factory=grad_hook_factory,
             unrolled_idx=_unrolled_idx,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
         )
 
         # detach and store carry
@@ -1318,7 +1364,7 @@ class URM_Inner(nn.Module):
         )
         
         # coda layers
-        head_hidden_states = self._run_token_layers(
+        head_hidden_states, _coda_cache = self._run_token_layers(
             hidden_states=hidden_states,
             layers=self.coda_layers,
             **seq_info,
@@ -1449,7 +1495,7 @@ class URM_Inner(nn.Module):
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
-        input_embeddings = self._run_token_layers(
+        input_embeddings, _prelude_cache = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
             cos_sin=cos_sin,
@@ -1474,7 +1520,7 @@ class URM_Inner(nn.Module):
             )
         if answer_indices.numel() == 0:
             new_carry = replace(carry, current_hidden=hidden_states.detach())
-            head_hidden_states = self._run_token_layers(
+            head_hidden_states, _coda_cache = self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=self.coda_layers,
                 cos_sin=cos_sin,
@@ -1544,7 +1590,7 @@ class URM_Inner(nn.Module):
         for _ in range(self.config.grad_H_cycles):
             hidden_states = run_answer_layers(hidden_states)
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        head_hidden_states = self._run_token_layers(
+        head_hidden_states, _coda_cache = self._run_token_layers(
             hidden_states=hidden_states,
             layers=self.coda_layers,
             cos_sin=cos_sin,
@@ -2092,14 +2138,55 @@ class URM(nn.Module):
             return diff_norm / (1e-7 + sum_norm / 2)
         return torch.norm(x1 - x2, dim=(1,2)) / (1e-7 + torch.norm(x1 + x2, dim=(1,2)) / 2)
 
+    def _inner_cache_loop_count(self) -> int:
+        if self.inner.use_hrm:
+            return self.config.H_cycles * (self.config.L_cycles + 1)
+        return self.config.H_cycles * self.config.L_cycles
+
+    def _cache_loop_offset(self, cache: Optional[URMInferenceCache], steps: torch.Tensor) -> int:
+        if cache is None:
+            return 0
+
+        inner_loop_count = self._inner_cache_loop_count()
+        cache_loop_count = len(cache.layers)
+        if cache_loop_count == inner_loop_count:
+            return 0
+
+        def single_step() -> int:
+            if steps.numel() == 0:
+                return 0
+            unique_steps = torch.unique(steps.detach())
+            if unique_steps.numel() != 1:
+                raise RuntimeError("Batched URMInferenceCache use requires all samples to share the same loop step.")
+            step = int(unique_steps[0].item())
+            if step < 0 or step >= self.config.loops:
+                raise RuntimeError(f"Cache loop step {step} is outside configured loops={self.config.loops}.")
+            return step
+
+        if cache_loop_count == self.config.loops:
+            if inner_loop_count != 1:
+                raise RuntimeError(
+                    "URMInferenceCache with config.loops entries requires exactly one inner recurrent loop per forward."
+                )
+            return single_step()
+
+        if cache_loop_count == self.config.loops * inner_loop_count:
+            return single_step() * inner_loop_count
+
+        raise RuntimeError(
+            "URMInferenceCache loop count must match the inner recurrent loop count, "
+            "config.loops, or config.loops * inner recurrent loop count."
+        )
+
     def forward(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
-        compute_target_q=False
-    ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        compute_target_q=False,
+        cache: Optional[URMInferenceCache] = None,
+    ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         if self.config.variable_seq_lengths:
-            return self._forward_packed(carry, batch, compute_target_q=compute_target_q)
+            return self._forward_packed(carry, batch, compute_target_q=compute_target_q, cache=cache)
 
         carry, batch = self._align_variable_batch(carry, batch)
         new_steps = torch.where(carry.halted, 0, carry.steps)
@@ -2113,7 +2200,13 @@ class URM(nn.Module):
         }
         new_carry = self._reset_fixed_carry(carry.halted, carry, new_current_data)
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
+        cache_loop_offset = self._cache_loop_offset(cache, new_steps)
+        inner_result = self.inner(new_carry, new_current_data, cache=cache, cache_loop_offset=cache_loop_offset)
+        new_cache = None
+        if cache is None:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
+        else:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
         
         hidden_diff_norm = self.norm_func(
             new_carry2.current_hidden.detach(),
@@ -2161,7 +2254,7 @@ class URM(nn.Module):
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
                 # halted = torch.ones_like(halted)
 
-        return (
+        result = (
             URMCarry(
                 current_hidden=new_carry2.current_hidden,
                 steps=new_steps,
@@ -2171,18 +2264,28 @@ class URM(nn.Module):
             ),
             outputs,
         )
+        if cache is not None:
+            return result[0], result[1], new_cache
+        return result
 
     def _forward_packed(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
         compute_target_q=False,
-    ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        cache: Optional[URMInferenceCache] = None,
+    ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         new_current_data = self._merge_packed_current_data(carry, batch)
         new_carry = self._reset_packed_carry(carry.halted, carry, new_current_data)
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
+        cache_loop_offset = self._cache_loop_offset(cache, new_steps)
+        inner_result = self.inner(new_carry, new_current_data, cache=cache, cache_loop_offset=cache_loop_offset)
+        new_cache = None
+        if cache is None:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
+        else:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
 
         hidden_diff_norm = self.norm_func(
             new_carry2.current_hidden.detach(),
@@ -2238,7 +2341,7 @@ class URM(nn.Module):
                         norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
 
-        return (
+        result = (
             URMCarry(
                 current_hidden=new_carry2.current_hidden,
                 steps=new_steps,
@@ -2248,3 +2351,6 @@ class URM(nn.Module):
             ),
             outputs,
         )
+        if cache is not None:
+            return result[0], result[1], new_cache
+        return result
