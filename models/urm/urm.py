@@ -30,6 +30,26 @@ class URMCarry:
     current_low_hidden: Optional[torch.Tensor] = None
 
 
+@dataclass
+class URMLayerInferenceCache:
+    key: torch.Tensor
+    value: torch.Tensor
+    seqlens: torch.Tensor
+    conv_hidden_state: Optional[torch.Tensor] = None
+    
+    def update(self, key: torch.Tensor, value: torch.Tensor, conv_hidden_state: Optional[torch.Tensor] = None) -> "URMLayerInferenceCache":
+        updated_key = torch.cat([self.key, key], dim=1)
+        updated_value = torch.cat([self.value, value], dim=1)
+        updated_seqlens = self.seqlens + key.shape[1]
+        return replace(self, key=updated_key, value=updated_value, seqlens=updated_seqlens, conv_hidden_state=conv_hidden_state or self.conv_hidden_state)
+
+
+@dataclass
+class URMInferenceCache:
+    layers: List[List[URMLayerInferenceCache]]
+    batch_size: int
+    max_cache_len: int
+
 def _normalize_attention_window_sizes(
     attention_window_size: Union[int, List[int]],
     num_layers: int,
@@ -206,7 +226,7 @@ class URMBlock(nn.Module):
             sequence_lengths=sequence_lengths,
         )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp(hidden_states)
+        mlp_output, _conv_hidden_state = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
@@ -216,18 +236,32 @@ class URMBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-    ) -> torch.Tensor:
-        attn_output = self.self_attn.forward_packed(
-            cos_sin=cos_sin,
-            hidden_states=hidden_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            window_size=-1,
-        )
+        cache: Optional[URMLayerInferenceCache] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if cache is not None:
+            attn_output, key, value = self.self_attn.forward_decode(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                key_cache=cache.key,
+                value_cache=cache.value,
+                cache_seqlens=cache.seqlens,
+            )
+        else:   
+            attn_output, key, value = self.self_attn.forward_packed(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=-1,
+            )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp.forward_packed(hidden_states, cu_seqlens)
+        mlp_output, conv_hidden_state = self.mlp.forward_packed(hidden_states, cu_seqlens, cache.conv_hidden_state if cache is not None else None)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
-        return hidden_states
+        
+        if cache is not None:
+            new_cache = cache.update(key=key, value=value, conv_hidden_state=conv_hidden_state)
+        
+        return hidden_states, key, value, conv_hidden_state
 
     def forward_cross_packed(
         self,
@@ -253,7 +287,7 @@ class URMBlock(nn.Module):
             causal=causal,
         )
         query_states = rms_norm(query_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp.forward_packed(query_states, cu_seqlens_q)
+        mlp_output, _conv_hidden_state = self.mlp.forward_packed(query_states, cu_seqlens_q)
         query_states = rms_norm(query_states + mlp_output, variance_epsilon=self.norm_eps)
         return query_states
 

@@ -1105,7 +1105,6 @@ class ConvSwiGLU(nn.Module):
         if hidden_state_cache is not None:
             expanded = torch.stack([hidden_state_cache, x_ffn, torch.zeros_like(x_ffn)], dim=1).reshape(-1, self.inter) # (3*total_tokens, inter)
         else:
-            
             lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x_ffn.device, dtype=torch.long)
             seq_ids = torch.repeat_interleave(
                 torch.arange(lengths.shape[0], device=x_ffn.device, dtype=torch.long),
@@ -1121,7 +1120,19 @@ class ConvSwiGLU(nn.Module):
         x_conv = x_conv[..., :expanded.size(0)]
         x_conv = self.act(x_conv).transpose(1, 2).squeeze(0).contiguous()
         x_conv = x_conv[expanded_positions]
-        return self.down_proj(self.mlp_dropout(x_conv)), x_ffn
+        
+        if x_ffn.shape[0] == cu_seqlens[-1]:  # next token prediction
+            next_cache = x_ffn
+        else:
+            next_cache = x_ffn.new_zeros((B, gap, self.inter))
+            for i in range(B):
+                seq_len = cu_seqlens[i + 1] - cu_seqlens[i]
+                if seq_len >= gap:
+                    next_cache[i] = x_ffn[cu_seqlens[i + 1] - gap: cu_seqlens[i + 1]]
+                else:
+                    next_cache[i, -seq_len:] = x_ffn[cu_seqlens[i]: cu_seqlens[i + 1]]
+        
+        return self.down_proj(self.mlp_dropout(x_conv)), next_cache
 
 
 class FullyLinearGLU(nn.Module):
