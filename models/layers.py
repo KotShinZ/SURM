@@ -7,8 +7,10 @@ import math
 
 try:
     from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+    from flash_attn_interface import flash_attn_with_kvcache
 except ImportError:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_with_kvcache
 
 try:
     from torch.nn.attention.flex_attention import flex_attention
@@ -617,6 +619,25 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
+    def project_query_key_value(
+        self,
+        hidden_states: torch.Tensor,
+        cos_sin: Optional[CosSin] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(
+            *hidden_states.shape[:-1],
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+        query = qkv[..., :self.num_heads, :]
+        key = qkv[..., self.num_heads: self.num_heads + self.num_key_value_heads, :]
+        value = qkv[..., self.num_heads + self.num_key_value_heads:, :]
+
+        query = apply_rotary_pos_emb_one(query, cos_sin)
+        key = apply_rotary_pos_emb_one(key, cos_sin)
+        return query, key, value
+    
     def _masked_score(self, score: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
         return torch.where(keep, score, torch.full_like(score, float("-inf")))
 
@@ -883,28 +904,12 @@ class Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         window_size=-1,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.attention_type not in {"full", "swa"}:
             raise ValueError(f"Packed variable-length attention does not support attention_type='{self.attention_type}'")
 
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
-        qkv = qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-        query = qkv[:, :self.num_heads]
-        key = qkv[:, self.num_heads: self.num_heads + self.num_key_value_heads]
-        value = qkv[:, self.num_heads + self.num_key_value_heads:]
-
-        if cos_sin is not None:
-            if len(cos_sin) == 8:
-                query, key = apply_rotary_pos_emb_4d(query, key, *cos_sin)
-            elif len(cos_sin) == 6:
-                query, key = apply_rotary_pos_emb_3d(query, key, *cos_sin)
-            elif len(cos_sin) == 4:
-                query, key = apply_rotary_pos_emb_2d(query, key, *cos_sin)
-            else:
-                cos, sin = cos_sin
-                query, key = apply_rotary_pos_emb(query, key, cos, sin)
-
+        query, key, value = self.project_query_key_value(hidden_states, cos_sin)
         effective_window_size = self.attention_window_size if window_size == -1 else window_size
         if self.attention_type == "full":
             effective_window_size = -1
@@ -924,7 +929,41 @@ class Attention(nn.Module):
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]
 
-        return self.o_proj(attn_output.reshape(num_tokens, self.output_size))
+        return self.o_proj(attn_output.reshape(num_tokens, self.output_size)), key, value
+
+    def forward_decode(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cache_batch_idx: Optional[torch.Tensor] = None,
+        window_size=-1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        batch_size = hidden_states.shape[0]
+        query, key, value = self.project_query_key_value(hidden_states, cos_sin)
+        effective_window_size = self.attention_window_size if window_size == -1 else window_size
+        if self.attention_type == "full":
+            effective_window_size = -1
+            
+        attn_output = flash_attn_with_kvcache(
+            q=query.contiguous(),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cache_seqlens=cache_seqlens.to(device=key_cache.device, dtype=torch.int32),
+            cache_batch_idx=cache_batch_idx,
+            causal=self.causal,
+            window_size=(effective_window_size, effective_window_size),
+        )
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+
+        attn_output = self.o_proj(attn_output.reshape(batch_size, 1, self.output_size))
+        return attn_output, key, value
 
     def forward_cross_packed(
         self,
@@ -1036,9 +1075,11 @@ class ConvSwiGLU(nn.Module):
         self.down_proj = CastedLinear(inter, hidden_size, bias=False)
         self.mlp_dropout = nn.Dropout(mlp_dropout)
 
-    def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
+    def forward(self, x: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         x_ffn = F.silu(gate) * up
+        if hidden_state_cache is not None:
+            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1)
         x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
         # x_conv = self.dwattn(cos_sin = None, hidden_states=x_ffn, window_size=self.conv_kernel - 1)
         x_conv = x_conv[..., :up.size(1)]
@@ -1046,11 +1087,13 @@ class ConvSwiGLU(nn.Module):
         x_conv = x_conv.transpose(1, 2).contiguous()
         x_out = self.down_proj(self.mlp_dropout(x_conv))
 
-        return x_out
+        return x_out, x_ffn[:, -self.inter:]
 
-    def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor):
+    def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         x_ffn = F.silu(gate) * up
+        if hidden_state_cache is not None:
+            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1)
 
         gap = max(0, self.conv_kernel - 1)
         if gap > 0 and x_ffn.shape[0] > 0:
@@ -1072,7 +1115,7 @@ class ConvSwiGLU(nn.Module):
         x_conv = x_conv[..., :expanded.size(0)]
         x_conv = self.act(x_conv).transpose(1, 2).squeeze(0).contiguous()
         x_conv = x_conv[expanded_positions]
-        return self.down_proj(self.mlp_dropout(x_conv))
+        return self.down_proj(self.mlp_dropout(x_conv)), x_ffn[:, -self.inter:]
 
 
 class FullyLinearGLU(nn.Module):
