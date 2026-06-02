@@ -216,7 +216,7 @@ class URMBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cache: Optional[URMLayerInferenceCache] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[URMLayerInferenceCache]]:
         if cache is not None:
             attn_output, key, value = self.self_attn.forward_decode(
                 cos_sin=cos_sin,
@@ -237,11 +237,12 @@ class URMBlock(nn.Module):
         mlp_output, conv_hidden_state = self.mlp.forward_packed(hidden_states, cu_seqlens, cache.conv_hidden_state if cache is not None else None)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         
+        new_cache = None
         if cache is not None:
             new_cache = cache.update(key=key, value=value, conv_hidden_state=conv_hidden_state)
         
-        return hidden_states, key, value, conv_hidden_state
-
+        return hidden_states, new_cache
+    
     def forward_cross_packed(
         self,
         query_cos_sin: CosSin,
@@ -1047,7 +1048,7 @@ class URM_Inner(nn.Module):
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
         for layer in layers:
             pre_hidden_states = hidden_states
-            hidden_states = layer.forward_packed(
+            hidden_states, cache = layer.forward_packed(
                 cos_sin=cos_sin,
                 hidden_states=pre_hidden_states,
                 cu_seqlens=cu_seqlens,
