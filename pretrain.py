@@ -43,7 +43,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from logger import global_logger
 
 
-ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
 class EMAHelper(object):
@@ -342,9 +342,11 @@ def _separate_mode(config: PretrainConfig) -> str:
 
 def _normalize_forward_mode_name(mode: Any) -> ForwardMode:
     normalized = str(mode).lower()
-    if normalized not in {"standard", "answer_only", "prefix_lm"}:
+    if normalized == "causal":
+        normalized = "casual"
+    if normalized not in {"standard", "answer_only", "prefix_lm", "casual"}:
         raise ValueError(
-            "forward_mode must be one of standard, answer_only, or prefix_lm, "
+            "forward_mode must be one of standard, answer_only, prefix_lm, or casual, "
             f"got {mode!r}"
         )
     return normalized  # type: ignore[return-value]
@@ -376,14 +378,16 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     label_separate = _label_separate_enabled(config)
     forward_mode = _resolve_forward_mode(config)
     prefix_lm_mode = forward_mode == "prefix_lm"
+    casual_lm_mode = forward_mode == "casual"
+    autoregressive_mode = forward_mode in {"prefix_lm", "casual"}
     answer_only_mode = forward_mode in {"answer_only", "prefix_lm"}
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
-    if prefix_lm_mode and not config.mask_full_training:
-        raise ValueError("prefix_lm forward_mode currently requires mask_full_training=True.")
+    if autoregressive_mode and not config.mask_full_training:
+        raise ValueError(f"{forward_mode} forward_mode currently requires mask_full_training=True.")
     if config.mask_full_training and label_separate:
         raise ValueError("label_separate cannot be combined with mask_full_training.")
     if label_separate and online_aug is not None and online_aug.enabled:
@@ -397,9 +401,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            padding=bool(config.padding and not prefix_lm_mode),
+            padding=bool(config.padding and not autoregressive_mode),
             forward_mode=forward_mode,
-            casual=prefix_lm_mode,
+            casual=autoregressive_mode,
             data_fraction=data_fraction,
             grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,
@@ -428,6 +432,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         print("Evaluation split uses PuzzleDatasetSeparate with fully noised answer tokens.")
     elif prefix_lm_mode:
         print("Dataset uses prefix-LM ARC answer tokens without 30x30 answer padding.")
+    elif casual_lm_mode:
+        print("Dataset uses casual causal-LM ARC tokens without 30x30 answer padding.")
     elif answer_only_mode:
         print("Dataset emits answer-only labels for the target answer slots.")
     elif is_test and not config.mask_full_training:
@@ -1546,7 +1552,7 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
     early_eval: bool = False,
 ):
-    if _resolve_forward_mode(config) == "prefix_lm":
+    if _resolve_forward_mode(config) in {"prefix_lm", "casual"}:
         from autoregressive_eval import evaluate_autoregressive
 
         original_is_log = global_logger.is_log

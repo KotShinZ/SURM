@@ -279,6 +279,67 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertEqual(int(sample["seq_lengths"].item()), 3)
         self.assertEqual(int(sample["label_seq_lengths"].item()), 2)
 
+    def test_casual_forward_mode_uses_causal_labels_and_target_last(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            forward_mode="casual",
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        dataset.split = "train"
+
+        sample = dataset._build_pairs_sample(
+            [
+                (np.array([2, 3], dtype=np.int32), np.array([4, 5], dtype=np.int32)),
+                (np.array([6, 7], dtype=np.int32), np.array([8, 9], dtype=np.int32)),
+            ],
+            [((1, 2), (1, 2)), ((1, 2), (1, 2))],
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+
+        self.assertNotIn("label_seq_lengths", sample)
+        self.assertEqual(sample["inputs"].tolist(), [6, 7, 8, 9, 12, 2, 3, 1, 4, 5])
+        self.assertEqual(
+            sample["labels"].tolist(),
+            [7, 8, 9, 12, IGNORE_LABEL_ID, IGNORE_LABEL_ID, IGNORE_LABEL_ID, 4, 5, 12],
+        )
+        self.assertEqual(
+            sample["answer_mask"].tolist(),
+            [False, False, False, False, False, False, False, True, True, True],
+        )
+        self.assertEqual(int(sample["seq_lengths"].item()), 10)
+
+    def test_casual_eval_batch_hides_target_size_fields(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            forward_mode="casual",
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        dataset.split = "test"
+
+        sample = dataset._build_pairs_sample(
+            [
+                (np.array([2, 3], dtype=np.int32), np.array([4, 5], dtype=np.int32)),
+                (np.array([6, 7], dtype=np.int32), np.array([8, 9], dtype=np.int32)),
+            ],
+            [((1, 2), (1, 2)), ((1, 2), (1, 2))],
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+        batch = dataset._collate_built_samples([sample], np.array([123], dtype=np.int64))
+
+        self.assertNotIn("labels", batch)
+        self.assertNotIn("answer_mask", batch)
+        self.assertNotIn("position_ids", batch)
+        self.assertIn("prompt_position_ids", batch)
+        self.assertEqual(batch["inputs"].tolist(), [6, 7, 8, 9, 12, 2, 3])
+
     def test_answer_only_forward_mode_uses_answer_only_labels_with_padding(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
         dataset.config = _config(

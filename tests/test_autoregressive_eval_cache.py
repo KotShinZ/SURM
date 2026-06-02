@@ -27,6 +27,7 @@ from autoregressive_eval import (  # noqa: E402
     _generate_sample_slow,
     _supports_prefix_lm_kv_cache,
 )
+from models.losses import IGNORE_LABEL_ID  # noqa: E402
 from models.urm.urm import URM  # noqa: E402
 
 
@@ -81,6 +82,51 @@ class AutoregressiveEvalCacheTests(unittest.TestCase):
             "seq_offsets": torch.tensor([0, 6], dtype=torch.int32, device="cuda"),
             "label_seq_lengths": torch.tensor([3], dtype=torch.int32, device="cuda"),
             "label_seq_offsets": torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+            "puzzle_identifiers": torch.tensor([0], dtype=torch.int64, device="cuda"),
+        }
+
+        self.assertTrue(_supports_prefix_lm_kv_cache(model))
+        with torch.inference_mode():
+            _slow_batch, slow_preds, slow_metrics = _generate_sample_slow(
+                model,
+                batch,
+                0,
+                start_token_id=1,
+            )
+            _cached_batch, cached_preds, cached_metrics = _generate_sample_cached(
+                model,
+                batch,
+                0,
+                start_token_id=1,
+            )
+
+        self.assertEqual(slow_preds["preds"].tolist(), cached_preds["preds"].tolist())
+        self.assertEqual(slow_metrics, cached_metrics)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for flash-attention decode")
+    def test_cached_casual_decode_matches_full_causal_decode(self) -> None:
+        torch.manual_seed(0)
+        model = URM(_urm_config(forward_mode="casual")).cuda().eval()
+        batch = {
+            "inputs": torch.tensor([2, 3, 4, 1, 9, 10], dtype=torch.int32, device="cuda"),
+            "labels": torch.tensor(
+                [IGNORE_LABEL_ID, IGNORE_LABEL_ID, IGNORE_LABEL_ID, 9, 10, 11],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            "answer_mask": torch.tensor([False, False, False, True, True, True], dtype=torch.bool, device="cuda"),
+            "source_inputs": torch.tensor([2, 3, 4, 9, 10, 11], dtype=torch.int32, device="cuda"),
+            "position_ids": torch.stack(
+                [
+                    torch.zeros(6, dtype=torch.int32, device="cuda"),
+                    torch.zeros(6, dtype=torch.int32, device="cuda"),
+                    torch.arange(6, dtype=torch.int32, device="cuda"),
+                    torch.zeros(6, dtype=torch.int32, device="cuda"),
+                ],
+                dim=1,
+            ),
+            "seq_lengths": torch.tensor([6], dtype=torch.int32, device="cuda"),
+            "seq_offsets": torch.tensor([0, 6], dtype=torch.int32, device="cuda"),
             "puzzle_identifiers": torch.tensor([0], dtype=torch.int64, device="cuda"),
         }
 

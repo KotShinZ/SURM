@@ -63,7 +63,7 @@ def _normalize_attention_window_sizes(
     return normalized_window_sizes
 
 
-ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
 class URMConfig(BaseModel):
@@ -143,6 +143,8 @@ class URMConfig(BaseModel):
 
     @model_validator(mode="after")
     def _normalize_forward_mode(self):
+        if self.forward_mode == "causal":
+            self.forward_mode = "casual"
         if self.forward_mode == "standard":
             if self.prefix_lm:
                 self.forward_mode = "prefix_lm"
@@ -154,6 +156,9 @@ class URMConfig(BaseModel):
             self.prefix_lm = True
         elif self.forward_mode == "answer_only":
             self.answer_only = True
+            self.prefix_lm = False
+        elif self.forward_mode == "casual":
+            self.answer_only = False
             self.prefix_lm = False
         return self
 
@@ -170,7 +175,7 @@ class URMBlock(nn.Module):
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            causal=False,
+            causal=config.forward_mode == "casual",
             attn_dropout=config.attn_dropout,
             attention_type=attention_type,
             attention_window_size=attention_window_size,

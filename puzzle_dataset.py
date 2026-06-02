@@ -15,7 +15,8 @@ from data.online_aug import OnlineAugConfig, apply_online_aug
 
 
 ARC_MAX_GRID_SIZE = 30
-ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+ARC_EOS_TOKEN_ID = 1
+ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
 class MaskedInputConfig(pydantic.BaseModel):
@@ -197,11 +198,13 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
 
     @pydantic.model_validator(mode="after")
     def _validate_training_sampling(self):
+        if self.forward_mode == "causal":
+            self.forward_mode = "casual"
         if self.forward_mode == "standard" and self.casual:
             self.forward_mode = "prefix_lm"
         if self.forward_mode in {"answer_only", "prefix_lm"}:
             self.answer_only_labels = True
-        if self.forward_mode == "prefix_lm":
+        if self.forward_mode in {"prefix_lm", "casual"}:
             self.casual = True
 
         if self.examples_per_puzzle is not None and self.examples_per_puzzle <= 0:
@@ -272,7 +275,10 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
         return bool(self.answer_only_labels or self.forward_mode in {"answer_only", "prefix_lm"})
 
     def uses_prefix_lm(self) -> bool:
-        return bool(self.casual or self.forward_mode == "prefix_lm")
+        return bool(self.casual or self.forward_mode in {"prefix_lm", "casual"})
+
+    def uses_casual_lm(self) -> bool:
+        return self.forward_mode == "casual"
 
 
 class PuzzleDataset(IterableDataset):
@@ -284,6 +290,7 @@ class PuzzleDataset(IterableDataset):
         self.config = config
         self.split = split
         self.metadata = self._load_metadata()
+        self._configure_casual_lm_end_token()
         
         # Checks
         assert self.config.global_batch_size % self.config.num_replicas == 0, f"Global batch size {self.config.global_batch_size} must be multiples of nodes {self.config.num_replicas}."
@@ -296,6 +303,36 @@ class PuzzleDataset(IterableDataset):
     def _load_metadata(self) -> PuzzleDatasetMetadata:
         with open(os.path.join(self.config.dataset_path, self.split, "dataset.json"), "r") as f:
             return PuzzleDatasetMetadata(**json.load(f))
+
+    def _configure_casual_lm_end_token(self) -> None:
+        self.casual_lm_end_token_id: Optional[int] = None
+        if not self.config.uses_casual_lm():
+            return
+
+        self.casual_lm_end_token_id = int(self.metadata.vocab_size)
+        self.metadata.vocab_size = int(self.metadata.vocab_size) + 1
+
+    def _casual_lm_end_token_id(self) -> int:
+        token_id = getattr(self, "casual_lm_end_token_id", None)
+        if token_id is not None:
+            return int(token_id)
+        return int(self.metadata.vocab_size)
+
+    def _strip_casual_eval_targets(self, batch: dict) -> dict:
+        if not self.config.uses_casual_lm():
+            return batch
+
+        if "position_ids" in batch:
+            batch["prompt_position_ids"] = batch.pop("position_ids")
+        for key in (
+            "labels",
+            "answer_mask",
+            "label_seq_lengths",
+            "label_seq_offsets",
+            "label_seq_shapes",
+        ):
+            batch.pop(key, None)
+        return batch
 
     def _lazy_load_dataset(self):
         if self._data is not None:
@@ -926,6 +963,9 @@ class PuzzleDataset(IterableDataset):
                 ).astype(np.int32, copy=False)
         if "seq_shapes" in batch:
             del batch["seq_shapes"]
+
+        if not make_masked_inputs:
+            batch = self._strip_casual_eval_targets(batch)
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
