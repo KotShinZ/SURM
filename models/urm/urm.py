@@ -53,34 +53,13 @@ class URMInferenceCache:
 def _normalize_attention_window_sizes(
     attention_window_size: Union[int, List[int]],
     num_layers: int,
-    config_name: str,
 ) -> List[int]:
     if isinstance(attention_window_size, (list, tuple)):
         layer_window_sizes = [int(window_size) for window_size in attention_window_size]
     else:
         layer_window_sizes = [int(attention_window_size)] * num_layers
 
-    if len(layer_window_sizes) != num_layers:
-        raise ValueError(
-            f"{config_name} must have exactly {num_layers} entries, but got {len(layer_window_sizes)}"
-        )
-
-    normalized_window_sizes = []
-    for layer_idx, window_size in enumerate(layer_window_sizes):
-        if window_size == -1:
-            normalized_window_sizes.append(-1)
-            continue
-        if window_size < 0:
-            raise ValueError(
-                f"{config_name}[{layer_idx}] must be -1 or a non-negative even integer, but got {window_size}"
-            )
-        if window_size % 2 != 0:
-            raise ValueError(
-                f"{config_name}[{layer_idx}] must be even so it can be split symmetrically, but got {window_size}"
-            )
-        normalized_window_sizes.append(window_size // 2)
-
-    return normalized_window_sizes
+    return [-1 if window_size == -1 else window_size // 2 for window_size in layer_window_sizes]
 
 
 ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
@@ -308,25 +287,8 @@ class URM_Inner(nn.Module):
         self.padded_grid_height = self.config.grid_height
         self.padded_grid_width = self.config.grid_width
         self.padded_seq_len = self.config.seq_len
-        if self.config.H_cycles < 1:
-            raise ValueError(f"H_cycles must be >= 1, got {self.config.H_cycles}")
-        if self.config.L_cycles < 1:
-            raise ValueError(f"L_cycles must be >= 1, got {self.config.L_cycles}")
-        if self.config.H_layers < 0:
-            raise ValueError(f"H_layers must be >= 0, got {self.config.H_layers}")
-        if self.config.L_layers < 0:
-            raise ValueError(f"L_layers must be >= 0, got {self.config.L_layers}")
-        if self.config.grad_H_cycles < 1:
-            raise ValueError(f"grad_H_cycles must be >= 1, got {self.config.grad_H_cycles}")
-        if self.config.grad_H_cycles > self.config.H_cycles:
-            raise ValueError(
-                f"grad_H_cycles must be <= H_cycles, got {self.config.grad_H_cycles} > {self.config.H_cycles}"
-            )
         self.use_hrm = self.config.H_layers > 0
         self.L_layers = self.config.L_layers if self.use_hrm and self.config.L_layers > 0 else self.config.num_layers
-
-        if self.config.variable_seq_lengths and self.config.patch_io_enabled:
-            raise ValueError("variable_seq_lengths is not supported with patch_io_enabled")
 
         if self.config.patch_io_enabled:
             if self.config.grid_height > 0 or self.config.grid_width > 0:
@@ -368,73 +330,6 @@ class URM_Inner(nn.Module):
             self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
-        if self.config.num_memory_tokens < 0:
-            raise ValueError(f"num_memory_tokens must be >= 0, got {self.config.num_memory_tokens}")
-        if self.config.answer_initial_random_std < 0:
-            raise ValueError(
-                "answer_initial_random_std must be >= 0, "
-                f"got {self.config.answer_initial_random_std}"
-            )
-        if self.config.label_separate_C_noise_scale < 0:
-            raise ValueError(
-                "label_separate_C_noise_scale must be >= 0, "
-                f"got {self.config.label_separate_C_noise_scale}"
-            )
-        if self._separate_mode() not in {"C", "D"}:
-            raise ValueError(f"SeparateMode must be 'C' or 'D', got {self._separate_mode()!r}")
-        if self.config.answer_initial_C_noise_scale < 0:
-            raise ValueError(
-                "answer_initial_C_noise_scale must be >= 0, "
-                f"got {self.config.answer_initial_C_noise_scale}"
-            )
-        if self.config.answer_initial_C_beta_alpha <= 0:
-            raise ValueError(
-                "answer_initial_C_beta_alpha must be > 0, "
-                f"got {self.config.answer_initial_C_beta_alpha}"
-            )
-        if self.config.answer_initial_C_beta_beta <= 0:
-            raise ValueError(
-                "answer_initial_C_beta_beta must be > 0, "
-                f"got {self.config.answer_initial_C_beta_beta}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_min <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_min must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_min}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_max <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_max must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_max}"
-            )
-        if self.config.answer_initial_D_ratio_min > self.config.answer_initial_D_ratio_max:
-            raise ValueError(
-                "answer_initial_D_ratio_min must be <= answer_initial_D_ratio_max, "
-                f"got {self.config.answer_initial_D_ratio_min} > {self.config.answer_initial_D_ratio_max}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_mean <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_mean must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_mean}"
-            )
-        if self.config.answer_initial_D_ratio_std < 0:
-            raise ValueError(
-                "answer_initial_D_ratio_std must be >= 0, "
-                f"got {self.config.answer_initial_D_ratio_std}"
-            )
-        if self.config.answer_initial_random_token_min < 0:
-            raise ValueError(
-                "answer_initial_random_token_min must be >= 0, "
-                f"got {self.config.answer_initial_random_token_min}"
-            )
-        if (
-            self.config.patch_io_enabled
-            and self.config.answer_initial_mode in {"noised_label_C", "noised_label_D"}
-        ):
-            raise ValueError(
-                "noised_label_C/noised_label_D answer initialization requires token embeddings "
-                "and is not supported with patch_io_enabled."
-            )
         self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
 
         if self.config.num_memory_tokens > 0:
@@ -504,7 +399,6 @@ class URM_Inner(nn.Module):
         self.layer_attention_window_sizes = _normalize_attention_window_sizes(
             self.inner_config.attention_window_size,
             self.L_layers,
-            "URMConfig.attention_window_size",
         )
         self.layers = nn.ModuleList(
             [
@@ -518,7 +412,6 @@ class URM_Inner(nn.Module):
             self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
                 self.inner_config.attention_window_size,
                 self.config.H_layers,
-                "URMConfig.attention_window_size",
             )
             self.H_layers = nn.ModuleList(
                 [
@@ -526,10 +419,6 @@ class URM_Inner(nn.Module):
                     for layer_idx in range(self.config.H_layers)
                 ]
             )
-        if self.config.prelude_layers < 0:
-            raise ValueError(f"prelude_layers must be >= 0, got {self.config.prelude_layers}")
-        if self.config.coda_layers < 0:
-            raise ValueError(f"coda_layers must be >= 0, got {self.config.coda_layers}")
         self.prelude_layers = nn.ModuleList(
             [
                 URMBlock(self.inner_config, attention_window_size=-1)
@@ -542,10 +431,6 @@ class URM_Inner(nn.Module):
                 for _ in range(self.config.coda_layers)
             ]
         )
-        if self.config.answer_only_context_layers < 0:
-            raise ValueError(
-                f"answer_only_context_layers must be >= 0, got {self.config.answer_only_context_layers}"
-            )
         self.context_layers = nn.ModuleList(
             [
                 URMBlock(self.inner_config, attention_window_size=-1)
@@ -572,15 +457,11 @@ class URM_Inner(nn.Module):
 
     def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim == 3:
-            if input.shape[-1] != self.config.vocab_size:
-                raise ValueError("one-hot inputs must have vocab_size as the last dimension")
             return input.to(self.forward_dtype)
         return F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
 
     def _patchify(self, pixels: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, channels = pixels.shape
-        if seq_len != self.config.seq_len:
-            raise ValueError("patch IO input sequence length must match config.seq_len")
+        batch_size, _, channels = pixels.shape
 
         if self.config.grid_height > 0 and self.config.grid_width > 0:
             pixels = pixels.view(batch_size, self.config.grid_height, self.config.grid_width, channels)
@@ -608,10 +489,8 @@ class URM_Inner(nn.Module):
         return pixels.reshape(batch_size, self.inner_seq_len, self.patch_area * channels)
 
     def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, patch_dim = patches.shape
+        batch_size = patches.shape[0]
         channels = self.config.patch_pre_embedding_size
-        if seq_len != self.inner_seq_len or patch_dim != self.patch_area * channels:
-            raise ValueError("patch IO head output has an unexpected shape")
 
         if self.config.grid_height > 0 and self.config.grid_width > 0:
             pixels = patches.reshape(
@@ -853,40 +732,27 @@ class URM_Inner(nn.Module):
         token_positions = torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
         return token_positions + seq_ids * self.prefix_seq_len + self.prefix_seq_len
 
-    def _packed_puzzle_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _packed_prefix_indices(
+        self,
+        batch: Dict[str, torch.Tensor],
+        start: int = 0,
+        length: Optional[int] = None,
+    ) -> torch.Tensor:
         batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.puzzle_emb_len == 0 or batch_size == 0:
+        length = self.prefix_seq_len if length is None else length
+        if length == 0 or batch_size == 0:
             return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
 
         data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        prefix_offsets = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
-        return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
-
-    def _packed_memory_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.config.num_memory_tokens == 0 or batch_size == 0:
-            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
-
-        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        memory_offsets = torch.arange(self.config.num_memory_tokens, device=batch["inputs"].device, dtype=torch.long)
-        return (seq_offsets[:, None] + self.puzzle_emb_len + memory_offsets[None, :]).reshape(-1)
-
-    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.prefix_seq_len == 0 or batch_size == 0:
-            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
-
-        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        prefix_offsets = torch.arange(self.prefix_seq_len, device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = (
+            data_offsets
+            + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
+            + start
+        )
+        prefix_offsets = torch.arange(length, device=batch["inputs"].device, dtype=torch.long)
         return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
 
     def _input_embeddings_packed(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.config.patch_io_enabled:
-            raise ValueError("Packed variable-length data is not supported with patch_io_enabled")
-
         token_embedding = self.embed_tokens(batch["inputs"].to(torch.int32))
         token_indices = self._packed_data_token_indices(batch)
 
@@ -899,11 +765,11 @@ class URM_Inner(nn.Module):
                 pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
                 if pad_count > 0:
                     puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-                embedding[self._packed_puzzle_indices(batch)] = puzzle_embedding.view(-1, self.config.hidden_size)
+                embedding[self._packed_prefix_indices(batch, length=self.puzzle_emb_len)] = puzzle_embedding.view(-1, self.config.hidden_size)
             if self.config.num_memory_tokens > 0:
                 batch_size = batch["puzzle_identifiers"].shape[0]
                 memory_embedding = self.memory_tokens.to(device=token_embedding.device).expand(batch_size, -1, -1)
-                embedding[self._packed_memory_indices(batch)] = memory_embedding.reshape(-1, self.config.hidden_size)
+                embedding[self._packed_prefix_indices(batch, start=self.puzzle_emb_len, length=self.config.num_memory_tokens)] = memory_embedding.reshape(-1, self.config.hidden_size)
         else:
             embedding = token_embedding
 
@@ -969,7 +835,7 @@ class URM_Inner(nn.Module):
         cos = cos[flat_ids]
         sin = sin[flat_ids]
         if self.config.num_memory_tokens > 0:
-            memory_indices = self._packed_memory_indices(batch)
+            memory_indices = self._packed_prefix_indices(batch, start=self.puzzle_emb_len, length=self.config.num_memory_tokens)
             cos = cos.clone()
             sin = sin.clone()
             cos[memory_indices] = 1
@@ -1082,8 +948,6 @@ class URM_Inner(nn.Module):
             (RotaryEmbedding2D, RotaryEmbedding3D, RotaryEmbedding4D),
         ):
             return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.prefix_seq_len)
-        if isinstance(self.rotary_emb, (RotaryEmbedding3D, RotaryEmbedding4D)):
-            raise ValueError(f"{type(self.rotary_emb).__name__} requires explicit position_ids in the batch.")
         cos_sin = self.rotary_emb()
         if self.config.num_memory_tokens == 0:
             return cos_sin
@@ -1582,11 +1446,6 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if not self.config.variable_seq_lengths:
-            raise ValueError("prefix_lm is currently implemented for packed variable-length batches only.")
-        if self.use_hrm:
-            raise ValueError("prefix_lm packed mode is not supported when H_layers > 0.")
-
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
@@ -1690,11 +1549,6 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if not self.config.variable_seq_lengths:
-            raise ValueError("answer_only is currently implemented for packed variable-length batches only.")
-        if self.use_hrm:
-            raise ValueError("answer_only packed mode is not supported when H_layers > 0.")
-
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
@@ -1933,11 +1787,6 @@ class URM(nn.Module):
             token_max = self.config.vocab_size - 1
         token_min = int(self.config.answer_initial_random_token_min)
         token_max = int(token_max)
-        if token_max < token_min:
-            raise ValueError(
-                "answer_initial_random_token_max must be >= answer_initial_random_token_min, "
-                f"got {token_max} < {token_min}"
-            )
 
         candidates = torch.arange(token_min, token_max + 1, dtype=torch.long, device=device)
         candidates = candidates[
@@ -1945,11 +1794,6 @@ class URM(nn.Module):
             & (candidates != int(self.config.answer_initial_eos_token_id))
         ]
         candidates = candidates[(0 <= candidates) & (candidates < self.config.vocab_size)]
-        if candidates.numel() == 0:
-            raise ValueError(
-                "answer_initial random token range has no valid tokens after excluding "
-                "pad/eos and clipping to vocab_size."
-            )
         return candidates
 
     def _random_non_special_tokens(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
@@ -1968,13 +1812,10 @@ class URM(nn.Module):
             return batch["answer_mask"].to(device=batch["inputs"].device, dtype=torch.bool)
         return batch["labels"] != -100
 
-    def _safe_label_tokens(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _label_embeddings(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         labels = labels.to(device=labels.device, dtype=torch.long)
         valid = (labels >= 0) & (labels < self.config.vocab_size)
-        return torch.where(valid, labels, torch.zeros_like(labels)), valid
-
-    def _label_embeddings(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        safe_labels, valid = self._safe_label_tokens(labels)
+        safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
         embeddings = self.inner.embed_tokens(safe_labels.to(torch.int32))
         return self.inner.embed_scale * embeddings, valid
 
@@ -1994,7 +1835,9 @@ class URM(nn.Module):
             embeddings, valid_labels = self._label_embeddings(labels)
             return embeddings, answer_mask & valid_labels
 
-        safe_labels, valid_labels = self._safe_label_tokens(labels)
+        labels = labels.to(device=labels.device, dtype=torch.long)
+        valid_labels = (labels >= 0) & (labels < self.config.vocab_size)
+        safe_labels = torch.where(valid_labels, labels, torch.zeros_like(labels))
         if replace_probs is None:
             replace_probs = self._sample_D_ratios(tuple(safe_labels.shape), safe_labels.device)
         replace_probs = replace_probs.to(device=safe_labels.device, dtype=torch.float32)
@@ -2035,8 +1878,6 @@ class URM(nn.Module):
             random_tokens = self._random_non_special_tokens((batch_size, seq_len), batch["inputs"].device)
             embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
         else:
-            if "labels" not in batch:
-                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
             replace_probs = None
             if mode == "noised_label_D":
                 replace_probs = self._sample_D_ratios(
@@ -2054,13 +1895,7 @@ class URM(nn.Module):
         labels = batch["labels"]
         if labels.numel() == batch["inputs"].numel():
             return labels[answer_data_mask]
-        if labels.numel() == int(answer_data_mask.sum().item()):
-            return labels
-        raise ValueError(
-            "Packed answer initialization expected labels to be either full sequence labels "
-            f"({batch['inputs'].numel()} tokens) or answer-only labels "
-            f"({int(answer_data_mask.sum().item())} tokens), got {labels.numel()}."
-        )
+        return labels
 
     def _make_packed_initial_hidden(self, batch: Dict[str, torch.Tensor], low: bool = False) -> torch.Tensor:
         lengths = self.inner._packed_lengths(batch)
@@ -2090,8 +1925,6 @@ class URM(nn.Module):
             embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
             valid_mask = torch.ones((answer_indices.numel(),), dtype=torch.bool, device=answer_indices.device)
         else:
-            if "labels" not in batch:
-                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
             answer_labels = self._packed_answer_labels(batch, answer_data_mask)
             replace_probs = None
             if mode == "noised_label_D":
