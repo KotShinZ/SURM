@@ -51,12 +51,10 @@ def apply_eval_overrides(
     config: PretrainConfig,
     *,
     batch_size: int,
-    autoregressive_eval_batch_size: Optional[int],
     loops: Optional[int],
     hidden_diff_threshold: Optional[float],
 ) -> None:
     config.global_batch_size = batch_size
-    config.autoregressive_eval_batch_size = autoregressive_eval_batch_size
     config.grad_accum_steps = 1
     config.load_checkpoint = None
     config.load_checkpoint_file = None
@@ -474,12 +472,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a saved URM checkpoint.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint file or directory.")
     parser.add_argument("--batch_size", type=int, default=4096, help="Evaluation global batch size.")
-    parser.add_argument(
-        "--autoregressive_eval_batch_size",
-        type=int,
-        default=None,
-        help="Optional per-rank inference batch size cap for prefix-LM autoregressive evaluation.",
-    )
     parser.add_argument("--hidden_diff_threshold", type=float, default=None, help="Override norm_diff_min/max.")
     parser.add_argument("--loops", type=int, default=None, help="Override model loop count.")
     parser.add_argument("--max_problems", type=int, default=None, help="Maximum number of test problems to evaluate.")
@@ -491,8 +483,6 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
-    if args.autoregressive_eval_batch_size is not None and args.autoregressive_eval_batch_size <= 0:
-        raise ValueError("--autoregressive_eval_batch_size must be positive when provided.")
     if args.max_problems is not None and args.max_problems <= 0:
         raise ValueError("--max_problems must be positive when provided.")
 
@@ -508,7 +498,6 @@ def main() -> None:
     apply_eval_overrides(
         config,
         batch_size=args.batch_size,
-        autoregressive_eval_batch_size=args.autoregressive_eval_batch_size,
         loops=args.loops,
         hidden_diff_threshold=args.hidden_diff_threshold,
     )

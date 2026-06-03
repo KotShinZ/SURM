@@ -301,16 +301,31 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         )
 
         self.assertNotIn("label_seq_lengths", sample)
-        self.assertEqual(sample["inputs"].tolist(), [6, 7, 8, 9, 12, 2, 3, 1, 4, 5])
+        self.assertEqual(sample["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3, 13, 4, 5])
         self.assertEqual(
             sample["labels"].tolist(),
-            [7, 8, 9, 12, IGNORE_LABEL_ID, IGNORE_LABEL_ID, IGNORE_LABEL_ID, 4, 5, 12],
+            [
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                4,
+                5,
+                12,
+            ],
         )
         self.assertEqual(
             sample["answer_mask"].tolist(),
-            [False, False, False, False, False, False, False, True, True, True],
+            [False, False, False, False, False, False, False, False, True, True, True],
         )
-        self.assertEqual(int(sample["seq_lengths"].item()), 10)
+        self.assertEqual(sample["position_ids"][2].tolist(), [0, 0, 0, 0])
+        self.assertEqual(sample["position_ids"][5].tolist(), [0, 0, 0, 0])
+        self.assertEqual(sample["position_ids"][8].tolist(), [0, 0, 0, 0])
+        self.assertEqual(int(sample["seq_lengths"].item()), 11)
 
     def test_casual_eval_batch_hides_target_size_fields(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
@@ -338,7 +353,7 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertNotIn("answer_mask", batch)
         self.assertNotIn("position_ids", batch)
         self.assertIn("prompt_position_ids", batch)
-        self.assertEqual(batch["inputs"].tolist(), [6, 7, 8, 9, 12, 2, 3])
+        self.assertEqual(batch["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3])
 
     def test_answer_only_forward_mode_uses_answer_only_labels_with_padding(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)

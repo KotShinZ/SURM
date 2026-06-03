@@ -188,7 +188,10 @@ def apply_rotary_pos_emb_4d(
 def apply_rotary_pos_emb_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     orig_dtype = x.dtype
     x = x.to(cos.dtype)
-    x_embed = (x * cos.unsqueeze(-2)) + (rotate_half(x) * sin.unsqueeze(-2))
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed.to(orig_dtype)
 
 
@@ -205,8 +208,14 @@ def apply_rotary_pos_emb_single_2d(
     half = x.shape[-1] // 2
     x_row, x_col = x[..., :half], x[..., half:]
 
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_row.ndim < x_row.ndim:
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -229,9 +238,17 @@ def apply_rotary_pos_emb_single_3d(
     )
     x_depth, x_row, x_col = torch.split(x, axis_dims, dim=-1)
 
-    x_depth = x_depth * cos_depth.unsqueeze(-2) + rotate_half(x_depth) * sin_depth.unsqueeze(-2)
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_depth.ndim < x_depth.ndim:
+        cos_depth = cos_depth.unsqueeze(-2)
+        sin_depth = sin_depth.unsqueeze(-2)
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_depth = x_depth * cos_depth + rotate_half(x_depth) * sin_depth
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_depth, x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -257,10 +274,20 @@ def apply_rotary_pos_emb_single_4d(
     )
     x_pair, x_io, x_row, x_col = torch.split(x, axis_dims, dim=-1)
 
-    x_pair = x_pair * cos_pair.unsqueeze(-2) + rotate_half(x_pair) * sin_pair.unsqueeze(-2)
-    x_io = x_io * cos_io.unsqueeze(-2) + rotate_half(x_io) * sin_io.unsqueeze(-2)
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_pair.ndim < x_pair.ndim:
+        cos_pair = cos_pair.unsqueeze(-2)
+        sin_pair = sin_pair.unsqueeze(-2)
+        cos_io = cos_io.unsqueeze(-2)
+        sin_io = sin_io.unsqueeze(-2)
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_pair = x_pair * cos_pair + rotate_half(x_pair) * sin_pair
+    x_io = x_io * cos_io + rotate_half(x_io) * sin_io
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_pair, x_io, x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -944,21 +971,33 @@ class Attention(nn.Module):
         
         batch_size = hidden_states.shape[0]
         query, key, value = self.project_query_key_value(hidden_states, cos_sin)
+        if query.ndim == 3:
+            query = query.unsqueeze(1)
+            key = key.unsqueeze(1)
+            value = value.unsqueeze(1)
         effective_window_size = self.attention_window_size if window_size == -1 else window_size
         if self.attention_type == "full":
             effective_window_size = -1
             
-        attn_output = flash_attn_with_kvcache(
-            q=query.contiguous(),
-            k_cache=key_cache,
-            v_cache=value_cache,
-            k=key.contiguous(),
-            v=value.contiguous(),
-            cache_seqlens=cache_seqlens.to(device=key_cache.device, dtype=torch.int32),
-            cache_batch_idx=cache_batch_idx,
-            causal=self.causal,
-            window_size=(effective_window_size, effective_window_size),
-        )
+        try:
+            attn_output = flash_attn_with_kvcache(
+                q=query.contiguous(),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                k=key.contiguous(),
+                v=value.contiguous(),
+                cache_seqlens=cache_seqlens.to(device=key_cache.device, dtype=torch.int32),
+                cache_batch_idx=cache_batch_idx,
+                causal=self.causal,
+                window_size=(effective_window_size, effective_window_size),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "flash_attn_with_kvcache failed with shapes "
+                f"q={tuple(query.shape)}, k={tuple(key.shape)}, v={tuple(value.shape)}, "
+                f"k_cache={tuple(key_cache.shape)}, v_cache={tuple(value_cache.shape)}, "
+                f"cache_seqlens={tuple(cache_seqlens.shape)}"
+            ) from exc
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]
 

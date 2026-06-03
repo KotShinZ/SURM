@@ -11,10 +11,7 @@ data_paths_test: []
 evaluators:
   - name: arc@ARC
 
-global_batch_size: 4608
-# Optional cap for autoregressive decoding. Use this when global_batch_size
-# is fine for loading/evaluator throughput but autoregressive inference OOMs.
-autoregressive_eval_batch_size: 8
+global_batch_size: 8
 load_checkpoint: /mnt/shared-storage-user/gaoxin1/project/TinyRecursiveModels/checkpoints/Arc2concept-aug-1000-ACT-torch/pretrain_att_arc2concept_8/step_96712
 checkpoint_path: ./eval_results
 seed: 0

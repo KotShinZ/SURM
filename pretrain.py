@@ -149,7 +149,9 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     eval_first: bool = False
     eval_save_outputs: List[str] = []
-    autoregressive_eval_batch_size: Optional[int] = None
+    eval_batch_size: Optional[int] = None
+    autoregressive_eval_max_new_tokens: Optional[int] = None
+    autoregressive_eval_cache_chunk_size: int = 64
 
     loop_deltas: List[str] = []
 
@@ -190,6 +192,7 @@ class PretrainConfig(pydantic.BaseModel):
     full_answer_initial_gamma_max: float = 1.0
     full_answer_initial_noise_token_min: int = 2
     full_answer_initial_noise_token_max: int = 11
+    full_casual_skip_loss_pairs: int = 1
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
@@ -211,6 +214,8 @@ class PretrainConfig(pydantic.BaseModel):
     def _normalize_casual_alias(self):
         if self.causal is not None:
             self.casual = bool(self.causal)
+        if self.eval_batch_size is not None and self.eval_batch_size <= 0:
+            raise ValueError("eval_batch_size must be positive when provided.")
         return self
 
 
@@ -418,6 +423,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
             full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
             full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
+            full_casual_skip_loss_pairs=config.full_casual_skip_loss_pairs,
             answer_only_labels=answer_only_mode,
             label_separate=label_separate,
             SeparateMode=_separate_mode(config),
@@ -1553,7 +1559,7 @@ def evaluate(
     early_eval: bool = False,
 ):
     if _resolve_forward_mode(config) in {"prefix_lm", "casual"}:
-        from autoregressive_eval import evaluate_autoregressive
+        from autoregressive_eval_URM import evaluate_autoregressive
 
         original_is_log = global_logger.is_log
         global_logger.is_log = False
@@ -1916,17 +1922,18 @@ def launch(hydra_config: DictConfig):
         evaluators = []
     else:
         try:
+            eval_global_batch_size = config.eval_batch_size or config.global_batch_size
             eval_loader, eval_metadata = create_dataloader(
                 config,
                 "test",
                 test_set_mode=True,
                 epochs_per_iter=1,
-                global_batch_size=config.global_batch_size,
+                global_batch_size=eval_global_batch_size,
                 rank=RANK,
                 world_size=WORLD_SIZE,
             )
             print("len(eval_loader) =", len(eval_loader))
-            print("eval_problem_counts =", len(eval_loader) * config.global_batch_size)
+            print("eval_problem_counts =", len(eval_loader) * eval_global_batch_size)
             print("eval_metadata =", eval_metadata)
             # Evaluators
             evaluators = create_evaluators(config, eval_metadata)

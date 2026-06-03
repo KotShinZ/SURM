@@ -36,18 +36,46 @@ class URMLayerInferenceCache:
     value: torch.Tensor
     seqlens: torch.Tensor
     conv_hidden_state: Optional[torch.Tensor] = None
+    cache_chunk_size: int = 1
+
+    def ensure_capacity(self, token_count: int) -> None:
+        next_seqlens = self.seqlens + token_count
+        required_cache_len = int(next_seqlens.max().item())
+        if self.key.shape[1] >= required_cache_len:
+            return
+
+        used_cache_len = int(self.seqlens.max().item()) if self.seqlens.numel() else 0
+        chunk_size = max(1, int(self.cache_chunk_size))
+        expanded_cache_len = ((required_cache_len + chunk_size - 1) // chunk_size) * chunk_size
+        updated_key = self.key.new_zeros((self.key.shape[0], expanded_cache_len, *self.key.shape[2:]))
+        updated_value = self.value.new_zeros((self.value.shape[0], expanded_cache_len, *self.value.shape[2:]))
+        if used_cache_len > 0:
+            updated_key[:, :used_cache_len] = self.key[:, :used_cache_len]
+            updated_value[:, :used_cache_len] = self.value[:, :used_cache_len]
+        self.key = updated_key
+        self.value = updated_value
     
     def update(self, key: torch.Tensor, value: torch.Tensor, conv_hidden_state: Optional[torch.Tensor] = None) -> "URMLayerInferenceCache":
-        updated_key = torch.cat([self.key, key], dim=1)
-        updated_value = torch.cat([self.value, value], dim=1)
-        updated_seqlens = self.seqlens + key.shape[1]
-        return replace(
-            self,
-            key=updated_key,
-            value=updated_value,
-            seqlens=updated_seqlens,
-            conv_hidden_state=conv_hidden_state if conv_hidden_state is not None else self.conv_hidden_state,
-        )
+        token_count = key.shape[1]
+        self.ensure_capacity(token_count)
+        next_seqlens = self.seqlens + token_count
+
+        if token_count == 1:
+            rows = torch.arange(self.seqlens.shape[0], device=self.seqlens.device)
+            positions = self.seqlens.to(device=self.seqlens.device, dtype=torch.long)
+            self.key[rows, positions] = key[:, 0]
+            self.value[rows, positions] = value[:, 0]
+        else:
+            for row_idx in range(int(self.seqlens.shape[0])):
+                start = int(self.seqlens[row_idx].item())
+                end = start + token_count
+                self.key[row_idx, start:end] = key[row_idx]
+                self.value[row_idx, start:end] = value[row_idx]
+
+        self.seqlens = next_seqlens
+        if conv_hidden_state is not None:
+            self.conv_hidden_state = conv_hidden_state
+        return self
 
 
 @dataclass
@@ -55,6 +83,7 @@ class URMInferenceCache:
     layers: List[List[URMLayerInferenceCache]]
     batch_size: int
     max_cache_len: int
+    cache_chunk_size: int = 1
 
 def _normalize_attention_window_sizes(
     attention_window_size: Union[int, List[int]],
@@ -198,6 +227,44 @@ class URMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
+    @staticmethod
+    def _pack_prefill_cache(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_cache_len: int,
+        conv_hidden_state: Optional[torch.Tensor],
+        cache_chunk_size: int = 1,
+    ) -> URMLayerInferenceCache:
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=key.device, dtype=torch.int32)
+        batch_size = int(lengths.shape[0])
+        cache_len = max(int(max_cache_len), int(lengths.max().item()) if lengths.numel() else 0)
+        key_cache = key.new_zeros((batch_size, cache_len, key.shape[-2], key.shape[-1]))
+        value_cache = value.new_zeros((batch_size, cache_len, value.shape[-2], value.shape[-1]))
+        for batch_idx in range(batch_size):
+            start = int(cu_seqlens[batch_idx].item())
+            end = int(cu_seqlens[batch_idx + 1].item())
+            length = end - start
+            if length > 0:
+                key_cache[batch_idx, :length] = key[start:end]
+                value_cache[batch_idx, :length] = value[start:end]
+
+        packed_conv_state = conv_hidden_state
+        if conv_hidden_state is not None and conv_hidden_state.ndim == 2 and conv_hidden_state.shape[0] == key.shape[0]:
+            tail_indices = cu_seqlens[1:].to(device=key.device, dtype=torch.long) - 1
+            valid_tail = lengths.to(device=key.device, dtype=torch.long) > 0
+            packed_conv_state = conv_hidden_state.new_zeros((batch_size, conv_hidden_state.shape[-1]))
+            if bool(valid_tail.any().item()):
+                packed_conv_state[valid_tail] = conv_hidden_state[tail_indices[valid_tail]]
+
+        return URMLayerInferenceCache(
+            key=key_cache,
+            value=value_cache,
+            seqlens=lengths,
+            conv_hidden_state=packed_conv_state,
+            cache_chunk_size=max(1, int(cache_chunk_size)),
+        )
+
     def forward(
         self,
         cos_sin: CosSin,
@@ -222,9 +289,13 @@ class URMBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cache: Optional[URMLayerInferenceCache] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[URMLayerInferenceCache]]:
         if cache is not None:
             decode_hidden_states = hidden_states.unsqueeze(1) if hidden_states.ndim == 2 else hidden_states
+            cache.ensure_capacity(int(decode_hidden_states.shape[1]))
             attn_output, key, value = self.self_attn.forward_decode(
                 cos_sin=cos_sin,
                 hidden_states=decode_hidden_states,
@@ -249,6 +320,15 @@ class URMBlock(nn.Module):
         new_cache = None
         if cache is not None:
             new_cache = cache.update(key=key, value=value, conv_hidden_state=conv_hidden_state)
+        elif collect_cache:
+            new_cache = self._pack_prefill_cache(
+                key=key,
+                value=value,
+                cu_seqlens=cu_seqlens,
+                max_cache_len=max_cache_len if max_cache_len is not None else max_seqlen,
+                conv_hidden_state=conv_hidden_state,
+                cache_chunk_size=cache_chunk_size if cache_chunk_size is not None else 1,
+            )
         
         return hidden_states, new_cache
     
@@ -1008,8 +1088,11 @@ class URM_Inner(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         cache: Optional[List[URMLayerInferenceCache]] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[List[URMLayerInferenceCache]]]:
-        new_cache = [] if cache is not None else None
+        new_cache = [] if cache is not None or collect_cache else None
         for i, layer in enumerate(layers):
             if cu_seqlens is not None:
                 if max_seqlen is None:
@@ -1020,6 +1103,9 @@ class URM_Inner(nn.Module):
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     cache=cache[i] if cache is not None else None,
+                    collect_cache=collect_cache,
+                    max_cache_len=max_cache_len,
+                    cache_chunk_size=cache_chunk_size,
                 )
                 if new_cache is not None:
                     new_cache.append(layer_cache)
@@ -1048,8 +1134,11 @@ class URM_Inner(nn.Module):
         force_injection: bool = False,
         add_noise: bool = True,
         cache: Optional[List[URMLayerInferenceCache]] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, Optional[List[URMLayerInferenceCache]]]:
-        new_cache = [] if cache is not None else None
+        new_cache = [] if cache is not None or collect_cache else None
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
         for layer_idx, layer in enumerate(layers):
             pre_hidden_states = hidden_states
@@ -1062,6 +1151,9 @@ class URM_Inner(nn.Module):
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     cache=cache[layer_idx] if cache is not None else None,
+                    collect_cache=collect_cache,
+                    max_cache_len=max_cache_len,
+                    cache_chunk_size=cache_chunk_size,
                 )
                 if new_cache is not None:
                     new_cache.append(layer_cache)
@@ -1095,11 +1187,14 @@ class URM_Inner(nn.Module):
         unrolled_idx: int = 0,
         cache: Optional[URMInferenceCache] = None,
         cache_loop_offset: int = 0,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[URMInferenceCache]]:
         expected_cache_loops = H_cycles * L_cycles if H_layers is None else H_cycles * (L_cycles + 1)
 
         loop_cache_idx = 0
-        new_cache_layers = list(cache.layers) if cache is not None else None
+        new_cache_layers = list(cache.layers) if cache is not None else ([] if collect_cache else None)
 
         def next_loop_cache() -> Optional[List[URMLayerInferenceCache]]:
             nonlocal loop_cache_idx
@@ -1112,7 +1207,10 @@ class URM_Inner(nn.Module):
         def append_loop_cache(layer_cache: Optional[List[URMLayerInferenceCache]]) -> None:
             if new_cache_layers is None:
                 return
-            new_cache_layers[cache_loop_offset + loop_cache_idx - 1] = layer_cache
+            if cache is None and collect_cache:
+                new_cache_layers.append(layer_cache)
+            else:
+                new_cache_layers[cache_loop_offset + loop_cache_idx - 1] = layer_cache
 
         no_grad_H_cycles = H_cycles - self.config.grad_H_cycles
         with torch.no_grad():
@@ -1132,6 +1230,9 @@ class URM_Inner(nn.Module):
                             layers=L_layers,
                             add_noise=False,
                             cache=next_loop_cache(),
+                            collect_cache=collect_cache,
+                            max_cache_len=max_cache_len,
+                            cache_chunk_size=cache_chunk_size,
                             **seq_info,
                         )
                         append_loop_cache(loop_new_cache)
@@ -1175,11 +1276,27 @@ class URM_Inner(nn.Module):
                         grad_hook_factory=grad_hook_factory,
                         unrolled_idx=unrolled_idx,
                         cache=next_loop_cache(),
+                        collect_cache=collect_cache,
+                        max_cache_len=max_cache_len,
+                        cache_chunk_size=cache_chunk_size,
                         **seq_info,
                     )
                     append_loop_cache(loop_new_cache)
 
-        new_cache = replace(cache, layers=new_cache_layers) if cache is not None else None
+        new_cache = None
+        if cache is not None:
+            new_cache = replace(cache, layers=new_cache_layers)
+        elif collect_cache:
+            cache_batch_size = 0
+            cu_for_size = seq_info.get("cu_seqlens")
+            if isinstance(cu_for_size, torch.Tensor):
+                cache_batch_size = int(cu_for_size.shape[0]) - 1
+            new_cache = URMInferenceCache(
+                layers=new_cache_layers if new_cache_layers is not None else [],
+                batch_size=cache_batch_size,
+                max_cache_len=int(max_cache_len) if max_cache_len is not None else 0,
+                cache_chunk_size=max(1, int(cache_chunk_size)) if cache_chunk_size is not None else 1,
+            )
         return hidden_states, low_hidden_states if H_layers is not None else None, diff_L, unrolled_idx, new_cache
 #endregion
   
@@ -1300,13 +1417,16 @@ class URM_Inner(nn.Module):
         batch: Dict[str, torch.Tensor],
         cache: Optional[URMInferenceCache] = None,
         cache_loop_offset: int = 0,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Union[
         Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]],
         Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor], Optional[URMInferenceCache]],
     ]:
-        if self.config.forward_mode == "prefix_lm":
+        if self.config.forward_mode == "prefix_lm" and cache is None and not return_cache:
             return self.forward_prefix_lm_packed(carry, batch)
-        if self.config.forward_mode == "answer_only":
+        if self.config.forward_mode == "answer_only" and cache is None and not return_cache:
             return self.forward_answer_only_packed(carry, batch)
         
         # create input
@@ -1315,6 +1435,14 @@ class URM_Inner(nn.Module):
             input_embeddings, token_indices = self._input_embeddings_packed(batch)
             cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
             cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+            decode_token_indices = token_indices if cache is not None else None
+            full_hidden_for_decode = carry.current_hidden if cache is not None else None
+            if cache is not None:
+                input_embeddings = input_embeddings[token_indices]
+                cos_sin = self._slice_packed_cos_sin(cos_sin, token_indices)
+                batch_size = int(batch["puzzle_identifiers"].shape[0])
+                cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int32, device=batch["inputs"].device)
+                max_seqlen = 1
             seq_info = dict(
                 cos_sin=cos_sin,
                 cu_seqlens=cu_seqlens,
@@ -1337,6 +1465,11 @@ class URM_Inner(nn.Module):
 
         hidden_states = carry.current_hidden
         low_hidden_states = carry.current_low_hidden
+        if is_packed and cache is not None:
+            assert decode_token_indices is not None
+            hidden_states = hidden_states[decode_token_indices]
+            if low_hidden_states is not None:
+                low_hidden_states = low_hidden_states[decode_token_indices]
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
@@ -1354,13 +1487,25 @@ class URM_Inner(nn.Module):
             unrolled_idx=_unrolled_idx,
             cache=cache,
             cache_loop_offset=cache_loop_offset,
+            collect_cache=return_cache and cache is None,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
         )
 
         # detach and store carry
+        carry_hidden_states = hidden_states
+        carry_low_hidden_states = low_hidden_states
+        if is_packed and cache is not None:
+            assert decode_token_indices is not None and full_hidden_for_decode is not None
+            carry_hidden_states = full_hidden_for_decode.clone()
+            carry_hidden_states[decode_token_indices] = hidden_states
+            if low_hidden_states is not None and carry.current_low_hidden is not None:
+                carry_low_hidden_states = carry.current_low_hidden.clone()
+                carry_low_hidden_states[decode_token_indices] = low_hidden_states
         new_carry = replace(
             carry,
-            current_hidden=hidden_states.detach(),
-            current_low_hidden=low_hidden_states.detach() if low_hidden_states is not None else None,
+            current_hidden=carry_hidden_states.detach(),
+            current_low_hidden=carry_low_hidden_states.detach() if carry_low_hidden_states is not None else None,
         )
         
         # coda layers
@@ -1372,14 +1517,20 @@ class URM_Inner(nn.Module):
 
         if is_packed:
             assert token_indices is not None and cu_seqlens is not None
-            output = self.lm_head(head_hidden_states[token_indices])
-            q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+            if cache is not None:
+                output = self.lm_head(head_hidden_states)
+                q_logits = self.q_head(head_hidden_states).to(torch.float32)
+            else:
+                output = self.lm_head(head_hidden_states[token_indices])
+                q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         else:
             output = self.lm_head(head_hidden_states)[:, self.prefix_seq_len:]
             q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
 
         if self.config.patch_io_enabled:
             output = self.post_head(self._unpatchify(output))
+        if cache is not None or return_cache:
+            return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L, new_cache
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
 
     forward_packed = forward
@@ -2184,9 +2335,20 @@ class URM(nn.Module):
         batch: Dict[str, torch.Tensor],
         compute_target_q=False,
         cache: Optional[URMInferenceCache] = None,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         if self.config.variable_seq_lengths:
-            return self._forward_packed(carry, batch, compute_target_q=compute_target_q, cache=cache)
+            return self._forward_packed(
+                carry,
+                batch,
+                compute_target_q=compute_target_q,
+                cache=cache,
+                return_cache=return_cache,
+                max_cache_len=max_cache_len,
+                cache_chunk_size=cache_chunk_size,
+            )
 
         carry, batch = self._align_variable_batch(carry, batch)
         new_steps = torch.where(carry.halted, 0, carry.steps)
@@ -2201,9 +2363,17 @@ class URM(nn.Module):
         new_carry = self._reset_fixed_carry(carry.halted, carry, new_current_data)
 
         cache_loop_offset = self._cache_loop_offset(cache, new_steps)
-        inner_result = self.inner(new_carry, new_current_data, cache=cache, cache_loop_offset=cache_loop_offset)
+        inner_result = self.inner(
+            new_carry,
+            new_current_data,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
+        )
         new_cache = None
-        if cache is None:
+        if cache is None and not return_cache:
             new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
         else:
             new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
@@ -2264,7 +2434,7 @@ class URM(nn.Module):
             ),
             outputs,
         )
-        if cache is not None:
+        if cache is not None or return_cache:
             return result[0], result[1], new_cache
         return result
 
@@ -2274,15 +2444,26 @@ class URM(nn.Module):
         batch: Dict[str, torch.Tensor],
         compute_target_q=False,
         cache: Optional[URMInferenceCache] = None,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
     ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         new_current_data = self._merge_packed_current_data(carry, batch)
         new_carry = self._reset_packed_carry(carry.halted, carry, new_current_data)
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
         cache_loop_offset = self._cache_loop_offset(cache, new_steps)
-        inner_result = self.inner(new_carry, new_current_data, cache=cache, cache_loop_offset=cache_loop_offset)
+        inner_result = self.inner(
+            new_carry,
+            new_current_data,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
+        )
         new_cache = None
-        if cache is None:
+        if cache is None and not return_cache:
             new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
         else:
             new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
@@ -2303,7 +2484,7 @@ class URM(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
         }
-        if self.config.forward_mode in {"answer_only", "prefix_lm"}:
+        if self.config.forward_mode in {"answer_only", "prefix_lm"} and "labels" in new_current_data and not return_cache:
             token_indices = self.inner._packed_data_token_indices(new_current_data)
             (
                 _answer_data_mask,
@@ -2351,6 +2532,6 @@ class URM(nn.Module):
             ),
             outputs,
         )
-        if cache is not None:
+        if cache is not None or return_cache:
             return result[0], result[1], new_cache
         return result

@@ -172,6 +172,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     full_answer_initial_gamma_max: float = 1.0
     full_answer_initial_noise_token_min: int = 2
     full_answer_initial_noise_token_max: int = 11
+    full_casual_skip_loss_pairs: int = 1
 
     # Forward/data mode. Legacy aliases below are kept for older configs.
     forward_mode: ForwardMode = "standard"
@@ -247,6 +248,11 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
             raise ValueError(
                 "full_answer_initial_noise_token_max must be >= full_answer_initial_noise_token_min, "
                 f"got {self.full_answer_initial_noise_token_max} < {self.full_answer_initial_noise_token_min}"
+            )
+        if self.full_casual_skip_loss_pairs < 0:
+            raise ValueError(
+                "full_casual_skip_loss_pairs must be >= 0, "
+                f"got {self.full_casual_skip_loss_pairs}"
             )
         if self.causal_lm_start_token_id < 0:
             raise ValueError(
