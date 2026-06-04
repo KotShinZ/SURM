@@ -569,21 +569,21 @@ class PuzzleFullDataset(PuzzleDataset):
             self._build_full_sample(dataset, example_indices, rng)
             for example_indices in sample_example_indices
         ]
-        min_sample = None
-        print("len samples ", len(samples))
-        for sample in samples:
-            if min_sample is None:
-                min_sample = sample
-            else:
-                if sample["inputs"].shape[0] < min_sample["inputs"].shape[0]:
-                    min_sample = sample
-                    break
-        print("inputs")
-        print(min_sample["inputs"])
-        print("labels")
-        print(min_sample["labels"])
-        print("position_ids")
-        print(min_sample["position_ids"])
+        # min_sample = None
+        # print("len samples ", len(samples))
+        # for sample in samples:
+        #     if min_sample is None:
+        #         min_sample = sample
+        #     else:
+        #         if sample["inputs"].shape[0] < min_sample["inputs"].shape[0]:
+        #             min_sample = sample
+        #             break
+        # print("inputs")
+        # print(min_sample["inputs"])
+        # print("labels")
+        # print(min_sample["labels"])
+        # print("position_ids")
+        # print(min_sample["position_ids"])
 
         batch = {
             "inputs": np.concatenate([sample["inputs"] for sample in samples]).astype(np.int32, copy=False),
