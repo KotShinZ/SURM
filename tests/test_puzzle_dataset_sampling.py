@@ -353,7 +353,9 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertNotIn("answer_mask", batch)
         self.assertNotIn("position_ids", batch)
         self.assertIn("prompt_position_ids", batch)
-        self.assertEqual(batch["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3])
+        self.assertEqual(batch["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3, 13])
+        self.assertEqual(tuple(batch["prompt_position_ids"].shape), (9, 4))
+        self.assertEqual(batch["prompt_position_ids"][-1].tolist(), [0, 0, 0, 0])
 
     def test_answer_only_forward_mode_uses_answer_only_labels_with_padding(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)

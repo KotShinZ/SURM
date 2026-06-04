@@ -227,27 +227,61 @@ def _prepare_prompt_batch(
     return prompt_batch, source_chunks, final_prompt_positions
 
 
-def _initial_special_positions(prompt_positions: List[torch.Tensor], position_dim: int) -> torch.Tensor:
-    rows = [
-        torch.zeros((position_dim,), dtype=torch.int32, device=positions.device)
-        for positions in prompt_positions
-    ]
-    if rows:
-        return torch.stack(rows, dim=0)
-    return torch.empty((0, position_dim), dtype=torch.int32)
+def _target_problem_position(
+    positions: torch.Tensor,
+    *,
+    skip_trailing_start_position: bool,
+    position_dim: int,
+) -> torch.Tensor:
+    fallback = torch.zeros((position_dim,), dtype=torch.int32, device=positions.device)
+    if positions.ndim != 2 or positions.shape[0] == 0:
+        return fallback
+
+    candidates = positions.to(dtype=torch.int32)
+    if skip_trailing_start_position and candidates.shape[0] > 1:
+        candidates = candidates[:-1]
+    if candidates.shape[0] == 0:
+        return fallback
+
+    if position_dim >= 4:
+        input_side = candidates[:, 1] == 0
+        if bool(input_side.any().item()):
+            return candidates[input_side][-1].clone()
+
+    return candidates[-1].clone()
 
 
-def _initial_answer_positions(prompt_positions: List[torch.Tensor], position_dim: int) -> torch.Tensor:
+def _initial_decode_positions(
+    prompt_positions: List[torch.Tensor],
+    *,
+    position_dim: int,
+    io_id: int,
+) -> torch.Tensor:
     rows = []
     for positions in prompt_positions:
         decode_position = torch.zeros((position_dim,), dtype=torch.int32, device=positions.device)
-        if position_dim >= 4 and positions.numel() > 0:
-            decode_position[:-2] = positions[-1, :-2]
-            decode_position[1] = 1
+        target_problem_position = _target_problem_position(
+            positions,
+            skip_trailing_start_position=True,
+            position_dim=position_dim,
+        )
+        if position_dim >= 4:
+            decode_position[:-2] = target_problem_position[:-2]
+            decode_position[1] = int(io_id)
+        elif position_dim > 2:
+            decode_position[:-2] = target_problem_position[:-2]
         rows.append(decode_position)
     if rows:
         return torch.stack(rows, dim=0)
     return torch.empty((0, position_dim), dtype=torch.int32)
+
+
+def _initial_special_positions(prompt_positions: List[torch.Tensor], position_dim: int) -> torch.Tensor:
+    return _initial_decode_positions(prompt_positions, position_dim=position_dim, io_id=0)
+
+
+def _initial_answer_positions(prompt_positions: List[torch.Tensor], position_dim: int) -> torch.Tensor:
+    return _initial_decode_positions(prompt_positions, position_dim=position_dim, io_id=1)
 
 
 def _run_prefill_to_cache(

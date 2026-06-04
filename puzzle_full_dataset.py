@@ -408,8 +408,13 @@ class PuzzleFullDataset(PuzzleDataset):
 
             if pair_pos == target_pair_index:
                 if casual_lm and self.split != "train":
-                    continue
-                if casual_lm:
+                    input_solution = np.array([self._casual_lm_start_token_id()], dtype=np.int32)
+                    label_solution = np.full(input_solution.shape, IGNORE_LABEL_ID, dtype=np.int32)
+                    answer_mask = np.ones(input_solution.shape, dtype=np.bool_)
+                    source_solution = input_solution
+                    solution_positions = self._casual_special_position()
+                    label_seq_shape = np.array([input_solution.shape[0]], dtype=np.int32)
+                elif casual_lm:
                     input_solution = self._prepend_casual_start_token(slot_solution)
                     label_solution = self._append_casual_end_token(slot_labels)
                     answer_mask = np.ones(input_solution.shape, dtype=np.bool_)

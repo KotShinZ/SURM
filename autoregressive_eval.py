@@ -259,18 +259,26 @@ def _advance_arc_position(row: int, col: int, token_id: int) -> Tuple[int, int]:
     return row, min(col + 1, 30 - 1)
 
 
-def _answer_position_prefix(prompt_positions: torch.Tensor) -> torch.Tensor:
+def _answer_position_prefix(prompt_positions: torch.Tensor, *, io_id: int = 1) -> torch.Tensor:
     if prompt_positions.ndim != 2 or prompt_positions.shape[0] == 0:
-        return torch.tensor([0, 1], dtype=torch.int32, device=prompt_positions.device)
+        return torch.tensor([0, int(io_id)], dtype=torch.int32, device=prompt_positions.device)
 
-    prefix = torch.zeros((prompt_positions.shape[1] - 2,), dtype=prompt_positions.dtype, device=prompt_positions.device)
-    if prompt_positions.shape[1] >= 4:
-        last_position = prompt_positions[-1]
-        prefix = last_position[:-2].clone()
-        prefix[0] = last_position[0]
-        prefix[1] = 1
-    elif prompt_positions.shape[1] > 2:
-        prefix = prompt_positions[-1, :-2].clone()
+    position_dim = int(prompt_positions.shape[1])
+    prefix = torch.zeros((position_dim - 2,), dtype=prompt_positions.dtype, device=prompt_positions.device)
+    candidates = prompt_positions
+    if candidates.shape[0] > 1:
+        candidates = candidates[:-1]
+
+    if position_dim >= 4:
+        input_side = candidates[:, 1] == 0
+        if bool(input_side.any().item()):
+            target_problem_position = candidates[input_side][-1]
+        else:
+            target_problem_position = candidates[-1]
+        prefix = target_problem_position[:-2].clone()
+        prefix[1] = int(io_id)
+    elif position_dim > 2:
+        prefix = candidates[-1, :-2].clone()
     return prefix
 
 
@@ -289,19 +297,29 @@ def _make_answer_positions_from_tokens(
         dtype = torch.int32
         device = generated_tokens.device
 
-    prefix = _answer_position_prefix(
+    answer_prefix = _answer_position_prefix(
         prompt_positions
         if prompt_positions.ndim == 2
-        else torch.empty((0, position_dim), dtype=dtype, device=device)
+        else torch.empty((0, position_dim), dtype=dtype, device=device),
+        io_id=1,
     )
-    if prefix.numel() + 2 != position_dim:
-        prefix = torch.zeros((max(position_dim - 2, 0),), dtype=dtype, device=device)
+    start_prefix = _answer_position_prefix(
+        prompt_positions
+        if prompt_positions.ndim == 2
+        else torch.empty((0, position_dim), dtype=dtype, device=device),
+        io_id=0,
+    )
+    if answer_prefix.numel() + 2 != position_dim:
+        answer_prefix = torch.zeros((max(position_dim - 2, 0),), dtype=dtype, device=device)
+    if start_prefix.numel() + 2 != position_dim:
+        start_prefix = torch.zeros((max(position_dim - 2, 0),), dtype=dtype, device=device)
 
     length = int(generated_tokens.numel()) + (1 if shifted else 0)
     positions = torch.zeros((length, position_dim), dtype=dtype, device=device)
     row = 0
     col = 0
     for idx in range(length):
+        prefix = start_prefix if shifted and idx == 0 else answer_prefix
         if prefix.numel() > 0:
             positions[idx, :-2] = prefix
         positions[idx, -2] = row

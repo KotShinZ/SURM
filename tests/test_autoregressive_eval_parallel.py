@@ -34,6 +34,11 @@ from autoregressive_eval import (  # noqa: E402
     _generate_casual_no_size_batch,
     _generate_batch_parallel_slow,
     _generate_sample_slow,
+    _make_answer_positions_from_tokens,
+)
+from autoregressive_eval_URM import (  # noqa: E402
+    _initial_answer_positions as _urm_initial_answer_positions,
+    _initial_special_positions as _urm_initial_special_positions,
 )
 
 
@@ -291,6 +296,57 @@ class AutoregressiveEvalParallelTests(unittest.TestCase):
         for final_batch, _preds, _metrics in results:
             self.assertIsNone(final_batch["labels"])
             self.assertIn("position_ids", final_batch)
+
+    def test_casual_no_size_positions_use_target_problem_pair_after_start(self) -> None:
+        prompt_positions = torch.tensor(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 1],
+                [0, 1, 0, 0],
+                [6, 0, 0, 0],
+                [6, 0, 0, 1],
+                [0, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        generated_tokens = torch.tensor([2, 3, 1], dtype=torch.long)
+
+        final_positions = _make_answer_positions_from_tokens(
+            generated_tokens,
+            prompt_positions,
+            shifted=False,
+        )
+        shifted_positions = _make_answer_positions_from_tokens(
+            generated_tokens,
+            prompt_positions,
+            shifted=True,
+        )
+
+        self.assertEqual(final_positions[:, 0].tolist(), [6, 6, 6])
+        self.assertEqual(final_positions[:, 1].tolist(), [1, 1, 1])
+        self.assertEqual(shifted_positions[:, 0].tolist(), [6, 6, 6, 6])
+        self.assertEqual(shifted_positions[:, 1].tolist(), [0, 1, 1, 1])
+
+    def test_urm_decode_positions_use_target_problem_pair_after_start(self) -> None:
+        prompt_positions = [
+            torch.tensor(
+                [
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 1],
+                    [0, 1, 0, 0],
+                    [6, 0, 0, 0],
+                    [6, 0, 0, 1],
+                    [0, 0, 0, 0],
+                ],
+                dtype=torch.int32,
+            )
+        ]
+
+        start_positions = _urm_initial_special_positions(prompt_positions, position_dim=4)
+        answer_positions = _urm_initial_answer_positions(prompt_positions, position_dim=4)
+
+        self.assertEqual(start_positions.tolist(), [[6, 0, 0, 0]])
+        self.assertEqual(answer_positions.tolist(), [[6, 1, 0, 0]])
 
 if __name__ == "__main__":
     unittest.main()
