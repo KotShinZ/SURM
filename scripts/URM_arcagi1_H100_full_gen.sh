@@ -5,7 +5,7 @@ mkdir -p $checkpoint_path
 
 torchrun --nproc-per-node 1 pretrain.py \
 data_path=data/arc1withgen-aug-1000 \
-arch=urm arch.loops=16 arch.H_cycles=1 arch.L_cycles=1 arch.num_layers=4 arch.hidden_size=512 \
+arch=urm arch.loops=8 arch.H_cycles=1 arch.L_cycles=1 arch.num_layers=4 arch.hidden_size=512 \
 arch.forward_mode=casual arch.answer_only_context_layers=0 arch.input_injection_enabled=True \
 arch.use_act=False arch.norm_diff_max=0.1 arch.norm_diff_min=0.001 \
 arch.loss.label_mask=0.0 \
@@ -15,7 +15,7 @@ grad_accum_steps=6 \
 epochs=100000 \
 eval_interval=10000 \
 eval_first=False \
-eval_batch_size=32 \
+eval_batch_size=64 \
 autoregressive_eval_cache_chunk_size=64 \
 puzzle_emb_lr=1e-2 \
 weight_decay=0.1 \

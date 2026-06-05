@@ -360,6 +360,9 @@ class PuzzleFullDataset(PuzzleDataset):
         source_chunks = []
         position_chunks = []
         label_seq_shape = None
+        target_label_tokens = None
+        target_label_positions = None
+        target_label_shape = None
 
         for pair_pos, ((problem, solution), shape_pair) in enumerate(zip(pairs, shapes)):
             skip_pair_loss = casual_lm and pair_pos < int(self.config.full_casual_skip_loss_pairs)
@@ -414,6 +417,9 @@ class PuzzleFullDataset(PuzzleDataset):
                     source_solution = input_solution
                     solution_positions = self._casual_special_position()
                     label_seq_shape = np.array([input_solution.shape[0]], dtype=np.int32)
+                    target_label_tokens = solution.astype(np.int32, copy=False)
+                    target_label_positions = self._make_position_ids(pair_pos, 1, label_shape)
+                    target_label_shape = np.array(label_shape, dtype=np.int32)
                 elif casual_lm:
                     input_solution = self._prepend_casual_start_token(slot_solution)
                     label_solution = self._append_casual_end_token(slot_labels)
@@ -491,6 +497,11 @@ class PuzzleFullDataset(PuzzleDataset):
                 raise ValueError("target_pair_index did not match any pair while building answer-only labels.")
             sample["label_seq_lengths"] = np.array(labels.shape[0], dtype=np.int32)
             sample["label_seq_shapes"] = np.array(label_seq_shape, dtype=np.int32)
+        if target_label_tokens is not None:
+            sample["target_labels"] = target_label_tokens.astype(np.int32, copy=False)
+            sample["target_position_ids"] = target_label_positions.astype(np.int32, copy=False)
+            sample["target_label_seq_lengths"] = np.array(target_label_tokens.shape[0], dtype=np.int32)
+            sample["target_label_seq_shapes"] = target_label_shape.astype(np.int32, copy=False)
         return sample
 
     def _build_full_sample(
@@ -618,6 +629,25 @@ class PuzzleFullDataset(PuzzleDataset):
                 [sample["label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
+        if "target_labels" in samples[0]:
+            batch["target_labels"] = np.concatenate(
+                [sample["target_labels"] for sample in samples]
+            ).astype(np.int32, copy=False)
+            batch["target_position_ids"] = np.concatenate(
+                [sample["target_position_ids"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+            batch["target_label_seq_lengths"] = np.array(
+                [int(sample["target_label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["target_label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["target_label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["target_label_seq_shapes"] = np.stack(
+                [sample["target_label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
 
         if self.config.uses_casual_lm() and self.split != "train":
             batch = self._strip_casual_eval_targets(batch)
@@ -652,6 +682,25 @@ class PuzzleFullDataset(PuzzleDataset):
             )
             batch["label_seq_shapes"] = np.stack(
                 [sample["label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+        if "target_labels" in samples[0]:
+            batch["target_labels"] = np.concatenate(
+                [sample["target_labels"] for sample in samples]
+            ).astype(np.int32, copy=False)
+            batch["target_position_ids"] = np.concatenate(
+                [sample["target_position_ids"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+            batch["target_label_seq_lengths"] = np.array(
+                [int(sample["target_label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["target_label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["target_label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["target_label_seq_shapes"] = np.stack(
+                [sample["target_label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
 

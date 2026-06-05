@@ -127,9 +127,12 @@ class AutoregressiveEvalURMTests(unittest.TestCase):
             "seq_lengths": torch.tensor([3], dtype=torch.int32),
             "seq_offsets": torch.tensor([0, 3], dtype=torch.int32),
             "puzzle_identifiers": torch.tensor([0], dtype=torch.int64),
+            "target_labels": torch.tensor([5], dtype=torch.int32),
+            "target_label_seq_lengths": torch.tensor([1], dtype=torch.int32),
+            "target_label_seq_offsets": torch.tensor([0, 1], dtype=torch.int32),
         }
 
-        final_batch, preds, _metrics = _generate_urm_batch(
+        final_batch, preds, metrics = _generate_urm_batch(
             model,
             batch,
             start_token_id=13,
@@ -144,6 +147,10 @@ class AutoregressiveEvalURMTests(unittest.TestCase):
         self.assertEqual(final_batch["position_ids"][generated_mask].tolist(), [[6, 1, 0, 0]])
         self.assertEqual([tokens.tolist() for tokens in model.decode_inputs], [[5]])
         self.assertEqual([positions.tolist() for positions in model.decode_positions], [[[6, 1, 0, 0]]])
+        self.assertEqual(metrics["count"], 1.0)
+        self.assertEqual(metrics["accuracy"], 1.0)
+        self.assertEqual(metrics["exact_accuracy"], 1.0)
+        self.assertEqual(metrics["steps"], 1.0)
 
 
 if __name__ == "__main__":

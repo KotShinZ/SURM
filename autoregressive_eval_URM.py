@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from data.common import PuzzleDatasetMetadata
+from models.losses import IGNORE_LABEL_ID
 from models.urm.urm import URMInferenceCache
 
 
@@ -307,10 +308,15 @@ def _run_prefill_to_cache(
     *,
     max_cache_len: int,
     cache_chunk_size: int,
-) -> Tuple[Dict[str, torch.Tensor], URMInferenceCache]:
+) -> Tuple[Dict[str, torch.Tensor], URMInferenceCache, torch.Tensor]:
     carry = base_model.initial_carry(prompt_batch)
     aggregate_layers = []
     outputs: Dict[str, torch.Tensor] = {}
+    steps = torch.zeros(
+        (int(prompt_batch["puzzle_identifiers"].shape[0]),),
+        dtype=torch.float32,
+        device=prompt_batch["inputs"].device,
+    )
     loops = int(getattr(getattr(base_model, "config", None), "loops", 1))
     for _ in range(max(1, loops)):
         carry, outputs, step_cache = base_model(
@@ -322,6 +328,8 @@ def _run_prefill_to_cache(
         )
         if step_cache is not None:
             aggregate_layers.extend(step_cache.layers)
+        if carry.steps is not None:
+            steps = carry.steps.to(device=prompt_batch["inputs"].device, dtype=torch.float32)
         if bool(carry.halted.all().item()):
             break
 
@@ -331,7 +339,7 @@ def _run_prefill_to_cache(
         max_cache_len=max_cache_len,
         cache_chunk_size=cache_chunk_size,
     )
-    return outputs, cache
+    return outputs, cache, steps
 
 
 def _decode_one_step_to_halt(
@@ -343,7 +351,7 @@ def _decode_one_step_to_halt(
     *,
     max_cache_len: int,
     cache_chunk_size: int,
-) -> Tuple[Dict[str, torch.Tensor], URMInferenceCache]:
+) -> Tuple[Dict[str, torch.Tensor], URMInferenceCache, torch.Tensor]:
     batch_size = int(input_tokens.shape[0])
     device = input_tokens.device
     seq_lengths = torch.ones((batch_size,), dtype=torch.int32, device=device)
@@ -357,6 +365,7 @@ def _decode_one_step_to_halt(
     carry = base_model.initial_carry(decode_batch)
     outputs: Dict[str, torch.Tensor] = {}
     updated_cache = cache
+    steps = torch.zeros((batch_size,), dtype=torch.float32, device=device)
     loops = int(getattr(getattr(base_model, "config", None), "loops", 1))
     for _ in range(max(1, loops)):
         carry, outputs, updated_cache = base_model(
@@ -366,9 +375,11 @@ def _decode_one_step_to_halt(
             max_cache_len=max_cache_len,
             cache_chunk_size=cache_chunk_size,
         )
+        if carry.steps is not None:
+            steps = carry.steps.to(device=device, dtype=torch.float32)
         if bool(carry.halted.all().item()):
             break
-    return outputs, updated_cache
+    return outputs, updated_cache, steps
 
 
 def _last_prompt_token_logits(
@@ -406,6 +417,58 @@ def _drop_eval_targets(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     return {key: value for key, value in batch.items() if key not in label_keys}
 
 
+def _target_label_chunks(batch: Dict[str, torch.Tensor], sample_count: int) -> List[Optional[torch.Tensor]]:
+    target_labels = batch.get("target_labels")
+    if target_labels is None:
+        return [None for _ in range(sample_count)]
+
+    offsets = batch.get("target_label_seq_offsets")
+    if offsets is not None:
+        offsets = offsets.to(device=target_labels.device, dtype=torch.long)
+        return [
+            target_labels[int(offsets[idx].item()) : int(offsets[idx + 1].item())]
+            for idx in range(sample_count)
+        ]
+
+    if target_labels.ndim >= 2 and int(target_labels.shape[0]) == sample_count:
+        return [target_labels[idx].reshape(-1) for idx in range(sample_count)]
+
+    if sample_count == 1:
+        return [target_labels.reshape(-1)]
+
+    return [None for _ in range(sample_count)]
+
+
+def _sample_metrics_from_generation(
+    target_tokens: Optional[torch.Tensor],
+    generated_tokens: torch.Tensor,
+    *,
+    steps: float,
+) -> Dict[str, float]:
+    if target_tokens is None:
+        return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "steps": 0.0}
+
+    target = target_tokens.reshape(-1).to(device=generated_tokens.device, dtype=generated_tokens.dtype)
+    generated = generated_tokens.reshape(-1)
+    valid = target != IGNORE_LABEL_ID
+    valid_count = int(valid.sum().item())
+    if valid_count == 0:
+        return {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "steps": 0.0}
+
+    common = min(int(target.numel()), int(generated.numel()))
+    correct = torch.zeros(target.shape, dtype=torch.bool, device=target.device)
+    if common > 0:
+        correct[:common] = generated[:common].to(target.dtype) == target[:common]
+    correct = correct & valid
+    exact = bool(int(generated.numel()) == int(target.numel()) and int(correct.sum().item()) == valid_count)
+    return {
+        "count": 1.0,
+        "accuracy": float(correct.sum().item()) / valid_count,
+        "exact_accuracy": 1.0 if exact else 0.0,
+        "steps": float(steps),
+    }
+
+
 def _final_sample_result(
     prompt_batch: Dict[str, torch.Tensor],
     source_chunks: List[torch.Tensor],
@@ -414,6 +477,8 @@ def _final_sample_result(
     generated_positions: torch.Tensor,
     generated_lengths: torch.Tensor,
     q_halt_logits: torch.Tensor,
+    target_tokens: Optional[torch.Tensor],
+    sample_steps: torch.Tensor,
     sample_idx: int,
 ) -> Tuple[Dict[str, Optional[torch.Tensor]], Dict[str, torch.Tensor], Dict[str, float]]:
     prompt_start = int(prompt_batch["seq_offsets"][sample_idx].item())
@@ -459,7 +524,15 @@ def _final_sample_result(
         "preds": preds,
         "q_halt_logits": q_halt_logits[sample_idx : sample_idx + 1].to(torch.float32),
     }
-    return final_batch, preds_dict, {"count": 0.0, "accuracy": 0.0, "exact_accuracy": 0.0, "steps": 0.0}
+    return (
+        final_batch,
+        preds_dict,
+        _sample_metrics_from_generation(
+            target_tokens,
+            sample_generated.to(torch.long),
+            steps=float(sample_steps[sample_idx].item()) if sample_steps.numel() else 0.0,
+        ),
+    )
 
 
 def _generate_urm_batch(
@@ -482,7 +555,7 @@ def _generate_urm_batch(
     max_prompt_len = int(prompt_batch["seq_lengths"].max().item()) if batch_size > 0 else 0
     prefix_seq_len = int(getattr(getattr(base_model, "inner", None), "prefix_seq_len", 0))
     max_cache_len = max_prompt_len + prefix_seq_len
-    prefill_outputs, cache = _run_prefill_to_cache(
+    prefill_outputs, cache, prefill_steps = _run_prefill_to_cache(
         base_model,
         prompt_batch,
         max_cache_len=max_cache_len,
@@ -497,6 +570,7 @@ def _generate_urm_batch(
     generated_positions = torch.zeros((batch_size, max_new_tokens, position_dim), dtype=torch.int32, device=device)
     generated_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
     answer_row_widths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+    sample_steps = torch.zeros((batch_size,), dtype=torch.float32, device=device)
     finished = torch.zeros((batch_size,), dtype=torch.bool, device=device)
     q_halt_logits = prefill_outputs.get(
         "q_halt_logits",
@@ -513,12 +587,14 @@ def _generate_urm_batch(
         next_tokens = torch.argmax(logits, dim=-1).to(torch.long)
         is_end = next_tokens == int(end_token_id)
         append_mask = ~finished & ~is_end
+        active_mask = ~finished
         generated_tokens[:, 0] = next_tokens
         generated_positions[:, 0] = torch.where(
             is_end.unsqueeze(-1),
             torch.zeros_like(next_answer_positions),
             next_answer_positions,
         )
+        sample_steps = torch.where(active_mask, prefill_steps.to(sample_steps.dtype), sample_steps)
         generated_lengths = generated_lengths + append_mask.to(torch.int32)
         finished = finished | is_end
         current_positions = torch.where(
@@ -548,7 +624,8 @@ def _generate_urm_batch(
         if bool(finished.all().item()):
             break
 
-        outputs, cache = _decode_one_step_to_halt(
+        active_mask = ~finished
+        outputs, cache, decode_steps = _decode_one_step_to_halt(
             base_model,
             cache,
             input_tokens,
@@ -570,6 +647,7 @@ def _generate_urm_batch(
             torch.zeros_like(next_answer_positions),
             next_answer_positions,
         )
+        sample_steps = torch.where(active_mask, decode_steps.to(sample_steps.dtype), sample_steps)
         generated_lengths = generated_lengths + append_mask.to(torch.int32)
         finished = finished | is_end
         current_positions = torch.where(
@@ -594,6 +672,7 @@ def _generate_urm_batch(
         )
         input_tokens = next_tokens
 
+    target_chunks = _target_label_chunks(batch, batch_size)
     return [
         _final_sample_result(
             prompt_batch,
@@ -603,6 +682,8 @@ def _generate_urm_batch(
             generated_positions,
             generated_lengths,
             q_halt_logits,
+            target_chunks[sample_idx],
+            sample_steps,
             sample_idx,
         )
         for sample_idx in range(batch_size)

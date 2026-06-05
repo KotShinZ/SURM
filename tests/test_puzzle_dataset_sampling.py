@@ -353,9 +353,15 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertNotIn("answer_mask", batch)
         self.assertNotIn("position_ids", batch)
         self.assertIn("prompt_position_ids", batch)
+        self.assertIn("target_labels", batch)
+        self.assertIn("target_position_ids", batch)
         self.assertEqual(batch["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3, 13])
         self.assertEqual(tuple(batch["prompt_position_ids"].shape), (9, 4))
         self.assertEqual(batch["prompt_position_ids"][-1].tolist(), [0, 0, 0, 0])
+        self.assertEqual(batch["target_labels"].tolist(), [4, 5])
+        self.assertEqual(batch["target_position_ids"].tolist(), [[1, 1, 0, 0], [1, 1, 0, 1]])
+        self.assertEqual(batch["target_label_seq_lengths"].tolist(), [2])
+        self.assertEqual(batch["target_label_seq_offsets"].tolist(), [0, 2])
 
     def test_casual_prompt_forced_with_target_tokens_matches_teacher_inputs(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
