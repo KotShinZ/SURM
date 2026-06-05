@@ -115,6 +115,7 @@ def _advance_positions(
     end_token_id: int,
     grid_height: int,
     grid_width: int,
+    row_widths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     next_positions = positions.clone()
     if positions.shape[-1] < 2:
@@ -124,8 +125,24 @@ def _advance_positions(
     cols = positions[:, -1]
     is_newline = token_ids == int(newline_token_id)
     is_end = token_ids == int(end_token_id)
-    next_rows = torch.where(is_newline, rows + 1, rows)
-    next_cols = torch.where(is_newline, torch.zeros_like(cols), cols + 1)
+
+    if row_widths is None:
+        next_rows = torch.where(is_newline, rows + 1, rows)
+        next_cols = torch.where(is_newline, torch.zeros_like(cols), cols + 1)
+    else:
+        widths = row_widths.to(device=positions.device, dtype=cols.dtype)
+        has_width = widths > 0
+
+        row_major_cols = cols + 1
+        row_major_wrap = row_major_cols >= widths.clamp_min(1)
+        row_major_rows = torch.where(row_major_wrap, rows + 1, rows)
+        row_major_cols = torch.where(row_major_wrap, torch.zeros_like(cols), row_major_cols)
+
+        token_rows = torch.where(is_newline, rows + 1, rows)
+        token_cols = torch.where(is_newline, torch.zeros_like(cols), cols + 1)
+        next_rows = torch.where(has_width, row_major_rows, token_rows)
+        next_cols = torch.where(has_width, row_major_cols, token_cols)
+
     next_rows = torch.where(is_end, rows, next_rows).clamp(min=0, max=max(grid_height - 1, 0))
     next_cols = torch.where(is_end, cols, next_cols).clamp(min=0, max=max(grid_width - 1, 0))
     next_positions[:, -2] = next_rows
@@ -354,6 +371,36 @@ def _decode_one_step_to_halt(
     return outputs, updated_cache
 
 
+def _last_prompt_token_logits(
+    logits: torch.Tensor,
+    prompt_batch: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    seq_lengths = prompt_batch["seq_lengths"].to(device=logits.device, dtype=torch.long)
+    if bool((seq_lengths <= 0).any().item()):
+        raise ValueError("Cannot generate from an empty prompt sequence.")
+
+    if logits.ndim == 3:
+        batch_indices = torch.arange(seq_lengths.shape[0], dtype=torch.long, device=logits.device)
+        return logits[batch_indices, seq_lengths - 1]
+
+    if logits.ndim == 2:
+        seq_offsets = prompt_batch["seq_offsets"].to(device=logits.device, dtype=torch.long)
+        return logits[seq_offsets[1:] - 1]
+
+    raise ValueError(f"Expected 2D or 3D logits, got shape={tuple(logits.shape)}.")
+
+
+def _prompt_ends_with_token(prompt_batch: Dict[str, torch.Tensor], token_id: int) -> bool:
+    seq_offsets = prompt_batch["seq_offsets"].to(device=prompt_batch["inputs"].device, dtype=torch.long)
+    if seq_offsets.numel() <= 1:
+        return False
+    lengths = seq_offsets[1:] - seq_offsets[:-1]
+    if bool((lengths <= 0).any().item()):
+        return False
+    last_tokens = prompt_batch["inputs"][seq_offsets[1:] - 1].to(torch.long)
+    return bool(torch.all(last_tokens == int(token_id)).item())
+
+
 def _drop_eval_targets(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     label_keys = {"labels", "answer_mask", "label_seq_lengths", "label_seq_offsets", "label_seq_shapes", "seq_shapes"}
     return {key: value for key, value in batch.items() if key not in label_keys}
@@ -449,6 +496,7 @@ def _generate_urm_batch(
     generated_tokens = torch.full((batch_size, max_new_tokens), int(end_token_id), dtype=torch.long, device=device)
     generated_positions = torch.zeros((batch_size, max_new_tokens, position_dim), dtype=torch.int32, device=device)
     generated_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+    answer_row_widths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
     finished = torch.zeros((batch_size,), dtype=torch.bool, device=device)
     q_halt_logits = prefill_outputs.get(
         "q_halt_logits",
@@ -459,7 +507,44 @@ def _generate_urm_batch(
     grid_height = int(getattr(config, "grid_height", 30) or 30)
     grid_width = int(getattr(config, "grid_width", 30) or 30)
 
-    for decode_step in range(int(max_new_tokens)):
+    decode_start = 0
+    if int(max_new_tokens) > 0 and _prompt_ends_with_token(prompt_batch, start_token_id):
+        logits = _last_prompt_token_logits(prefill_outputs["logits"], prompt_batch)
+        next_tokens = torch.argmax(logits, dim=-1).to(torch.long)
+        is_end = next_tokens == int(end_token_id)
+        append_mask = ~finished & ~is_end
+        generated_tokens[:, 0] = next_tokens
+        generated_positions[:, 0] = torch.where(
+            is_end.unsqueeze(-1),
+            torch.zeros_like(next_answer_positions),
+            next_answer_positions,
+        )
+        generated_lengths = generated_lengths + append_mask.to(torch.int32)
+        finished = finished | is_end
+        current_positions = torch.where(
+            is_end.unsqueeze(-1),
+            torch.zeros_like(next_answer_positions),
+            next_answer_positions,
+        )
+        first_newline_widths = next_answer_positions[:, -1] + 1
+        answer_row_widths = torch.where(
+            (answer_row_widths <= 0) & append_mask & (next_tokens == int(newline_token_id)),
+            first_newline_widths.to(answer_row_widths.dtype),
+            answer_row_widths,
+        )
+        next_answer_positions = _advance_positions(
+            next_answer_positions,
+            next_tokens,
+            newline_token_id=newline_token_id,
+            end_token_id=end_token_id,
+            grid_height=grid_height,
+            grid_width=grid_width,
+            row_widths=answer_row_widths,
+        )
+        input_tokens = next_tokens
+        decode_start = 1
+
+    for decode_step in range(decode_start, int(max_new_tokens)):
         if bool(finished.all().item()):
             break
 
@@ -492,6 +577,12 @@ def _generate_urm_batch(
             torch.zeros_like(next_answer_positions),
             next_answer_positions,
         )
+        first_newline_widths = next_answer_positions[:, -1] + 1
+        answer_row_widths = torch.where(
+            (answer_row_widths <= 0) & append_mask & (next_tokens == int(newline_token_id)),
+            first_newline_widths.to(answer_row_widths.dtype),
+            answer_row_widths,
+        )
         next_answer_positions = _advance_positions(
             next_answer_positions,
             next_tokens,
@@ -499,6 +590,7 @@ def _generate_urm_batch(
             end_token_id=end_token_id,
             grid_height=grid_height,
             grid_width=grid_width,
+            row_widths=answer_row_widths,
         )
         input_tokens = next_tokens
 
