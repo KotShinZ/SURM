@@ -30,40 +30,74 @@ class URMCarry:
     current_low_hidden: Optional[torch.Tensor] = None
 
 
+@dataclass
+class URMLayerInferenceCache:
+    key: torch.Tensor
+    value: torch.Tensor
+    seqlens: torch.Tensor
+    conv_hidden_state: Optional[torch.Tensor] = None
+    cache_chunk_size: int = 1
+
+    def ensure_capacity(self, token_count: int) -> None:
+        next_seqlens = self.seqlens + token_count
+        required_cache_len = int(next_seqlens.max().item())
+        if self.key.shape[1] >= required_cache_len:
+            return
+
+        used_cache_len = int(self.seqlens.max().item()) if self.seqlens.numel() else 0
+        chunk_size = max(1, int(self.cache_chunk_size))
+        expanded_cache_len = ((required_cache_len + chunk_size - 1) // chunk_size) * chunk_size
+        updated_key = self.key.new_zeros((self.key.shape[0], expanded_cache_len, *self.key.shape[2:]))
+        updated_value = self.value.new_zeros((self.value.shape[0], expanded_cache_len, *self.value.shape[2:]))
+        if used_cache_len > 0:
+            updated_key[:, :used_cache_len] = self.key[:, :used_cache_len]
+            updated_value[:, :used_cache_len] = self.value[:, :used_cache_len]
+        self.key = updated_key
+        self.value = updated_value
+    
+    def update(self, key: torch.Tensor, value: torch.Tensor, conv_hidden_state: Optional[torch.Tensor] = None) -> "URMLayerInferenceCache":
+        token_count = key.shape[1]
+        self.ensure_capacity(token_count)
+        next_seqlens = self.seqlens + token_count
+
+        if token_count == 1:
+            rows = torch.arange(self.seqlens.shape[0], device=self.seqlens.device)
+            positions = self.seqlens.to(device=self.seqlens.device, dtype=torch.long)
+            self.key[rows, positions] = key[:, 0]
+            self.value[rows, positions] = value[:, 0]
+        else:
+            for row_idx in range(int(self.seqlens.shape[0])):
+                start = int(self.seqlens[row_idx].item())
+                end = start + token_count
+                self.key[row_idx, start:end] = key[row_idx]
+                self.value[row_idx, start:end] = value[row_idx]
+
+        self.seqlens = next_seqlens
+        if conv_hidden_state is not None:
+            self.conv_hidden_state = conv_hidden_state
+        return self
+
+
+@dataclass
+class URMInferenceCache:
+    layers: List[List[URMLayerInferenceCache]]
+    batch_size: int
+    max_cache_len: int
+    cache_chunk_size: int = 1
+
 def _normalize_attention_window_sizes(
     attention_window_size: Union[int, List[int]],
     num_layers: int,
-    config_name: str,
 ) -> List[int]:
     if isinstance(attention_window_size, (list, tuple)):
         layer_window_sizes = [int(window_size) for window_size in attention_window_size]
     else:
         layer_window_sizes = [int(attention_window_size)] * num_layers
 
-    if len(layer_window_sizes) != num_layers:
-        raise ValueError(
-            f"{config_name} must have exactly {num_layers} entries, but got {len(layer_window_sizes)}"
-        )
-
-    normalized_window_sizes = []
-    for layer_idx, window_size in enumerate(layer_window_sizes):
-        if window_size == -1:
-            normalized_window_sizes.append(-1)
-            continue
-        if window_size < 0:
-            raise ValueError(
-                f"{config_name}[{layer_idx}] must be -1 or a non-negative even integer, but got {window_size}"
-            )
-        if window_size % 2 != 0:
-            raise ValueError(
-                f"{config_name}[{layer_idx}] must be even so it can be split symmetrically, but got {window_size}"
-            )
-        normalized_window_sizes.append(window_size // 2)
-
-    return normalized_window_sizes
+    return [-1 if window_size == -1 else window_size // 2 for window_size in layer_window_sizes]
 
 
-ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
 class URMConfig(BaseModel):
@@ -143,6 +177,8 @@ class URMConfig(BaseModel):
 
     @model_validator(mode="after")
     def _normalize_forward_mode(self):
+        if self.forward_mode == "causal":
+            self.forward_mode = "casual"
         if self.forward_mode == "standard":
             if self.prefix_lm:
                 self.forward_mode = "prefix_lm"
@@ -154,6 +190,9 @@ class URMConfig(BaseModel):
             self.prefix_lm = True
         elif self.forward_mode == "answer_only":
             self.answer_only = True
+            self.prefix_lm = False
+        elif self.forward_mode == "casual":
+            self.answer_only = False
             self.prefix_lm = False
         return self
 
@@ -170,7 +209,7 @@ class URMBlock(nn.Module):
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            causal=False,
+            causal=config.forward_mode == "casual",
             attn_dropout=config.attn_dropout,
             attention_type=attention_type,
             attention_window_size=attention_window_size,
@@ -188,6 +227,44 @@ class URMBlock(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
+    @staticmethod
+    def _pack_prefill_cache(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_cache_len: int,
+        conv_hidden_state: Optional[torch.Tensor],
+        cache_chunk_size: int = 1,
+    ) -> URMLayerInferenceCache:
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=key.device, dtype=torch.int32)
+        batch_size = int(lengths.shape[0])
+        cache_len = max(int(max_cache_len), int(lengths.max().item()) if lengths.numel() else 0)
+        key_cache = key.new_zeros((batch_size, cache_len, key.shape[-2], key.shape[-1]))
+        value_cache = value.new_zeros((batch_size, cache_len, value.shape[-2], value.shape[-1]))
+        for batch_idx in range(batch_size):
+            start = int(cu_seqlens[batch_idx].item())
+            end = int(cu_seqlens[batch_idx + 1].item())
+            length = end - start
+            if length > 0:
+                key_cache[batch_idx, :length] = key[start:end]
+                value_cache[batch_idx, :length] = value[start:end]
+
+        packed_conv_state = conv_hidden_state
+        if conv_hidden_state is not None and conv_hidden_state.ndim == 2 and conv_hidden_state.shape[0] == key.shape[0]:
+            tail_indices = cu_seqlens[1:].to(device=key.device, dtype=torch.long) - 1
+            valid_tail = lengths.to(device=key.device, dtype=torch.long) > 0
+            packed_conv_state = conv_hidden_state.new_zeros((batch_size, conv_hidden_state.shape[-1]))
+            if bool(valid_tail.any().item()):
+                packed_conv_state[valid_tail] = conv_hidden_state[tail_indices[valid_tail]]
+
+        return URMLayerInferenceCache(
+            key=key_cache,
+            value=value_cache,
+            seqlens=lengths,
+            conv_hidden_state=packed_conv_state,
+            cache_chunk_size=max(1, int(cache_chunk_size)),
+        )
+
     def forward(
         self,
         cos_sin: CosSin,
@@ -201,7 +278,7 @@ class URMBlock(nn.Module):
             sequence_lengths=sequence_lengths,
         )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp(hidden_states)
+        mlp_output, _conv_hidden_state = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
@@ -211,19 +288,50 @@ class URMBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-    ) -> torch.Tensor:
-        attn_output = self.self_attn.forward_packed(
-            cos_sin=cos_sin,
-            hidden_states=hidden_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            window_size=-1,
-        )
+        cache: Optional[URMLayerInferenceCache] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[URMLayerInferenceCache]]:
+        if cache is not None:
+            decode_hidden_states = hidden_states.unsqueeze(1) if hidden_states.ndim == 2 else hidden_states
+            cache.ensure_capacity(int(decode_hidden_states.shape[1]))
+            attn_output, key, value = self.self_attn.forward_decode(
+                cos_sin=cos_sin,
+                hidden_states=decode_hidden_states,
+                key_cache=cache.key,
+                value_cache=cache.value,
+                cache_seqlens=cache.seqlens,
+            )
+            if hidden_states.ndim == 2 and attn_output.ndim == 3:
+                attn_output = attn_output.squeeze(1)
+        else:   
+            attn_output, key, value = self.self_attn.forward_packed(
+                cos_sin=cos_sin,
+                hidden_states=hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=-1,
+            )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp.forward_packed(hidden_states, cu_seqlens)
+        mlp_output, conv_hidden_state = self.mlp.forward_packed(hidden_states, cu_seqlens, cache.conv_hidden_state if cache is not None else None)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
-        return hidden_states
-
+        
+        new_cache = None
+        if cache is not None:
+            new_cache = cache.update(key=key, value=value, conv_hidden_state=conv_hidden_state)
+        elif collect_cache:
+            new_cache = self._pack_prefill_cache(
+                key=key,
+                value=value,
+                cu_seqlens=cu_seqlens,
+                max_cache_len=max_cache_len if max_cache_len is not None else max_seqlen,
+                conv_hidden_state=conv_hidden_state,
+                cache_chunk_size=cache_chunk_size if cache_chunk_size is not None else 1,
+            )
+        
+        return hidden_states, new_cache
+    
     def forward_cross_packed(
         self,
         query_cos_sin: CosSin,
@@ -248,12 +356,14 @@ class URMBlock(nn.Module):
             causal=causal,
         )
         query_states = rms_norm(query_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output = self.mlp.forward_packed(query_states, cu_seqlens_q)
+        mlp_output, _conv_hidden_state = self.mlp.forward_packed(query_states, cu_seqlens_q)
         query_states = rms_norm(query_states + mlp_output, variance_epsilon=self.norm_eps)
         return query_states
 
 
 class URM_Inner(nn.Module):
+    
+#region Init
     def __init__(self, config: URMConfig) -> None:
         super().__init__()
         self.config = config
@@ -269,37 +379,9 @@ class URM_Inner(nn.Module):
         self.padded_grid_height = self.config.grid_height
         self.padded_grid_width = self.config.grid_width
         self.padded_seq_len = self.config.seq_len
-        if self.config.H_cycles < 1:
-            raise ValueError(f"H_cycles must be >= 1, got {self.config.H_cycles}")
-        if self.config.L_cycles < 1:
-            raise ValueError(f"L_cycles must be >= 1, got {self.config.L_cycles}")
-        if self.config.H_layers < 0:
-            raise ValueError(f"H_layers must be >= 0, got {self.config.H_layers}")
-        if self.config.L_layers < 0:
-            raise ValueError(f"L_layers must be >= 0, got {self.config.L_layers}")
-        if self.config.grad_H_cycles < 1:
-            raise ValueError(f"grad_H_cycles must be >= 1, got {self.config.grad_H_cycles}")
-        if self.config.grad_H_cycles > self.config.H_cycles:
-            raise ValueError(
-                f"grad_H_cycles must be <= H_cycles, got {self.config.grad_H_cycles} > {self.config.H_cycles}"
-            )
         self.use_hrm = self.config.H_layers > 0
         self.L_layers = self.config.L_layers if self.use_hrm and self.config.L_layers > 0 else self.config.num_layers
-
-        if self.config.variable_seq_lengths and self.config.patch_io_enabled:
-            raise ValueError("variable_seq_lengths is not supported with patch_io_enabled")
-
-        if self.config.patch_io_enabled:
-            if self.config.grid_height > 0 or self.config.grid_width > 0:
-                self.inner_grid_height = -(self.config.grid_height // -self.config.patch_height)
-                self.inner_grid_width = -(self.config.grid_width // -self.config.patch_width)
-                self.inner_seq_len = self.inner_grid_height * self.inner_grid_width
-                self.padded_grid_height = self.inner_grid_height * self.config.patch_height
-                self.padded_grid_width = self.inner_grid_width * self.config.patch_width
-            else:
-                self.inner_seq_len = -(self.config.seq_len // -self.patch_area)
-                self.padded_seq_len = self.inner_seq_len * self.patch_area
-
+            
         config_updates = dict(
             seq_len=self.inner_seq_len,
             grid_depth=self.inner_grid_depth,
@@ -313,99 +395,21 @@ class URM_Inner(nn.Module):
             else self.config.copy(update=config_updates)
         )
 
-        if self.config.patch_io_enabled:
-            patch_dim = self.patch_area * self.config.patch_pre_embedding_size
-            self.pre_embedding = CastedLinear(self.config.vocab_size, self.config.patch_pre_embedding_size, bias=False)
-            self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
-            self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
-            self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
-        else:
-            self.embed_tokens = CastedEmbedding(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                init_std=embed_init_std,
-                cast_to=self.forward_dtype,
-            )
-            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.embed_tokens = CastedEmbedding(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            init_std=embed_init_std,
+            cast_to=self.forward_dtype,
+        )
+        self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
-        if self.config.num_memory_tokens < 0:
-            raise ValueError(f"num_memory_tokens must be >= 0, got {self.config.num_memory_tokens}")
-        if self.config.answer_initial_random_std < 0:
-            raise ValueError(
-                "answer_initial_random_std must be >= 0, "
-                f"got {self.config.answer_initial_random_std}"
-            )
-        if self.config.label_separate_C_noise_scale < 0:
-            raise ValueError(
-                "label_separate_C_noise_scale must be >= 0, "
-                f"got {self.config.label_separate_C_noise_scale}"
-            )
-        if self._separate_mode() not in {"C", "D"}:
-            raise ValueError(f"SeparateMode must be 'C' or 'D', got {self._separate_mode()!r}")
-        if self.config.answer_initial_C_noise_scale < 0:
-            raise ValueError(
-                "answer_initial_C_noise_scale must be >= 0, "
-                f"got {self.config.answer_initial_C_noise_scale}"
-            )
-        if self.config.answer_initial_C_beta_alpha <= 0:
-            raise ValueError(
-                "answer_initial_C_beta_alpha must be > 0, "
-                f"got {self.config.answer_initial_C_beta_alpha}"
-            )
-        if self.config.answer_initial_C_beta_beta <= 0:
-            raise ValueError(
-                "answer_initial_C_beta_beta must be > 0, "
-                f"got {self.config.answer_initial_C_beta_beta}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_min <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_min must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_min}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_max <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_max must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_max}"
-            )
-        if self.config.answer_initial_D_ratio_min > self.config.answer_initial_D_ratio_max:
-            raise ValueError(
-                "answer_initial_D_ratio_min must be <= answer_initial_D_ratio_max, "
-                f"got {self.config.answer_initial_D_ratio_min} > {self.config.answer_initial_D_ratio_max}"
-            )
-        if not (0.0 <= self.config.answer_initial_D_ratio_mean <= 1.0):
-            raise ValueError(
-                "answer_initial_D_ratio_mean must be in [0, 1], "
-                f"got {self.config.answer_initial_D_ratio_mean}"
-            )
-        if self.config.answer_initial_D_ratio_std < 0:
-            raise ValueError(
-                "answer_initial_D_ratio_std must be >= 0, "
-                f"got {self.config.answer_initial_D_ratio_std}"
-            )
-        if self.config.answer_initial_random_token_min < 0:
-            raise ValueError(
-                "answer_initial_random_token_min must be >= 0, "
-                f"got {self.config.answer_initial_random_token_min}"
-            )
-        if (
-            self.config.patch_io_enabled
-            and self.config.answer_initial_mode in {"noised_label_C", "noised_label_D"}
-        ):
-            raise ValueError(
-                "noised_label_C/noised_label_D answer initialization requires token embeddings "
-                "and is not supported with patch_io_enabled."
-            )
         self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
 
         if self.config.num_memory_tokens > 0:
             self.memory_tokens = nn.Parameter(
                 trunc_normal_init_(
-                    torch.empty(
-                        self.config.num_memory_tokens,
-                        self.config.hidden_size,
-                        dtype=self.forward_dtype,
-                    ),
+                    torch.empty(self.config.num_memory_tokens,self.config.hidden_size,dtype=self.forward_dtype,),
                     std=embed_init_std,
                 )
             )
@@ -419,12 +423,58 @@ class URM_Inner(nn.Module):
                 cast_to=self.forward_dtype,
             )
 
-        if (
-            self.inner_config.grid_depth > 0
-            and self.inner_config.grid_io > 0
-            and self.inner_config.grid_height > 0
-            and self.inner_config.grid_width > 0
-        ):
+        self.init_rope_nD()
+
+        self.layer_attention_window_sizes = _normalize_attention_window_sizes(
+            self.inner_config.attention_window_size,
+            self.L_layers,
+        )
+        self.layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=self.layer_attention_window_sizes[layer_idx])
+                for layer_idx in range(self.L_layers)
+            ]
+        )
+        
+        if self.use_hrm:
+            self.init_hrm()
+            
+        if self.config.patch_io_enabled:
+            self.init_patch_io()
+            
+        self.prelude_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=-1)
+                for _ in range(self.config.prelude_layers)
+            ]
+        )
+        self.coda_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=-1)
+                for _ in range(self.config.coda_layers)
+            ]
+        )
+        self.context_layers = nn.ModuleList(
+            [
+                URMBlock(self.inner_config, attention_window_size=-1)
+                for _ in range(self.config.answer_only_context_layers)
+            ]
+        )
+
+        self.init_hidden = nn.Buffer(
+            trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
+            persistent=True,
+        )
+
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)
+            
+        generator_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.generator = torch.Generator(device=generator_device).manual_seed(self.config.noise_seed)
+        
+    def init_rope_nD(self):
+        if (self.inner_config.grid_depth > 0 and self.inner_config.grid_io > 0 and self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0):
             self.rotary_emb = RotaryEmbedding4D(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_depth=self.inner_config.grid_depth,
@@ -462,86 +512,46 @@ class URM_Inner(nn.Module):
                 base=self.inner_config.rope_theta,
             )
 
-        self.layer_attention_window_sizes = _normalize_attention_window_sizes(
-            self.inner_config.attention_window_size,
-            self.L_layers,
-            "URMConfig.attention_window_size",
-        )
-        self.layers = nn.ModuleList(
-            [
-                URMBlock(self.inner_config, attention_window_size=self.layer_attention_window_sizes[layer_idx])
-                for layer_idx in range(self.L_layers)
-            ]
-        )
+    def init_hrm(self):
         self.H_layer_attention_window_sizes = []
         self.H_layers = nn.ModuleList()
-        if self.use_hrm:
-            self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
+        self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
                 self.inner_config.attention_window_size,
                 self.config.H_layers,
-                "URMConfig.attention_window_size",
             )
-            self.H_layers = nn.ModuleList(
-                [
-                    URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
-                    for layer_idx in range(self.config.H_layers)
-                ]
-            )
-        if self.config.prelude_layers < 0:
-            raise ValueError(f"prelude_layers must be >= 0, got {self.config.prelude_layers}")
-        if self.config.coda_layers < 0:
-            raise ValueError(f"coda_layers must be >= 0, got {self.config.coda_layers}")
-        self.prelude_layers = nn.ModuleList(
+        self.H_layers = nn.ModuleList(
             [
-                URMBlock(self.inner_config, attention_window_size=-1)
-                for _ in range(self.config.prelude_layers)
+                URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
+                for layer_idx in range(self.config.H_layers)
             ]
         )
-        self.coda_layers = nn.ModuleList(
-            [
-                URMBlock(self.inner_config, attention_window_size=-1)
-                for _ in range(self.config.coda_layers)
-            ]
-        )
-        if self.config.answer_only_context_layers < 0:
-            raise ValueError(
-                f"answer_only_context_layers must be >= 0, got {self.config.answer_only_context_layers}"
-            )
-        self.context_layers = nn.ModuleList(
-            [
-                URMBlock(self.inner_config, attention_window_size=-1)
-                for _ in range(self.config.answer_only_context_layers)
-            ]
-        )
-
-        self.init_hidden = nn.Buffer(
+        self.low_init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
-        if self.use_hrm:
-            self.low_init_hidden = nn.Buffer(
-                trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
-                persistent=True,
-            )
 
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)
+    def init_patch_io(self):
+        if self.config.grid_height > 0 or self.config.grid_width > 0:
+            self.inner_grid_height = -(self.config.grid_height // -self.config.patch_height)
+            self.inner_grid_width = -(self.config.grid_width // -self.config.patch_width)
+            self.inner_seq_len = self.inner_grid_height * self.inner_grid_width
+            self.padded_grid_height = self.inner_grid_height * self.config.patch_height
+            self.padded_grid_width = self.inner_grid_width * self.config.patch_width
+        else:
+            self.inner_seq_len = -(self.config.seq_len // -self.patch_area)
+            self.padded_seq_len = self.inner_seq_len * self.patch_area
             
-        generator_device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.generator = torch.Generator(device=generator_device).manual_seed(self.config.noise_seed)
+        patch_dim = self.patch_area * self.config.patch_pre_embedding_size
+        self.pre_embedding = CastedLinear(self.config.vocab_size, self.config.patch_pre_embedding_size, bias=False)
+        self.embed_tokens = CastedLinear(patch_dim, self.config.hidden_size, bias=False)
+        self.lm_head = CastedLinear(self.config.hidden_size, patch_dim, bias=False)
+        self.post_head = CastedLinear(self.config.patch_pre_embedding_size, self.config.vocab_size, bias=False)
+#endregion
 
-    def _one_hot_inputs(self, input: torch.Tensor) -> torch.Tensor:
-        if input.ndim == 3:
-            if input.shape[-1] != self.config.vocab_size:
-                raise ValueError("one-hot inputs must have vocab_size as the last dimension")
-            return input.to(self.forward_dtype)
-        return F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
-
+#region Patchify
+    ### convert (B, T, C) to (B, T // patch_size, C)
     def _patchify(self, pixels: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, channels = pixels.shape
-        if seq_len != self.config.seq_len:
-            raise ValueError("patch IO input sequence length must match config.seq_len")
+        batch_size, _, channels = pixels.shape
 
         if self.config.grid_height > 0 and self.config.grid_width > 0:
             pixels = pixels.view(batch_size, self.config.grid_height, self.config.grid_width, channels)
@@ -568,11 +578,10 @@ class URM_Inner(nn.Module):
             pixels = F.pad(pixels, (0, 0, 0, self.padded_seq_len - self.config.seq_len))
         return pixels.reshape(batch_size, self.inner_seq_len, self.patch_area * channels)
 
+    ### unconvert (B, T, C) to (B, T // patch_size, C)
     def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, patch_dim = patches.shape
+        batch_size = patches.shape[0]
         channels = self.config.patch_pre_embedding_size
-        if seq_len != self.inner_seq_len or patch_dim != self.patch_area * channels:
-            raise ValueError("patch IO head output has an unexpected shape")
 
         if self.config.grid_height > 0 and self.config.grid_width > 0:
             pixels = patches.reshape(
@@ -596,21 +605,18 @@ class URM_Inner(nn.Module):
             )
 
         return patches.reshape(batch_size, self.padded_seq_len, channels)[:, : self.config.seq_len]
-
-    def _output_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        output = self.lm_head(hidden_states)[:, self.prefix_seq_len:]
-        if self.config.patch_io_enabled:
-            output = self.post_head(self._unpatchify(output))
-        return output
+#endregion
 
     def _memory_embeddings(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
         if self.config.num_memory_tokens == 0:
             return None
         return self.memory_tokens.to(device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
+
+#region Label Embedding Noise
     def _separate_mode(self) -> str:
         return str(self.config.separate_mode or self.config.SeparateMode).upper()
-
+    
     def _label_separate_C_enabled(self) -> bool:
         return bool(self.config.label_separate and self._separate_mode() == "C")
 
@@ -722,6 +728,7 @@ class URM_Inner(nn.Module):
         embedding = embedding.clone()
         embedding[answer_indices] = mixed.to(embedding.dtype)
         return embedding
+#endregion
 
     def _input_embeddings(
         self,
@@ -730,7 +737,11 @@ class URM_Inner(nn.Module):
         batch: Optional[Dict[str, torch.Tensor]] = None,
     ):
         if self.config.patch_io_enabled:
-            pixels = self.pre_embedding(self._one_hot_inputs(input))
+            if input.ndim == 3:
+                _input = input.to(self.forward_dtype)
+            else:
+                _input = F.one_hot(input.to(torch.long), num_classes=self.config.vocab_size).to(self.forward_dtype)
+            pixels = self.pre_embedding(_input)
             embedding = self.embed_tokens(self._patchify(pixels))
         else:
             embedding = self.embed_tokens(input.to(torch.int32))
@@ -814,40 +825,27 @@ class URM_Inner(nn.Module):
         token_positions = torch.arange(num_tokens, device=batch["inputs"].device, dtype=torch.long)
         return token_positions + seq_ids * self.prefix_seq_len + self.prefix_seq_len
 
-    def _packed_puzzle_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _packed_prefix_indices(
+        self,
+        batch: Dict[str, torch.Tensor],
+        start: int = 0,
+        length: Optional[int] = None,
+    ) -> torch.Tensor:
         batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.puzzle_emb_len == 0 or batch_size == 0:
+        length = self.prefix_seq_len if length is None else length
+        if length == 0 or batch_size == 0:
             return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
 
         data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        prefix_offsets = torch.arange(self.puzzle_emb_len, device=batch["inputs"].device, dtype=torch.long)
-        return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
-
-    def _packed_memory_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.config.num_memory_tokens == 0 or batch_size == 0:
-            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
-
-        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        memory_offsets = torch.arange(self.config.num_memory_tokens, device=batch["inputs"].device, dtype=torch.long)
-        return (seq_offsets[:, None] + self.puzzle_emb_len + memory_offsets[None, :]).reshape(-1)
-
-    def _packed_prefix_indices(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = batch["puzzle_identifiers"].shape[0]
-        if self.prefix_seq_len == 0 or batch_size == 0:
-            return torch.empty((0,), device=batch["inputs"].device, dtype=torch.long)
-
-        data_offsets = batch["seq_offsets"][:-1].to(device=batch["inputs"].device, dtype=torch.long)
-        seq_offsets = data_offsets + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
-        prefix_offsets = torch.arange(self.prefix_seq_len, device=batch["inputs"].device, dtype=torch.long)
+        seq_offsets = (
+            data_offsets
+            + torch.arange(batch_size, device=batch["inputs"].device, dtype=torch.long) * self.prefix_seq_len
+            + start
+        )
+        prefix_offsets = torch.arange(length, device=batch["inputs"].device, dtype=torch.long)
         return (seq_offsets[:, None] + prefix_offsets[None, :]).reshape(-1)
 
     def _input_embeddings_packed(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.config.patch_io_enabled:
-            raise ValueError("Packed variable-length data is not supported with patch_io_enabled")
-
         token_embedding = self.embed_tokens(batch["inputs"].to(torch.int32))
         token_indices = self._packed_data_token_indices(batch)
 
@@ -860,11 +858,11 @@ class URM_Inner(nn.Module):
                 pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
                 if pad_count > 0:
                     puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-                embedding[self._packed_puzzle_indices(batch)] = puzzle_embedding.view(-1, self.config.hidden_size)
+                embedding[self._packed_prefix_indices(batch, length=self.puzzle_emb_len)] = puzzle_embedding.view(-1, self.config.hidden_size)
             if self.config.num_memory_tokens > 0:
                 batch_size = batch["puzzle_identifiers"].shape[0]
                 memory_embedding = self.memory_tokens.to(device=token_embedding.device).expand(batch_size, -1, -1)
-                embedding[self._packed_memory_indices(batch)] = memory_embedding.reshape(-1, self.config.hidden_size)
+                embedding[self._packed_prefix_indices(batch, start=self.puzzle_emb_len, length=self.config.num_memory_tokens)] = memory_embedding.reshape(-1, self.config.hidden_size)
         else:
             embedding = token_embedding
 
@@ -930,7 +928,7 @@ class URM_Inner(nn.Module):
         cos = cos[flat_ids]
         sin = sin[flat_ids]
         if self.config.num_memory_tokens > 0:
-            memory_indices = self._packed_memory_indices(batch)
+            memory_indices = self._packed_prefix_indices(batch, start=self.puzzle_emb_len, length=self.config.num_memory_tokens)
             cos = cos.clone()
             sin = sin.clone()
             cos[memory_indices] = 1
@@ -1043,8 +1041,6 @@ class URM_Inner(nn.Module):
             (RotaryEmbedding2D, RotaryEmbedding3D, RotaryEmbedding4D),
         ):
             return self.rotary_emb(batch["position_ids"], prefix_seq_len=self.prefix_seq_len)
-        if isinstance(self.rotary_emb, (RotaryEmbedding3D, RotaryEmbedding4D)):
-            raise ValueError(f"{type(self.rotary_emb).__name__} requires explicit position_ids in the batch.")
         cos_sin = self.rotary_emb()
         if self.config.num_memory_tokens == 0:
             return cos_sin
@@ -1065,6 +1061,7 @@ class URM_Inner(nn.Module):
             return None
         return batch["seq_lengths"].to(torch.int32) + self.prefix_seq_len
 
+#region loops
     def _inject_inputs(self, hidden_states: torch.Tensor, input_embeddings: torch.Tensor) -> torch.Tensor:
         if not self.config.input_injection_enabled:
             return hidden_states
@@ -1088,14 +1085,39 @@ class URM_Inner(nn.Module):
         layers: nn.ModuleList,
         cos_sin: CosSin,
         sequence_lengths: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        for layer in layers:
-            hidden_states = layer(
-                cos_sin=cos_sin,
-                hidden_states=hidden_states,
-                sequence_lengths=sequence_lengths,
-            )
-        return hidden_states
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        cache: Optional[List[URMLayerInferenceCache]] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[List[URMLayerInferenceCache]]]:
+        new_cache = [] if cache is not None or collect_cache else None
+        for i, layer in enumerate(layers):
+            if cu_seqlens is not None:
+                if max_seqlen is None:
+                    raise RuntimeError("Packed token layers require max_seqlen.")
+                hidden_states, layer_cache = layer.forward_packed(
+                    cos_sin=cos_sin,
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cache=cache[i] if cache is not None else None,
+                    collect_cache=collect_cache,
+                    max_cache_len=max_cache_len,
+                    cache_chunk_size=cache_chunk_size,
+                )
+                if new_cache is not None:
+                    new_cache.append(layer_cache)
+            else:
+                if cache is not None:
+                    raise RuntimeError("Fixed-length token layers do not support inference caches.")
+                hidden_states = layer.forward(
+                    cos_sin=cos_sin,
+                    hidden_states=hidden_states,
+                    sequence_lengths=sequence_lengths,
+                )
+        return hidden_states, new_cache
 
     def _run_recurrent_layers(
         self,
@@ -1103,21 +1125,44 @@ class URM_Inner(nn.Module):
         input_embeddings: torch.Tensor,
         layers: nn.ModuleList,
         cos_sin: CosSin,
-        sequence_lengths: Optional[torch.Tensor],
+        sequence_lengths: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         diff_L: Optional[torch.Tensor] = None,
         grad_hook_factory=None,
         unrolled_idx: int = 0,
         force_injection: bool = False,
         add_noise: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+        cache: Optional[List[URMLayerInferenceCache]] = None,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, Optional[List[URMLayerInferenceCache]]]:
+        new_cache = [] if cache is not None or collect_cache else None
         hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
-        for layer in layers:
+        for layer_idx, layer in enumerate(layers):
             pre_hidden_states = hidden_states
-            hidden_states = layer(
-                cos_sin=cos_sin,
-                hidden_states=pre_hidden_states,
-                sequence_lengths=sequence_lengths,
-            )
+            if cu_seqlens is not None:
+                if max_seqlen is None:
+                    raise RuntimeError("Packed recurrent layers require max_seqlen.")
+                hidden_states, layer_cache = layer.forward_packed(
+                    cos_sin=cos_sin,
+                    hidden_states=pre_hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cache=cache[layer_idx] if cache is not None else None,
+                    collect_cache=collect_cache,
+                    max_cache_len=max_cache_len,
+                    cache_chunk_size=cache_chunk_size,
+                )
+                if new_cache is not None:
+                    new_cache.append(layer_cache)
+            else:
+                hidden_states = layer.forward(
+                    cos_sin=cos_sin,
+                    hidden_states=pre_hidden_states,
+                    sequence_lengths=sequence_lengths,
+                )
             if diff_L is not None:
                 diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
             if add_noise:
@@ -1125,58 +1170,136 @@ class URM_Inner(nn.Module):
             if grad_hook_factory is not None:
                 hidden_states.register_hook(grad_hook_factory(unrolled_idx))
                 unrolled_idx += 1
-        return hidden_states, diff_L, unrolled_idx
+        return hidden_states, diff_L, unrolled_idx, new_cache
 
-    def _run_recurrent_layers_packed(
+    def _loop_layers(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        low_hidden_states: Optional[torch.Tensor],
         input_embeddings: torch.Tensor,
-        layers: nn.ModuleList,
-        cos_sin: CosSin,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        H_layers: Optional[nn.ModuleList],
+        L_layers: nn.ModuleList,
+        H_cycles: int,
+        L_cycles: int,
+        seq_info: Dict[str, Union[torch.Tensor, int, CosSin, None]],
         diff_L: Optional[torch.Tensor] = None,
         grad_hook_factory=None,
         unrolled_idx: int = 0,
-        force_injection: bool = False,
-        add_noise: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
-        hidden_states = hidden_states + input_embeddings if force_injection else self._inject_inputs(hidden_states, input_embeddings)
-        for layer in layers:
-            pre_hidden_states = hidden_states
-            hidden_states = layer.forward_packed(
-                cos_sin=cos_sin,
-                hidden_states=pre_hidden_states,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-            if diff_L is not None:
-                diff_L = diff_L + torch.abs(hidden_states - pre_hidden_states)
-            if add_noise:
-                hidden_states = self._add_noise(hidden_states)
-            if grad_hook_factory is not None:
-                hidden_states.register_hook(grad_hook_factory(unrolled_idx))
-                unrolled_idx += 1
-        return hidden_states, diff_L, unrolled_idx
+        cache: Optional[URMInferenceCache] = None,
+        cache_loop_offset: int = 0,
+        collect_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int, Optional[URMInferenceCache]]:
+        expected_cache_loops = H_cycles * L_cycles if H_layers is None else H_cycles * (L_cycles + 1)
 
-    def _run_token_layers_packed(
-        self,
-        hidden_states: torch.Tensor,
-        layers: nn.ModuleList,
-        cos_sin: CosSin,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        for layer in layers:
-            hidden_states = layer.forward_packed(
-                cos_sin=cos_sin,
-                hidden_states=hidden_states,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-        return hidden_states
+        loop_cache_idx = 0
+        new_cache_layers = list(cache.layers) if cache is not None else ([] if collect_cache else None)
 
-    @torch.compiler.disable
+        def next_loop_cache() -> Optional[List[URMLayerInferenceCache]]:
+            nonlocal loop_cache_idx
+            if cache is None:
+                return None
+            layer_cache = cache.layers[cache_loop_offset + loop_cache_idx]
+            loop_cache_idx += 1
+            return layer_cache
+
+        def append_loop_cache(layer_cache: Optional[List[URMLayerInferenceCache]]) -> None:
+            if new_cache_layers is None:
+                return
+            if cache is None and collect_cache:
+                new_cache_layers.append(layer_cache)
+            else:
+                new_cache_layers[cache_loop_offset + loop_cache_idx - 1] = layer_cache
+
+        no_grad_H_cycles = H_cycles - self.config.grad_H_cycles
+        with torch.no_grad():
+            for _ in range(no_grad_H_cycles):
+                for _ in range(L_cycles):
+                    if H_layers is not None:
+                        layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
+                        low_hidden_states, _, _, _ = self._run_recurrent_layers(
+                            hidden_states=low_hidden_states,
+                            input_embeddings=layer_input,
+                            layers=L_layers,
+                        )
+                    else:
+                        hidden_states, _, _, loop_new_cache = self._run_recurrent_layers(
+                            hidden_states=hidden_states,
+                            input_embeddings=input_embeddings,
+                            layers=L_layers,
+                            add_noise=False,
+                            cache=next_loop_cache(),
+                            collect_cache=collect_cache,
+                            max_cache_len=max_cache_len,
+                            cache_chunk_size=cache_chunk_size,
+                            **seq_info,
+                        )
+                        append_loop_cache(loop_new_cache)
+                        hidden_states = self._add_noise(hidden_states)
+                if H_layers is not None:
+                    hidden_states, _, _, _ = self._run_recurrent_layers(
+                        hidden_states=hidden_states,
+                        input_embeddings=low_hidden_states,
+                        layers=H_layers,
+                        **seq_info,
+                    )
+
+        for _ in range(self.config.grad_H_cycles):
+            if H_layers is not None:
+                for _ in range(L_cycles):
+                    layer_input = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
+                    low_hidden_states, diff_L, unrolled_idx, _ = self._run_recurrent_layers(
+                        hidden_states=low_hidden_states,
+                        input_embeddings=layer_input,
+                        layers=L_layers,
+                        diff_L=diff_L,
+                        grad_hook_factory=grad_hook_factory,
+                        unrolled_idx=unrolled_idx,
+                        **seq_info,
+                    )
+                hidden_states, _, unrolled_idx, _ = self._run_recurrent_layers(
+                    hidden_states=hidden_states,
+                    input_embeddings=low_hidden_states,
+                    layers=H_layers,
+                    grad_hook_factory=grad_hook_factory,
+                    unrolled_idx=unrolled_idx,
+                    **seq_info,
+                )
+            else:
+                for _ in range(L_cycles):
+                    hidden_states, diff_L, unrolled_idx, loop_new_cache = self._run_recurrent_layers(
+                        hidden_states=hidden_states,
+                        input_embeddings=input_embeddings,
+                        layers=L_layers,
+                        diff_L=diff_L,
+                        grad_hook_factory=grad_hook_factory,
+                        unrolled_idx=unrolled_idx,
+                        cache=next_loop_cache(),
+                        collect_cache=collect_cache,
+                        max_cache_len=max_cache_len,
+                        cache_chunk_size=cache_chunk_size,
+                        **seq_info,
+                    )
+                    append_loop_cache(loop_new_cache)
+
+        new_cache = None
+        if cache is not None:
+            new_cache = replace(cache, layers=new_cache_layers)
+        elif collect_cache:
+            cache_batch_size = 0
+            cu_for_size = seq_info.get("cu_seqlens")
+            if isinstance(cu_for_size, torch.Tensor):
+                cache_batch_size = int(cu_for_size.shape[0]) - 1
+            new_cache = URMInferenceCache(
+                layers=new_cache_layers if new_cache_layers is not None else [],
+                batch_size=cache_batch_size,
+                max_cache_len=int(max_cache_len) if max_cache_len is not None else 0,
+                cache_chunk_size=max(1, int(cache_chunk_size)) if cache_chunk_size is not None else 1,
+            )
+        return hidden_states, low_hidden_states if H_layers is not None else None, diff_L, unrolled_idx, new_cache
+#endregion
+  
     def _prefix_lm_key_value_indices(
         self,
         context_indices: torch.Tensor,
@@ -1216,13 +1339,14 @@ class URM_Inner(nn.Module):
         if len(layers) == 0:
             return hidden_states
         if answer_indices.numel() == 0:
-            return self._run_token_layers_packed(
+            hidden_states, _cache = self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=layers,
                 cos_sin=cos_sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
+            return hidden_states
 
         context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
         answer_cos_sin = self._slice_packed_cos_sin(cos_sin, answer_indices)
@@ -1238,7 +1362,7 @@ class URM_Inner(nn.Module):
             next_states = hidden_states.clone()
             context_states = hidden_states[context_indices]
             if context_states.numel() > 0:
-                context_states = layer.forward_packed(
+                context_states, _cache = layer.forward_packed(
                     cos_sin=context_cos_sin,
                     hidden_states=context_states,
                     cu_seqlens=cu_context,
@@ -1265,289 +1389,157 @@ class URM_Inner(nn.Module):
             hidden_states = self._add_noise(next_states) if add_noise else next_states
 
         return hidden_states
+    
+    def get_grad_hook_factory(self):
+        if not self.config.grad_logging_enabled or not global_logger.is_log or not self.training:
+            return None
 
+        grad_norms = {}
+        layers_per_H_cycle = self.config.L_cycles * len(self.layers)
+        if self.use_hrm:
+            layers_per_H_cycle += len(self.H_layers)
+        total_unrolled = self.config.grad_H_cycles * layers_per_H_cycle
+
+        def make_grad_hook(idx):
+            def hook(grad):
+                grad_norms[idx] = grad.detach().norm().item()
+                if len(grad_norms) == total_unrolled:
+                    norm_tensor = torch.tensor([grad_norms[i] for i in range(total_unrolled)])
+                    global_logger.store("grad_norm_per_layer", norm_tensor)
+            return hook
+
+        return make_grad_hook
+
+#region Some forward 
     def forward(
         self,
         carry: URMCarry,
-        batch: Dict[str, torch.Tensor]
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if self.config.variable_seq_lengths:
-            return self.forward_packed(carry, batch)
-
-        seq_info = dict(
-            cos_sin=self._rotary_cos_sin(batch),
-            sequence_lengths=self._sequence_lengths(batch),
-        )
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
-        input_embeddings = self._run_token_layers(
-            hidden_states=input_embeddings,
-            layers=self.prelude_layers,
-            **seq_info,
-        )
-
-        # Gradient norm logging for unrolled layers
-        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
-        grad_hook_factory = None
-        if _log_grads:
-            _grad_norms = {}
-            _layers_per_H_cycle = self.config.L_cycles * len(self.layers)
-            if self.use_hrm:
-                _layers_per_H_cycle += len(self.H_layers)
-            _total_unrolled = self.config.grad_H_cycles * _layers_per_H_cycle
-            def _make_grad_hook(idx):
-                def hook(grad):
-                    _grad_norms[idx] = grad.detach().norm().item()
-                    if len(_grad_norms) == _total_unrolled:
-                        norm_tensor = torch.tensor([_grad_norms[i] for i in range(_total_unrolled)])
-                        global_logger.store("grad_norm_per_layer", norm_tensor)
-                return hook
-            grad_hook_factory = _make_grad_hook
-
-        hidden_states = carry.current_hidden
-        low_hidden_states = carry.current_low_hidden
-        no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
-        _unrolled_idx = 0
-        diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
-
-        if self.use_hrm:
-            if low_hidden_states is None:
-                raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                        low_hidden_states, _, _ = self._run_recurrent_layers(
-                            hidden_states=low_hidden_states,
-                            input_embeddings=L_injection,
-                            layers=self.layers,
-                            force_injection=True,
-                            **seq_info,
-                        )
-                    hidden_states, _, _ = self._run_recurrent_layers(
-                        hidden_states=hidden_states,
-                        input_embeddings=low_hidden_states,
-                        layers=self.H_layers,
-                        force_injection=True,
-                        **seq_info,
-                    )
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                    low_hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers(
-                        hidden_states=low_hidden_states,
-                        input_embeddings=L_injection,
-                        layers=self.layers,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        force_injection=True,
-                        **seq_info,
-                    )
-                hidden_states, _, _unrolled_idx = self._run_recurrent_layers(
-                    hidden_states=hidden_states,
-                    input_embeddings=low_hidden_states,
-                    layers=self.H_layers,
-                    grad_hook_factory=grad_hook_factory,
-                    unrolled_idx=_unrolled_idx,
-                    force_injection=True,
-                    **seq_info,
-                )
-        else:
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        hidden_states, _, _ = self._run_recurrent_layers(
-                            hidden_states=hidden_states,
-                            input_embeddings=input_embeddings,
-                            layers=self.layers,
-                            add_noise=False,
-                            **seq_info,
-                        )
-                        hidden_states = self._add_noise(hidden_states)
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers(
-                        hidden_states=hidden_states,
-                        input_embeddings=input_embeddings,
-                        layers=self.layers,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        **seq_info,
-                    )
-
-        new_carry = replace(
-            carry,
-            current_hidden=hidden_states.detach(),
-            current_low_hidden=low_hidden_states.detach() if low_hidden_states is not None else None,
-        )
-        head_hidden_states = self._run_token_layers(
-            hidden_states=hidden_states,
-            layers=self.coda_layers,
-            **seq_info,
-        )
-        output = self._output_logits(head_hidden_states)
-        q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
-
-    def forward_packed(
-        self,
-        carry: URMCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if self.config.forward_mode == "prefix_lm":
+        cache: Optional[URMInferenceCache] = None,
+        cache_loop_offset: int = 0,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Union[
+        Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]],
+        Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor], Optional[URMInferenceCache]],
+    ]:
+        if self.config.forward_mode == "prefix_lm" and cache is None and not return_cache:
             return self.forward_prefix_lm_packed(carry, batch)
-        if self.config.forward_mode == "answer_only":
+        if self.config.forward_mode == "answer_only" and cache is None and not return_cache:
             return self.forward_answer_only_packed(carry, batch)
-
-        input_embeddings, token_indices = self._input_embeddings_packed(batch)
-        cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
-        cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
-        input_embeddings = self._run_token_layers_packed(
+        
+        # create input
+        is_packed = self.config.variable_seq_lengths
+        if is_packed:
+            input_embeddings, token_indices = self._input_embeddings_packed(batch)
+            cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
+            cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
+            decode_token_indices = token_indices if cache is not None else None
+            full_hidden_for_decode = carry.current_hidden if cache is not None else None
+            if cache is not None:
+                input_embeddings = input_embeddings[token_indices]
+                cos_sin = self._slice_packed_cos_sin(cos_sin, token_indices)
+                batch_size = int(batch["puzzle_identifiers"].shape[0])
+                cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int32, device=batch["inputs"].device)
+                max_seqlen = 1
+            seq_info = dict(
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        else:
+            input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"], batch=batch)
+            token_indices, cu_seqlens, max_seqlen = None, None, None
+            cos_sin = self._rotary_cos_sin(batch)
+            seq_info = dict(
+                cos_sin=cos_sin,
+                sequence_lengths=self._sequence_lengths(batch),
+            )
+        input_embeddings, _prelude_cache = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
-            cos_sin=cos_sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            **seq_info,
         )
+        grad_hook_factory = self.get_grad_hook_factory()
 
         hidden_states = carry.current_hidden
-        if hidden_states.shape[0] != input_embeddings.shape[0]:
-            raise RuntimeError(
-                f"Packed carry/input length mismatch: carry={hidden_states.shape[0]} input={input_embeddings.shape[0]}"
-            )
-
-        _log_grads = self.config.grad_logging_enabled and global_logger.is_log and self.training
-        grad_hook_factory = None
-        if _log_grads:
-            _grad_norms = {}
-            _layers_per_H_cycle = self.config.L_cycles * len(self.layers)
-            if self.use_hrm:
-                _layers_per_H_cycle += len(self.H_layers)
-            _total_unrolled = self.config.grad_H_cycles * _layers_per_H_cycle
-            def _make_grad_hook(idx):
-                def hook(grad):
-                    _grad_norms[idx] = grad.detach().norm().item()
-                    if len(_grad_norms) == _total_unrolled:
-                        norm_tensor = torch.tensor([_grad_norms[i] for i in range(_total_unrolled)])
-                        global_logger.store("grad_norm_per_layer", norm_tensor)
-                return hook
-            grad_hook_factory = _make_grad_hook
-
         low_hidden_states = carry.current_low_hidden
-        no_grad_H_cycles = self.config.H_cycles - self.config.grad_H_cycles
+        if is_packed and cache is not None:
+            assert decode_token_indices is not None
+            hidden_states = hidden_states[decode_token_indices]
+            if low_hidden_states is not None:
+                low_hidden_states = low_hidden_states[decode_token_indices]
         _unrolled_idx = 0
         diff_L = torch.zeros_like(hidden_states) if self.config.diff_L_loss_enabled else None
 
-        if self.use_hrm:
-            if low_hidden_states is None:
-                raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
-            if low_hidden_states.shape[0] != input_embeddings.shape[0]:
-                raise RuntimeError(
-                    f"Packed carry/input length mismatch: low_carry={low_hidden_states.shape[0]} input={input_embeddings.shape[0]}"
-                )
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                        low_hidden_states, _, _ = self._run_recurrent_layers_packed(
-                            hidden_states=low_hidden_states,
-                            input_embeddings=L_injection,
-                            layers=self.layers,
-                            cos_sin=cos_sin,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
-                            force_injection=True,
-                        )
-                    hidden_states, _, _ = self._run_recurrent_layers_packed(
-                        hidden_states=hidden_states,
-                        input_embeddings=low_hidden_states,
-                        layers=self.H_layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        force_injection=True,
-                    )
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    L_injection = hidden_states + input_embeddings if self.config.input_injection_enabled else hidden_states
-                    low_hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers_packed(
-                        hidden_states=low_hidden_states,
-                        input_embeddings=L_injection,
-                        layers=self.layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                        force_injection=True,
-                    )
-                hidden_states, _, _unrolled_idx = self._run_recurrent_layers_packed(
-                    hidden_states=hidden_states,
-                    input_embeddings=low_hidden_states,
-                    layers=self.H_layers,
-                    cos_sin=cos_sin,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    grad_hook_factory=grad_hook_factory,
-                    unrolled_idx=_unrolled_idx,
-                    force_injection=True,
-                )
-        else:
-            with torch.no_grad():
-                for _ in range(no_grad_H_cycles):
-                    for _ in range(self.config.L_cycles):
-                        hidden_states, _, _ = self._run_recurrent_layers_packed(
-                            hidden_states=hidden_states,
-                            input_embeddings=input_embeddings,
-                            layers=self.layers,
-                            cos_sin=cos_sin,
-                            cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen,
-                            add_noise=False,
-                        )
-                        hidden_states = self._add_noise(hidden_states)
-            for _ in range(self.config.grad_H_cycles):
-                for _ in range(self.config.L_cycles):
-                    hidden_states, diff_L, _unrolled_idx = self._run_recurrent_layers_packed(
-                        hidden_states=hidden_states,
-                        input_embeddings=input_embeddings,
-                        layers=self.layers,
-                        cos_sin=cos_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        diff_L=diff_L,
-                        grad_hook_factory=grad_hook_factory,
-                        unrolled_idx=_unrolled_idx,
-                    )
+        hidden_states, low_hidden_states, diff_L, _unrolled_idx, new_cache = self._loop_layers(
+            hidden_states=hidden_states,
+            low_hidden_states=low_hidden_states if self.use_hrm else None,
+            input_embeddings=input_embeddings,
+            H_layers=self.H_layers if self.use_hrm else None,
+            L_layers=self.layers,
+            H_cycles=self.config.H_cycles,
+            L_cycles=self.config.L_cycles,
+            seq_info=seq_info,
+            diff_L=diff_L,
+            grad_hook_factory=grad_hook_factory,
+            unrolled_idx=_unrolled_idx,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
+            collect_cache=return_cache and cache is None,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
+        )
 
+        # detach and store carry
+        carry_hidden_states = hidden_states
+        carry_low_hidden_states = low_hidden_states
+        if is_packed and cache is not None:
+            assert decode_token_indices is not None and full_hidden_for_decode is not None
+            carry_hidden_states = full_hidden_for_decode.clone()
+            carry_hidden_states[decode_token_indices] = hidden_states
+            if low_hidden_states is not None and carry.current_low_hidden is not None:
+                carry_low_hidden_states = carry.current_low_hidden.clone()
+                carry_low_hidden_states[decode_token_indices] = low_hidden_states
         new_carry = replace(
             carry,
-            current_hidden=hidden_states.detach(),
-            current_low_hidden=low_hidden_states.detach() if low_hidden_states is not None else None,
+            current_hidden=carry_hidden_states.detach(),
+            current_low_hidden=carry_low_hidden_states.detach() if carry_low_hidden_states is not None else None,
         )
-        head_hidden_states = self._run_token_layers_packed(
+        
+        # coda layers
+        head_hidden_states, _coda_cache = self._run_token_layers(
             hidden_states=hidden_states,
             layers=self.coda_layers,
-            cos_sin=cos_sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            **seq_info,
         )
-        output = self.lm_head(head_hidden_states[token_indices])
-        q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+
+        if is_packed:
+            assert token_indices is not None and cu_seqlens is not None
+            if cache is not None:
+                output = self.lm_head(head_hidden_states)
+                q_logits = self.q_head(head_hidden_states).to(torch.float32)
+            else:
+                output = self.lm_head(head_hidden_states[token_indices])
+                q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
+        else:
+            output = self.lm_head(head_hidden_states)[:, self.prefix_seq_len:]
+            q_logits = self.q_head(head_hidden_states[:, 0]).to(torch.float32)
+
+        if self.config.patch_io_enabled:
+            output = self.post_head(self._unpatchify(output))
+        if cache is not None or return_cache:
+            return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L, new_cache
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), diff_L
+
+    forward_packed = forward
 
     def forward_prefix_lm_packed(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if not self.config.variable_seq_lengths:
-            raise ValueError("prefix_lm is currently implemented for packed variable-length batches only.")
-        if self.use_hrm:
-            raise ValueError("prefix_lm packed mode is not supported when H_layers > 0.")
-
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
@@ -1590,7 +1582,7 @@ class URM_Inner(nn.Module):
             )
             context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
             for layer in self.context_layers:
-                context_states = layer.forward_packed(
+                context_states, _cache = layer.forward_packed(
                     cos_sin=context_cos_sin,
                     hidden_states=context_states,
                     cu_seqlens=cu_context,
@@ -1651,15 +1643,10 @@ class URM_Inner(nn.Module):
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[URMCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
-        if not self.config.variable_seq_lengths:
-            raise ValueError("answer_only is currently implemented for packed variable-length batches only.")
-        if self.use_hrm:
-            raise ValueError("answer_only packed mode is not supported when H_layers > 0.")
-
         input_embeddings, token_indices = self._input_embeddings_packed(batch)
         cu_seqlens, max_seqlen = self._packed_cu_seqlens(batch)
         cos_sin = self._rotary_cos_sin_packed(batch, token_indices)
-        input_embeddings = self._run_token_layers_packed(
+        input_embeddings, _prelude_cache = self._run_token_layers(
             hidden_states=input_embeddings,
             layers=self.prelude_layers,
             cos_sin=cos_sin,
@@ -1684,7 +1671,7 @@ class URM_Inner(nn.Module):
             )
         if answer_indices.numel() == 0:
             new_carry = replace(carry, current_hidden=hidden_states.detach())
-            head_hidden_states = self._run_token_layers_packed(
+            head_hidden_states, _coda_cache = self._run_token_layers(
                 hidden_states=hidden_states,
                 layers=self.coda_layers,
                 cos_sin=cos_sin,
@@ -1702,7 +1689,7 @@ class URM_Inner(nn.Module):
         )
         context_cos_sin = self._slice_packed_cos_sin(cos_sin, context_indices)
         for layer in self.context_layers:
-            context_states = layer.forward_packed(
+            context_states, _cache = layer.forward_packed(
                 cos_sin=context_cos_sin,
                 hidden_states=context_states,
                 cu_seqlens=cu_context,
@@ -1754,7 +1741,7 @@ class URM_Inner(nn.Module):
         for _ in range(self.config.grad_H_cycles):
             hidden_states = run_answer_layers(hidden_states)
         new_carry = replace(carry, current_hidden=hidden_states.detach())
-        head_hidden_states = self._run_token_layers_packed(
+        head_hidden_states, _coda_cache = self._run_token_layers(
             hidden_states=hidden_states,
             layers=self.coda_layers,
             cos_sin=cos_sin,
@@ -1764,7 +1751,7 @@ class URM_Inner(nn.Module):
         output = self.lm_head(head_hidden_states[answer_indices])
         q_logits = self.q_head(head_hidden_states[cu_seqlens[:-1].to(torch.long)]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), None
-
+#endregion
 
 class URM(nn.Module):
     def __init__(self, config_dict: dict):
@@ -1894,11 +1881,6 @@ class URM(nn.Module):
             token_max = self.config.vocab_size - 1
         token_min = int(self.config.answer_initial_random_token_min)
         token_max = int(token_max)
-        if token_max < token_min:
-            raise ValueError(
-                "answer_initial_random_token_max must be >= answer_initial_random_token_min, "
-                f"got {token_max} < {token_min}"
-            )
 
         candidates = torch.arange(token_min, token_max + 1, dtype=torch.long, device=device)
         candidates = candidates[
@@ -1906,11 +1888,6 @@ class URM(nn.Module):
             & (candidates != int(self.config.answer_initial_eos_token_id))
         ]
         candidates = candidates[(0 <= candidates) & (candidates < self.config.vocab_size)]
-        if candidates.numel() == 0:
-            raise ValueError(
-                "answer_initial random token range has no valid tokens after excluding "
-                "pad/eos and clipping to vocab_size."
-            )
         return candidates
 
     def _random_non_special_tokens(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
@@ -1929,13 +1906,10 @@ class URM(nn.Module):
             return batch["answer_mask"].to(device=batch["inputs"].device, dtype=torch.bool)
         return batch["labels"] != -100
 
-    def _safe_label_tokens(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _label_embeddings(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         labels = labels.to(device=labels.device, dtype=torch.long)
         valid = (labels >= 0) & (labels < self.config.vocab_size)
-        return torch.where(valid, labels, torch.zeros_like(labels)), valid
-
-    def _label_embeddings(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        safe_labels, valid = self._safe_label_tokens(labels)
+        safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
         embeddings = self.inner.embed_tokens(safe_labels.to(torch.int32))
         return self.inner.embed_scale * embeddings, valid
 
@@ -1955,7 +1929,9 @@ class URM(nn.Module):
             embeddings, valid_labels = self._label_embeddings(labels)
             return embeddings, answer_mask & valid_labels
 
-        safe_labels, valid_labels = self._safe_label_tokens(labels)
+        labels = labels.to(device=labels.device, dtype=torch.long)
+        valid_labels = (labels >= 0) & (labels < self.config.vocab_size)
+        safe_labels = torch.where(valid_labels, labels, torch.zeros_like(labels))
         if replace_probs is None:
             replace_probs = self._sample_D_ratios(tuple(safe_labels.shape), safe_labels.device)
         replace_probs = replace_probs.to(device=safe_labels.device, dtype=torch.float32)
@@ -1996,8 +1972,6 @@ class URM(nn.Module):
             random_tokens = self._random_non_special_tokens((batch_size, seq_len), batch["inputs"].device)
             embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
         else:
-            if "labels" not in batch:
-                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
             replace_probs = None
             if mode == "noised_label_D":
                 replace_probs = self._sample_D_ratios(
@@ -2015,13 +1989,7 @@ class URM(nn.Module):
         labels = batch["labels"]
         if labels.numel() == batch["inputs"].numel():
             return labels[answer_data_mask]
-        if labels.numel() == int(answer_data_mask.sum().item()):
-            return labels
-        raise ValueError(
-            "Packed answer initialization expected labels to be either full sequence labels "
-            f"({batch['inputs'].numel()} tokens) or answer-only labels "
-            f"({int(answer_data_mask.sum().item())} tokens), got {labels.numel()}."
-        )
+        return labels
 
     def _make_packed_initial_hidden(self, batch: Dict[str, torch.Tensor], low: bool = False) -> torch.Tensor:
         lengths = self.inner._packed_lengths(batch)
@@ -2051,8 +2019,6 @@ class URM(nn.Module):
             embeddings = self.inner.embed_scale * self.inner.embed_tokens(random_tokens.to(torch.int32))
             valid_mask = torch.ones((answer_indices.numel(),), dtype=torch.bool, device=answer_indices.device)
         else:
-            if "labels" not in batch:
-                raise ValueError(f"{self.config.answer_initial_mode} requires labels in the batch.")
             answer_labels = self._packed_answer_labels(batch, answer_data_mask)
             replace_probs = None
             if mode == "noised_label_D":
@@ -2323,14 +2289,66 @@ class URM(nn.Module):
             return diff_norm / (1e-7 + sum_norm / 2)
         return torch.norm(x1 - x2, dim=(1,2)) / (1e-7 + torch.norm(x1 + x2, dim=(1,2)) / 2)
 
+    def _inner_cache_loop_count(self) -> int:
+        if self.inner.use_hrm:
+            return self.config.H_cycles * (self.config.L_cycles + 1)
+        return self.config.H_cycles * self.config.L_cycles
+
+    def _cache_loop_offset(self, cache: Optional[URMInferenceCache], steps: torch.Tensor) -> int:
+        if cache is None:
+            return 0
+
+        inner_loop_count = self._inner_cache_loop_count()
+        cache_loop_count = len(cache.layers)
+        if cache_loop_count == inner_loop_count:
+            return 0
+
+        def single_step() -> int:
+            if steps.numel() == 0:
+                return 0
+            unique_steps = torch.unique(steps.detach())
+            if unique_steps.numel() != 1:
+                raise RuntimeError("Batched URMInferenceCache use requires all samples to share the same loop step.")
+            step = int(unique_steps[0].item())
+            if step < 0 or step >= self.config.loops:
+                raise RuntimeError(f"Cache loop step {step} is outside configured loops={self.config.loops}.")
+            return step
+
+        if cache_loop_count == self.config.loops:
+            if inner_loop_count != 1:
+                raise RuntimeError(
+                    "URMInferenceCache with config.loops entries requires exactly one inner recurrent loop per forward."
+                )
+            return single_step()
+
+        if cache_loop_count == self.config.loops * inner_loop_count:
+            return single_step() * inner_loop_count
+
+        raise RuntimeError(
+            "URMInferenceCache loop count must match the inner recurrent loop count, "
+            "config.loops, or config.loops * inner recurrent loop count."
+        )
+
     def forward(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
-        compute_target_q=False
-    ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        compute_target_q=False,
+        cache: Optional[URMInferenceCache] = None,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         if self.config.variable_seq_lengths:
-            return self._forward_packed(carry, batch, compute_target_q=compute_target_q)
+            return self._forward_packed(
+                carry,
+                batch,
+                compute_target_q=compute_target_q,
+                cache=cache,
+                return_cache=return_cache,
+                max_cache_len=max_cache_len,
+                cache_chunk_size=cache_chunk_size,
+            )
 
         carry, batch = self._align_variable_batch(carry, batch)
         new_steps = torch.where(carry.halted, 0, carry.steps)
@@ -2344,7 +2362,21 @@ class URM(nn.Module):
         }
         new_carry = self._reset_fixed_carry(carry.halted, carry, new_current_data)
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
+        cache_loop_offset = self._cache_loop_offset(cache, new_steps)
+        inner_result = self.inner(
+            new_carry,
+            new_current_data,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
+        )
+        new_cache = None
+        if cache is None and not return_cache:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
+        else:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
         
         hidden_diff_norm = self.norm_func(
             new_carry2.current_hidden.detach(),
@@ -2392,7 +2424,7 @@ class URM(nn.Module):
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
                 # halted = torch.ones_like(halted)
 
-        return (
+        result = (
             URMCarry(
                 current_hidden=new_carry2.current_hidden,
                 steps=new_steps,
@@ -2402,18 +2434,39 @@ class URM(nn.Module):
             ),
             outputs,
         )
+        if cache is not None or return_cache:
+            return result[0], result[1], new_cache
+        return result
 
     def _forward_packed(
         self,
         carry: URMCarry,
         batch: Dict[str, torch.Tensor],
         compute_target_q=False,
-    ) -> Tuple[URMCarry, Dict[str, torch.Tensor]]:
+        cache: Optional[URMInferenceCache] = None,
+        return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
+        cache_chunk_size: Optional[int] = None,
+    ) -> Union[Tuple[URMCarry, Dict[str, torch.Tensor]], Tuple[URMCarry, Dict[str, torch.Tensor], Optional[URMInferenceCache]]]:
         new_current_data = self._merge_packed_current_data(carry, batch)
         new_carry = self._reset_packed_carry(carry.halted, carry, new_current_data)
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
-        new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = self.inner(new_carry, new_current_data)
+        cache_loop_offset = self._cache_loop_offset(cache, new_steps)
+        inner_result = self.inner(
+            new_carry,
+            new_current_data,
+            cache=cache,
+            cache_loop_offset=cache_loop_offset,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
+            cache_chunk_size=cache_chunk_size,
+        )
+        new_cache = None
+        if cache is None and not return_cache:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L = inner_result
+        else:
+            new_carry2, logits, (q_halt_logits, q_continue_logits), diff_L, new_cache = inner_result
 
         hidden_diff_norm = self.norm_func(
             new_carry2.current_hidden.detach(),
@@ -2431,7 +2484,7 @@ class URM(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
         }
-        if self.config.forward_mode in {"answer_only", "prefix_lm"}:
+        if self.config.forward_mode in {"answer_only", "prefix_lm"} and "labels" in new_current_data and not return_cache:
             token_indices = self.inner._packed_data_token_indices(new_current_data)
             (
                 _answer_data_mask,
@@ -2469,7 +2522,7 @@ class URM(nn.Module):
                         norm_diff_threshold = torch.full_like(hidden_diff_norm, norm_diff_max)
                     halted = halted | (hidden_diff_norm < (norm_diff_threshold + self.config.attn_dropout))
 
-        return (
+        result = (
             URMCarry(
                 current_hidden=new_carry2.current_hidden,
                 steps=new_steps,
@@ -2479,3 +2532,6 @@ class URM(nn.Module):
             ),
             outputs,
         )
+        if cache is not None or return_cache:
+            return result[0], result[1], new_cache
+        return result

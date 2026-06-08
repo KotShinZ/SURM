@@ -15,6 +15,16 @@ if str(REPO_ROOT) not in sys.path:
 
 def _install_test_stubs() -> None:
     if "flash_attn" not in sys.modules:
+        try:
+            __import__("flash_attn")
+            return
+        except ImportError:
+            try:
+                __import__("flash_attn_interface")
+                return
+            except ImportError:
+                pass
+
         flash_attn = types.ModuleType("flash_attn")
 
         def _unavailable(*args, **kwargs):
@@ -95,6 +105,18 @@ class PrefixLMTests(unittest.TestCase):
 
         self.assertEqual(answer_model.config.forward_mode, "answer_only")
         self.assertEqual(prefix_model.config.forward_mode, "prefix_lm")
+
+    def test_casual_forward_mode_uses_causal_self_attention(self) -> None:
+        model = URM(_urm_config(forward_mode="casual"))
+
+        self.assertEqual(model.config.forward_mode, "casual")
+        self.assertTrue(model.inner.layers[0].self_attn.causal)
+
+    def test_causal_forward_mode_alias_normalizes_to_casual(self) -> None:
+        model = URM(_urm_config(forward_mode="causal"))
+
+        self.assertEqual(model.config.forward_mode, "casual")
+        self.assertTrue(model.inner.layers[0].self_attn.causal)
 
     def test_prefix_lm_layers_use_context_then_causal_answer_attention(self) -> None:
         model = URM(_urm_config())

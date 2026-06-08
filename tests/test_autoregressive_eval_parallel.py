@@ -31,10 +31,14 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from autoregressive_eval import (  # noqa: E402
+    _generate_casual_no_size_batch,
     _generate_batch_parallel_slow,
     _generate_sample_slow,
-    _iter_autoregressive_eval_batches,
-    _resolve_autoregressive_eval_batch_size,
+    _make_answer_positions_from_tokens,
+)
+from autoregressive_eval_URM import (  # noqa: E402
+    _initial_answer_positions as _urm_initial_answer_positions,
+    _initial_special_positions as _urm_initial_special_positions,
 )
 
 
@@ -79,6 +83,71 @@ class _ToyAutoregressiveModel:
 
     def _token_for(self, identifier: int, answer_pos: int) -> int:
         return int((identifier * 3 + answer_pos + 5) % self.vocab_size)
+
+
+class _ToyCasualAutoregressiveModel(_ToyAutoregressiveModel):
+    def __init__(self, vocab_size: int = 64):
+        super().__init__(vocab_size=vocab_size)
+        self.config = SimpleNamespace(loops=1, forward_mode="casual")
+
+    def __call__(self, *, carry, batch):
+        del carry
+        self.calls += 1
+        total_len = int(batch["inputs"].numel())
+        logits = torch.full(
+            (total_len, self.vocab_size),
+            -1000.0,
+            dtype=torch.float32,
+            device=batch["inputs"].device,
+        )
+
+        seq_offsets = batch["seq_offsets"].to(torch.long)
+        for sample_idx, identifier in enumerate(batch["puzzle_identifiers"].to(torch.long).tolist()):
+            start = int(seq_offsets[sample_idx].item())
+            end = int(seq_offsets[sample_idx + 1].item())
+            answer_len = int(batch["answer_mask"][start:end].sum().item())
+            if answer_len > 0:
+                logits[end - 1, self._token_for(identifier, answer_len - 1)] = 1000.0
+
+        halted = torch.ones((int(batch["puzzle_identifiers"].shape[0]),), dtype=torch.bool, device=batch["inputs"].device)
+        q_halt_logits = batch["puzzle_identifiers"].to(torch.float32) / 10.0
+        return (
+            SimpleNamespace(halted=halted, steps=torch.ones_like(halted, dtype=torch.int32)),
+            {"logits": logits, "q_halt_logits": q_halt_logits},
+        )
+
+
+class _ToyCasualEndTokenModel(_ToyAutoregressiveModel):
+    def __init__(self, vocab_size: int = 16, end_token_id: int = 12):
+        super().__init__(vocab_size=vocab_size)
+        self.config = SimpleNamespace(loops=1, forward_mode="casual", vocab_size=vocab_size)
+        self.end_token_id = end_token_id
+
+    def __call__(self, *, carry, batch):
+        del carry
+        self.calls += 1
+        total_len = int(batch["inputs"].numel())
+        logits = torch.full(
+            (total_len, self.vocab_size),
+            -1000.0,
+            dtype=torch.float32,
+            device=batch["inputs"].device,
+        )
+
+        seq_offsets = batch["seq_offsets"].to(torch.long)
+        for sample_idx, identifier in enumerate(batch["puzzle_identifiers"].to(torch.long).tolist()):
+            end = int(seq_offsets[sample_idx + 1].item())
+            last_token = int(batch["inputs"][end - 1].item())
+            answer_token = int(identifier + 5)
+            next_token = answer_token if last_token == 1 else self.end_token_id
+            logits[end - 1, next_token] = 1000.0
+
+        halted = torch.ones((int(batch["puzzle_identifiers"].shape[0]),), dtype=torch.bool, device=batch["inputs"].device)
+        q_halt_logits = batch["puzzle_identifiers"].to(torch.float32) / 10.0
+        return (
+            SimpleNamespace(halted=halted, steps=torch.ones_like(halted, dtype=torch.int32)),
+            {"logits": logits, "q_halt_logits": q_halt_logits},
+        )
 
 
 def _position_ids(length: int, sample_idx: int, is_answer: bool) -> torch.Tensor:
@@ -175,50 +244,109 @@ class AutoregressiveEvalParallelTests(unittest.TestCase):
             for key in ("preds", "q_halt_logits"):
                 self.assertTrue(torch.equal(single_preds[key], parallel_preds[key]), key)
 
-    def test_parallel_decode_can_be_microbatched(self) -> None:
+    def test_casual_parallel_full_prefix_decode_matches_single_sample_decode(self) -> None:
         batch = _build_packed_batch()
-        full_model = _ToyAutoregressiveModel()
-        full_results = _generate_batch_parallel_slow(full_model, batch, start_token_id=1)
 
-        micro_model = _ToyAutoregressiveModel()
-        micro_results = []
-        spans = []
-        for sample_start, sample_end, micro_batch in _iter_autoregressive_eval_batches(batch, 2):
-            spans.append((sample_start, sample_end))
-            micro_results.extend(_generate_batch_parallel_slow(micro_model, micro_batch, start_token_id=1))
+        single_model = _ToyCasualAutoregressiveModel()
+        single_results = [
+            _generate_sample_slow(single_model, batch, sample_idx, start_token_id=1)
+            for sample_idx in range(int(batch["puzzle_identifiers"].shape[0]))
+        ]
 
-        self.assertEqual(spans, [(0, 2), (2, 3)])
-        self.assertEqual(len(micro_results), len(full_results))
-        for (_full_batch, full_preds, full_metrics), (_micro_batch, micro_preds, micro_metrics) in zip(
-            full_results,
-            micro_results,
+        parallel_model = _ToyCasualAutoregressiveModel()
+        parallel_results = _generate_batch_parallel_slow(parallel_model, batch, start_token_id=1)
+
+        self.assertEqual(len(parallel_results), len(single_results))
+        for (_single_batch, single_preds, single_metrics), (_parallel_batch, parallel_preds, parallel_metrics) in zip(
+            single_results,
+            parallel_results,
         ):
-            self.assertEqual(full_metrics, micro_metrics)
-            self.assertTrue(torch.equal(full_preds["preds"], micro_preds["preds"]))
+            self.assertEqual(single_metrics, parallel_metrics)
+            self.assertTrue(torch.equal(single_preds["preds"], parallel_preds["preds"]))
 
-    def test_autoregressive_eval_batch_size_config_resolution(self) -> None:
-        self.assertIsNone(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(arch=SimpleNamespace())
-            )
+    def test_casual_no_size_decode_stops_on_end_token(self) -> None:
+        prompt_lengths = torch.tensor([2, 3], dtype=torch.int32)
+        prompt_positions = torch.cat(
+            [
+                _position_ids(2, 0, is_answer=False),
+                _position_ids(3, 1, is_answer=False),
+            ],
+            dim=0,
         )
-        self.assertEqual(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(autoregressive_eval_batch_size=2, arch=SimpleNamespace())
-            ),
-            2,
-        )
-        self.assertEqual(
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(arch=SimpleNamespace(autoregressive_eval_batch_size=3))
-            ),
-            3,
-        )
-        with self.assertRaises(ValueError):
-            _resolve_autoregressive_eval_batch_size(
-                SimpleNamespace(autoregressive_eval_batch_size=0, arch=SimpleNamespace())
-            )
+        batch = {
+            "inputs": torch.tensor([2, 3, 4, 5, 6], dtype=torch.int32),
+            "source_inputs": torch.tensor([2, 3, 4, 5, 6], dtype=torch.int32),
+            "prompt_position_ids": prompt_positions,
+            "seq_lengths": prompt_lengths,
+            "seq_offsets": torch.nn.functional.pad(torch.cumsum(prompt_lengths, dim=0), (1, 0)).to(torch.int32),
+            "puzzle_identifiers": torch.tensor([2, 4], dtype=torch.int64),
+        }
+        model = _ToyCasualEndTokenModel()
 
+        results = _generate_casual_no_size_batch(
+            model,
+            batch,
+            start_token_id=1,
+            end_token_id=12,
+            max_new_tokens=8,
+        )
+
+        self.assertEqual(model.calls, 2)
+        self.assertEqual([preds["preds"].tolist() for _final_batch, preds, _metrics in results], [[0, 0, 7], [0, 0, 0, 9]])
+        for final_batch, _preds, _metrics in results:
+            self.assertIsNone(final_batch["labels"])
+            self.assertIn("position_ids", final_batch)
+
+    def test_casual_no_size_positions_use_target_problem_pair_after_start(self) -> None:
+        prompt_positions = torch.tensor(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 1],
+                [0, 1, 0, 0],
+                [6, 0, 0, 0],
+                [6, 0, 0, 1],
+                [0, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        generated_tokens = torch.tensor([2, 3, 1], dtype=torch.long)
+
+        final_positions = _make_answer_positions_from_tokens(
+            generated_tokens,
+            prompt_positions,
+            shifted=False,
+        )
+        shifted_positions = _make_answer_positions_from_tokens(
+            generated_tokens,
+            prompt_positions,
+            shifted=True,
+        )
+
+        self.assertEqual(final_positions[:, 0].tolist(), [6, 6, 6])
+        self.assertEqual(final_positions[:, 1].tolist(), [1, 1, 1])
+        self.assertEqual(shifted_positions[:, 0].tolist(), [6, 6, 6, 6])
+        self.assertEqual(shifted_positions[:, 1].tolist(), [0, 1, 1, 1])
+
+    def test_urm_decode_positions_use_target_problem_pair_after_start(self) -> None:
+        prompt_positions = [
+            torch.tensor(
+                [
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 1],
+                    [0, 1, 0, 0],
+                    [6, 0, 0, 0],
+                    [6, 0, 0, 1],
+                    [0, 0, 0, 0],
+                ],
+                dtype=torch.int32,
+            )
+        ]
+
+        start_positions = _urm_initial_special_positions(prompt_positions, position_dim=4)
+        answer_positions = _urm_initial_answer_positions(prompt_positions, position_dim=4)
+
+        self.assertEqual(start_positions.tolist(), [[6, 0, 0, 0]])
+        self.assertEqual(answer_positions.tolist(), [[6, 1, 0, 0]])
 
 if __name__ == "__main__":
     unittest.main()

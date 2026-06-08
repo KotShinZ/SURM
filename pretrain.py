@@ -43,7 +43,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from logger import global_logger
 
 
-ForwardMode = Literal["standard", "answer_only", "prefix_lm"]
+ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
 class EMAHelper(object):
@@ -149,7 +149,9 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     eval_first: bool = False
     eval_save_outputs: List[str] = []
-    autoregressive_eval_batch_size: Optional[int] = None
+    eval_batch_size: Optional[int] = None
+    autoregressive_eval_max_new_tokens: Optional[int] = None
+    autoregressive_eval_cache_chunk_size: int = 64
 
     loop_deltas: List[str] = []
 
@@ -190,6 +192,7 @@ class PretrainConfig(pydantic.BaseModel):
     full_answer_initial_gamma_max: float = 1.0
     full_answer_initial_noise_token_min: int = 2
     full_answer_initial_noise_token_max: int = 11
+    full_casual_skip_loss_pairs: int = 1
 
     # Benchmark a fixed number of optimizer steps and exit without wandb/eval/checkpointing.
     benchmark_steps: int = 0
@@ -211,6 +214,8 @@ class PretrainConfig(pydantic.BaseModel):
     def _normalize_casual_alias(self):
         if self.causal is not None:
             self.casual = bool(self.causal)
+        if self.eval_batch_size is not None and self.eval_batch_size <= 0:
+            raise ValueError("eval_batch_size must be positive when provided.")
         return self
 
 
@@ -342,9 +347,11 @@ def _separate_mode(config: PretrainConfig) -> str:
 
 def _normalize_forward_mode_name(mode: Any) -> ForwardMode:
     normalized = str(mode).lower()
-    if normalized not in {"standard", "answer_only", "prefix_lm"}:
+    if normalized == "causal":
+        normalized = "casual"
+    if normalized not in {"standard", "answer_only", "prefix_lm", "casual"}:
         raise ValueError(
-            "forward_mode must be one of standard, answer_only, or prefix_lm, "
+            "forward_mode must be one of standard, answer_only, prefix_lm, or casual, "
             f"got {mode!r}"
         )
     return normalized  # type: ignore[return-value]
@@ -376,14 +383,16 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     label_separate = _label_separate_enabled(config)
     forward_mode = _resolve_forward_mode(config)
     prefix_lm_mode = forward_mode == "prefix_lm"
+    casual_lm_mode = forward_mode == "casual"
+    autoregressive_mode = forward_mode in {"prefix_lm", "casual"}
     answer_only_mode = forward_mode in {"answer_only", "prefix_lm"}
     data_fraction = config.data_fraction if not is_test else 1.0
     # Apply online augmentation only during training
     online_aug = config.online_aug if not is_test else None
     # Keep dynamic ARC masking strictly on the training path.
     arc_output_mask = config.arc_output_mask if not is_test else None
-    if prefix_lm_mode and not config.mask_full_training:
-        raise ValueError("prefix_lm forward_mode currently requires mask_full_training=True.")
+    if autoregressive_mode and not config.mask_full_training:
+        raise ValueError(f"{forward_mode} forward_mode currently requires mask_full_training=True.")
     if config.mask_full_training and label_separate:
         raise ValueError("label_separate cannot be combined with mask_full_training.")
     if label_separate and online_aug is not None and online_aug.enabled:
@@ -397,9 +406,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = dataset_cls(
         PuzzleDatasetConfig(
             seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size,
-            padding=bool(config.padding and not prefix_lm_mode),
+            padding=bool(config.padding and not autoregressive_mode),
             forward_mode=forward_mode,
-            casual=prefix_lm_mode,
+            casual=autoregressive_mode,
             data_fraction=data_fraction,
             grad_accum_steps=max(1, config.grad_accum_steps) if not is_test else 1,
             examples_per_puzzle=config.examples_per_puzzle,
@@ -414,6 +423,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
             full_answer_initial_gamma_max=config.full_answer_initial_gamma_max,
             full_answer_initial_noise_token_min=config.full_answer_initial_noise_token_min,
             full_answer_initial_noise_token_max=config.full_answer_initial_noise_token_max,
+            full_casual_skip_loss_pairs=config.full_casual_skip_loss_pairs,
             answer_only_labels=answer_only_mode,
             label_separate=label_separate,
             SeparateMode=_separate_mode(config),
@@ -428,6 +438,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         print("Evaluation split uses PuzzleDatasetSeparate with fully noised answer tokens.")
     elif prefix_lm_mode:
         print("Dataset uses prefix-LM ARC answer tokens without 30x30 answer padding.")
+    elif casual_lm_mode:
+        print("Dataset uses casual causal-LM ARC tokens without 30x30 answer padding.")
     elif answer_only_mode:
         print("Dataset emits answer-only labels for the target answer slots.")
     elif is_test and not config.mask_full_training:
@@ -1546,8 +1558,8 @@ def evaluate(
     cpu_group: Optional[dist.ProcessGroup],
     early_eval: bool = False,
 ):
-    if _resolve_forward_mode(config) == "prefix_lm":
-        from autoregressive_eval import evaluate_autoregressive
+    if _resolve_forward_mode(config) in {"prefix_lm", "casual"}:
+        from autoregressive_eval_URM import evaluate_autoregressive
 
         original_is_log = global_logger.is_log
         global_logger.is_log = False
@@ -1910,17 +1922,18 @@ def launch(hydra_config: DictConfig):
         evaluators = []
     else:
         try:
+            eval_global_batch_size = config.eval_batch_size or config.global_batch_size
             eval_loader, eval_metadata = create_dataloader(
                 config,
                 "test",
                 test_set_mode=True,
                 epochs_per_iter=1,
-                global_batch_size=config.global_batch_size,
+                global_batch_size=eval_global_batch_size,
                 rank=RANK,
                 world_size=WORLD_SIZE,
             )
             print("len(eval_loader) =", len(eval_loader))
-            print("eval_problem_counts =", len(eval_loader) * config.global_batch_size)
+            print("eval_problem_counts =", len(eval_loader) * eval_global_batch_size)
             print("eval_metadata =", eval_metadata)
             # Evaluators
             evaluators = create_evaluators(config, eval_metadata)

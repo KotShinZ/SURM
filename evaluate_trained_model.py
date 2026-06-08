@@ -51,12 +51,10 @@ def apply_eval_overrides(
     config: PretrainConfig,
     *,
     batch_size: int,
-    autoregressive_eval_batch_size: Optional[int],
     loops: Optional[int],
     hidden_diff_threshold: Optional[float],
 ) -> None:
     config.global_batch_size = batch_size
-    config.autoregressive_eval_batch_size = autoregressive_eval_batch_size
     config.grad_accum_steps = 1
     config.load_checkpoint = None
     config.load_checkpoint_file = None
@@ -91,14 +89,51 @@ def _truncate_batch(batch: Dict[str, torch.Tensor], sample_count: int) -> Dict[s
     token_count = int(seq_lengths.sum().item())
     truncated: Dict[str, torch.Tensor] = {}
     original_token_count = int(batch["seq_lengths"].sum().item())
+    label_lengths = batch.get("label_seq_lengths")
+    label_token_count = None
+    original_label_token_count = None
+    if label_lengths is not None:
+        label_token_count = int(label_lengths[:sample_count].sum().item())
+        original_label_token_count = int(label_lengths.sum().item())
+
+    target_label_lengths = batch.get("target_label_seq_lengths")
+    target_label_token_count = None
+    original_target_label_token_count = None
+    if target_label_lengths is not None:
+        target_label_token_count = int(target_label_lengths[:sample_count].sum().item())
+        original_target_label_token_count = int(target_label_lengths.sum().item())
 
     for key, value in batch.items():
         if key == "seq_offsets":
             offsets = torch.zeros(sample_count + 1, dtype=value.dtype, device=value.device)
             offsets[1:] = torch.cumsum(seq_lengths.to(value.dtype), dim=0)
             truncated[key] = offsets
+        elif key == "label_seq_lengths":
+            truncated[key] = value[:sample_count]
+        elif key == "label_seq_offsets" and label_lengths is not None:
+            offsets = torch.zeros(sample_count + 1, dtype=value.dtype, device=value.device)
+            offsets[1:] = torch.cumsum(label_lengths[:sample_count].to(value.dtype), dim=0)
+            truncated[key] = offsets
+        elif key == "target_label_seq_lengths":
+            truncated[key] = value[:sample_count]
+        elif key == "target_label_seq_offsets" and target_label_lengths is not None:
+            offsets = torch.zeros(sample_count + 1, dtype=value.dtype, device=value.device)
+            offsets[1:] = torch.cumsum(target_label_lengths[:sample_count].to(value.dtype), dim=0)
+            truncated[key] = offsets
         elif value.shape[:1] == (current_count,):
             truncated[key] = value[:sample_count]
+        elif (
+            key in {"labels"}
+            and original_label_token_count is not None
+            and value.shape[:1] == (original_label_token_count,)
+        ):
+            truncated[key] = value[:label_token_count]
+        elif (
+            key in {"target_labels", "target_position_ids"}
+            and original_target_label_token_count is not None
+            and value.shape[:1] == (original_target_label_token_count,)
+        ):
+            truncated[key] = value[:target_label_token_count]
         elif value.shape[:1] == (original_token_count,):
             truncated[key] = value[:token_count]
         else:
@@ -474,12 +509,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a saved URM checkpoint.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint file or directory.")
     parser.add_argument("--batch_size", type=int, default=4096, help="Evaluation global batch size.")
-    parser.add_argument(
-        "--autoregressive_eval_batch_size",
-        type=int,
-        default=None,
-        help="Optional per-rank inference batch size cap for prefix-LM autoregressive evaluation.",
-    )
     parser.add_argument("--hidden_diff_threshold", type=float, default=None, help="Override norm_diff_min/max.")
     parser.add_argument("--loops", type=int, default=None, help="Override model loop count.")
     parser.add_argument("--max_problems", type=int, default=None, help="Maximum number of test problems to evaluate.")
@@ -491,8 +520,6 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
-    if args.autoregressive_eval_batch_size is not None and args.autoregressive_eval_batch_size <= 0:
-        raise ValueError("--autoregressive_eval_batch_size must be positive when provided.")
     if args.max_problems is not None and args.max_problems <= 0:
         raise ValueError("--max_problems must be positive when provided.")
 
@@ -508,7 +535,6 @@ def main() -> None:
     apply_eval_overrides(
         config,
         batch_size=args.batch_size,
-        autoregressive_eval_batch_size=args.autoregressive_eval_batch_size,
         loops=args.loops,
         hidden_diff_threshold=args.hidden_diff_threshold,
     )

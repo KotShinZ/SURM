@@ -279,6 +279,138 @@ class PuzzleFullDatasetPaddingTests(unittest.TestCase):
         self.assertEqual(int(sample["seq_lengths"].item()), 3)
         self.assertEqual(int(sample["label_seq_lengths"].item()), 2)
 
+    def test_casual_forward_mode_uses_causal_labels_and_target_last(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            forward_mode="casual",
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        dataset.split = "train"
+
+        sample = dataset._build_pairs_sample(
+            [
+                (np.array([2, 3], dtype=np.int32), np.array([4, 5], dtype=np.int32)),
+                (np.array([6, 7], dtype=np.int32), np.array([8, 9], dtype=np.int32)),
+            ],
+            [((1, 2), (1, 2)), ((1, 2), (1, 2))],
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+
+        self.assertNotIn("label_seq_lengths", sample)
+        self.assertEqual(sample["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3, 13, 4, 5])
+        self.assertEqual(
+            sample["labels"].tolist(),
+            [
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                IGNORE_LABEL_ID,
+                4,
+                5,
+                12,
+            ],
+        )
+        self.assertEqual(
+            sample["answer_mask"].tolist(),
+            [False, False, False, False, False, False, False, False, True, True, True],
+        )
+        self.assertEqual(sample["position_ids"][2].tolist(), [0, 0, 0, 0])
+        self.assertEqual(sample["position_ids"][5].tolist(), [0, 0, 0, 0])
+        self.assertEqual(sample["position_ids"][8].tolist(), [0, 0, 0, 0])
+        self.assertEqual(int(sample["seq_lengths"].item()), 11)
+
+    def test_casual_eval_batch_hides_target_size_fields(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            forward_mode="casual",
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        dataset.split = "test"
+
+        sample = dataset._build_pairs_sample(
+            [
+                (np.array([2, 3], dtype=np.int32), np.array([4, 5], dtype=np.int32)),
+                (np.array([6, 7], dtype=np.int32), np.array([8, 9], dtype=np.int32)),
+            ],
+            [((1, 2), (1, 2)), ((1, 2), (1, 2))],
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+        batch = dataset._collate_built_samples([sample], np.array([123], dtype=np.int64))
+
+        self.assertNotIn("labels", batch)
+        self.assertNotIn("answer_mask", batch)
+        self.assertNotIn("position_ids", batch)
+        self.assertIn("prompt_position_ids", batch)
+        self.assertIn("target_labels", batch)
+        self.assertIn("target_position_ids", batch)
+        self.assertEqual(batch["inputs"].tolist(), [6, 7, 13, 8, 9, 12, 2, 3, 13])
+        self.assertEqual(tuple(batch["prompt_position_ids"].shape), (9, 4))
+        self.assertEqual(batch["prompt_position_ids"][-1].tolist(), [0, 0, 0, 0])
+        self.assertEqual(batch["target_labels"].tolist(), [4, 5])
+        self.assertEqual(batch["target_position_ids"].tolist(), [[1, 1, 0, 0], [1, 1, 0, 1]])
+        self.assertEqual(batch["target_label_seq_lengths"].tolist(), [2])
+        self.assertEqual(batch["target_label_seq_offsets"].tolist(), [0, 2])
+
+    def test_casual_prompt_forced_with_target_tokens_matches_teacher_inputs(self) -> None:
+        dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
+        dataset.config = _config(
+            padding=True,
+            forward_mode="casual",
+            full_answer_initial_mode="black",
+            full_answer_initial_black_token_id=2,
+        )
+        dataset.metadata = _metadata()
+        pairs = [
+            (np.array([2, 3], dtype=np.int32), np.array([4, 1, 5, 0], dtype=np.int32)),
+            (np.array([6, 7], dtype=np.int32), np.array([8, 9], dtype=np.int32)),
+        ]
+        shapes = [((1, 2), (2, 2)), ((1, 2), (1, 2))]
+
+        dataset.split = "train"
+        teacher = dataset._build_pairs_sample(
+            pairs,
+            shapes,
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+        dataset.split = "eval_train"
+        prompt = dataset._build_pairs_sample(
+            pairs,
+            shapes,
+            target_pair_index=0,
+            rng=np.random.default_rng(0),
+        )
+
+        prompt_len = int(prompt["seq_lengths"].item())
+        teacher_answer_mask = teacher["answer_mask"]
+        teacher_answer_inputs = teacher["inputs"][teacher_answer_mask]
+        teacher_answer_sources = teacher["source_inputs"][teacher_answer_mask]
+        teacher_answer_positions = teacher["position_ids"][teacher_answer_mask]
+
+        forced_prompt_inputs = np.concatenate([prompt["inputs"], teacher_answer_inputs[1:]])
+        forced_prompt_sources = np.concatenate([prompt["source_inputs"], teacher_answer_sources[1:]])
+        forced_prompt_positions = np.concatenate([prompt["position_ids"], teacher_answer_positions[1:]], axis=0)
+
+        np.testing.assert_array_equal(prompt["inputs"], teacher["inputs"][:prompt_len])
+        np.testing.assert_array_equal(prompt["source_inputs"], teacher["source_inputs"][:prompt_len])
+        np.testing.assert_array_equal(prompt["position_ids"], teacher["position_ids"][:prompt_len])
+        np.testing.assert_array_equal(forced_prompt_inputs, teacher["inputs"])
+        np.testing.assert_array_equal(forced_prompt_sources, teacher["source_inputs"])
+        np.testing.assert_array_equal(forced_prompt_positions, teacher["position_ids"])
+        self.assertEqual(int(forced_prompt_inputs.shape[0]), int(teacher["seq_lengths"].item()))
+
     def test_answer_only_forward_mode_uses_answer_only_labels_with_padding(self) -> None:
         dataset = PuzzleFullDataset.__new__(PuzzleFullDataset)
         dataset.config = _config(

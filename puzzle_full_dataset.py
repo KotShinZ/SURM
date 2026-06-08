@@ -7,7 +7,7 @@ import torch
 
 from data.build_arc_dataset import _print_color_data
 from models.losses import IGNORE_LABEL_ID
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
+from puzzle_dataset import ARC_EOS_TOKEN_ID, PuzzleDataset, PuzzleDatasetConfig
 
 
 ARC_MAX_GRID_SIZE = 30
@@ -116,6 +116,7 @@ class PuzzleFullDataset(PuzzleDataset):
 
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
         super().__init__(config, split=split)
+        self._configure_full_casual_lm_start_token()
         self._validate_full_config()
         self.metadata.position_id_shape = [
             int(self.config.full_max_pairs),
@@ -140,6 +141,20 @@ class PuzzleFullDataset(PuzzleDataset):
             )
         if not self.metadata.variable_seq_lengths:
             raise ValueError("PuzzleFullDataset expects variable-length ARC examples.")
+        if self.config.full_casual_skip_loss_pairs < 0:
+            raise ValueError(
+                "full_casual_skip_loss_pairs must be >= 0, "
+                f"got {self.config.full_casual_skip_loss_pairs}"
+            )
+
+    def _configure_full_casual_lm_start_token(self) -> None:
+        self.casual_lm_start_token_id: Optional[int] = None
+        if not self.config.uses_casual_lm():
+            return
+
+        self.casual_lm_start_token_id = int(self.metadata.vocab_size)
+        self.metadata.vocab_size = int(self.metadata.vocab_size) + 1
+        self.config.causal_lm_start_token_id = int(self.casual_lm_start_token_id)
 
     def _lazy_load_dataset(self):
         if self._data is None:
@@ -238,6 +253,83 @@ class PuzzleFullDataset(PuzzleDataset):
         shifted[1:] = solution[:-1]
         return shifted
 
+    @staticmethod
+    def _make_next_token_labels(tokens: np.ndarray) -> np.ndarray:
+        labels = np.full_like(tokens, IGNORE_LABEL_ID)
+        if tokens.size > 1:
+            labels[:-1] = tokens[1:]
+        return labels
+
+    def _append_casual_end_token(self, tokens: np.ndarray) -> np.ndarray:
+        end = np.array([self._casual_lm_end_token_id()], dtype=np.int32)
+        return np.concatenate([tokens.astype(np.int32, copy=False), end], axis=0)
+
+    def _prepend_casual_start_token(self, tokens: np.ndarray) -> np.ndarray:
+        start = np.array([self._casual_lm_start_token_id()], dtype=np.int32)
+        return np.concatenate([start, tokens.astype(np.int32, copy=False)], axis=0)
+
+    def _casual_lm_start_token_id(self) -> int:
+        token_id = getattr(self, "casual_lm_start_token_id", None)
+        if token_id is not None:
+            return int(token_id)
+        return int(self._casual_lm_end_token_id()) + 1
+
+    @staticmethod
+    def _casual_special_position() -> np.ndarray:
+        return np.zeros((1, 4), dtype=np.int32)
+
+    def _make_casual_answer_positions(
+        self,
+        pair_id: int,
+        io_id: int,
+        shape: Tuple[int, int],
+        include_end: bool,
+    ) -> np.ndarray:
+        chunks = [
+            self._casual_special_position(),
+            self._make_position_ids(pair_id, io_id, shape),
+        ]
+        if include_end:
+            chunks.append(self._casual_special_position())
+        return np.concatenate(chunks, axis=0).astype(np.int32, copy=False)
+
+    @staticmethod
+    def _advance_casual_row_col(row: int, col: int, token: int) -> Tuple[int, int]:
+        if int(token) == ARC_EOS_TOKEN_ID:
+            return min(row + 1, ARC_MAX_GRID_SIZE - 1), 0
+        return row, min(col + 1, ARC_MAX_GRID_SIZE - 1)
+
+    def _make_casual_shifted_positions(
+        self,
+        pair_id: int,
+        io_id: int,
+        tokens: np.ndarray,
+    ) -> np.ndarray:
+        positions = np.zeros((int(tokens.size) + 1, 4), dtype=np.int32)
+        row = 0
+        col = 0
+        for idx in range(positions.shape[0]):
+            positions[idx] = np.array([pair_id, io_id, row, col], dtype=np.int32)
+            if idx < tokens.size:
+                row, col = self._advance_casual_row_col(row, col, int(tokens[idx]))
+        return positions
+
+    def _append_casual_end_position(
+        self,
+        position_ids: np.ndarray,
+        tokens: np.ndarray,
+    ) -> np.ndarray:
+        if position_ids.shape[0] == 0:
+            return position_ids
+        end_position = position_ids[-1:].astype(np.int32, copy=True)
+        row = int(end_position[0, -2])
+        col = int(end_position[0, -1])
+        if tokens.size > 0:
+            row, col = self._advance_casual_row_col(row, col, int(tokens[-1]))
+        end_position[0, -2] = row
+        end_position[0, -1] = col
+        return np.concatenate([position_ids, end_position], axis=0)
+
     def _build_pairs_sample(
         self,
         pairs: Sequence[Tuple[np.ndarray, np.ndarray]],
@@ -250,8 +342,17 @@ class PuzzleFullDataset(PuzzleDataset):
         if len(pairs) != len(shapes):
             raise ValueError(f"pairs and shapes length mismatch: {len(pairs)} != {len(shapes)}")
 
+        if self.config.uses_casual_lm():
+            if target_pair_index < 0 or target_pair_index >= len(pairs):
+                raise ValueError(f"target_pair_index out of range: {target_pair_index}")
+            order = [idx for idx in range(len(pairs)) if idx != target_pair_index] + [target_pair_index]
+            pairs = [pairs[idx] for idx in order]
+            shapes = [shapes[idx] for idx in order]
+            target_pair_index = len(pairs) - 1
+
         answer_only_labels = self.config.emits_answer_only_labels()
         causal_lm = self.config.uses_prefix_lm()
+        casual_lm = self.config.uses_casual_lm()
 
         input_chunks = []
         label_chunks = []
@@ -259,8 +360,12 @@ class PuzzleFullDataset(PuzzleDataset):
         source_chunks = []
         position_chunks = []
         label_seq_shape = None
+        target_label_tokens = None
+        target_label_positions = None
+        target_label_shape = None
 
         for pair_pos, ((problem, solution), shape_pair) in enumerate(zip(pairs, shapes)):
+            skip_pair_loss = casual_lm and pair_pos < int(self.config.full_casual_skip_loss_pairs)
             input_shape = tuple(int(v) for v in shape_pair[0])
             label_shape = tuple(int(v) for v in shape_pair[1])
             problem = problem.astype(np.int32, copy=False)
@@ -305,28 +410,73 @@ class PuzzleFullDataset(PuzzleDataset):
             position_chunks.append(self._make_position_ids(pair_pos, 0, input_shape))
 
             if pair_pos == target_pair_index:
-                input_solution = (
-                    self._make_causal_answer_inputs(slot_solution)
-                    if causal_lm
-                    else self._make_answer_initial_tokens(slot_solution, rng)
-                )
-                label_solution = slot_labels
-                answer_mask = np.ones(slot_solution.shape, dtype=np.bool_)
-                label_seq_shape = slot_label_shape
+                if casual_lm and self.split != "train":
+                    input_solution = np.array([self._casual_lm_start_token_id()], dtype=np.int32)
+                    label_solution = np.full(input_solution.shape, IGNORE_LABEL_ID, dtype=np.int32)
+                    answer_mask = np.ones(input_solution.shape, dtype=np.bool_)
+                    source_solution = input_solution
+                    solution_positions = self._casual_special_position()
+                    label_seq_shape = np.array([input_solution.shape[0]], dtype=np.int32)
+                    target_label_tokens = solution.astype(np.int32, copy=False)
+                    target_label_positions = self._make_position_ids(pair_pos, 1, label_shape)
+                    target_label_shape = np.array(label_shape, dtype=np.int32)
+                elif casual_lm:
+                    input_solution = self._prepend_casual_start_token(slot_solution)
+                    label_solution = self._append_casual_end_token(slot_labels)
+                    answer_mask = np.ones(input_solution.shape, dtype=np.bool_)
+                    source_solution = input_solution
+                    solution_positions = self._make_casual_answer_positions(
+                        pair_pos,
+                        1,
+                        slot_label_shape,
+                        include_end=False,
+                    )
+                    label_seq_shape = np.array([label_solution.shape[0]], dtype=np.int32)
+                else:
+                    input_solution = (
+                        self._make_causal_answer_inputs(slot_solution)
+                        if causal_lm
+                        else self._make_answer_initial_tokens(slot_solution, rng)
+                    )
+                    label_solution = slot_labels
+                    answer_mask = np.ones(slot_solution.shape, dtype=np.bool_)
+                    source_solution = slot_solution
+                    solution_positions = self._make_position_ids(pair_pos, 1, slot_label_shape)
+                    label_seq_shape = slot_label_shape
             else:
-                input_solution = slot_solution
-                label_solution = np.full_like(slot_solution, IGNORE_LABEL_ID)
+                if casual_lm:
+                    input_solution = self._append_casual_end_token(
+                        self._prepend_casual_start_token(slot_solution)
+                    )
+                    label_solution = self._make_next_token_labels(input_solution)
+                    source_solution = input_solution
+                    solution_positions = self._make_casual_answer_positions(
+                        pair_pos,
+                        1,
+                        slot_label_shape,
+                        include_end=True,
+                    )
+                else:
+                    input_solution = slot_solution
+                    label_solution = np.full_like(slot_solution, IGNORE_LABEL_ID)
+                    source_solution = slot_solution
+                    solution_positions = self._make_position_ids(pair_pos, 1, slot_label_shape)
                 answer_mask = np.zeros(slot_solution.shape, dtype=np.bool_)
+                if casual_lm:
+                    answer_mask = np.zeros(input_solution.shape, dtype=np.bool_)
 
             input_chunks.append(input_solution)
+            label_count_before_solution = len(label_chunks)
             if answer_only_labels:
                 if pair_pos == target_pair_index:
                     label_chunks.append(label_solution)
             else:
                 label_chunks.append(label_solution)
+            if skip_pair_loss and len(label_chunks) > label_count_before_solution:
+                label_chunks[-1] = np.full_like(label_chunks[-1], IGNORE_LABEL_ID)
             answer_mask_chunks.append(answer_mask)
-            source_chunks.append(slot_solution)
-            position_chunks.append(self._make_position_ids(pair_pos, 1, slot_label_shape))
+            source_chunks.append(source_solution)
+            position_chunks.append(solution_positions)
 
         inputs = np.concatenate(input_chunks).astype(np.int32, copy=False)
         labels = np.concatenate(label_chunks).astype(np.int32, copy=False)
@@ -347,6 +497,11 @@ class PuzzleFullDataset(PuzzleDataset):
                 raise ValueError("target_pair_index did not match any pair while building answer-only labels.")
             sample["label_seq_lengths"] = np.array(labels.shape[0], dtype=np.int32)
             sample["label_seq_shapes"] = np.array(label_seq_shape, dtype=np.int32)
+        if target_label_tokens is not None:
+            sample["target_labels"] = target_label_tokens.astype(np.int32, copy=False)
+            sample["target_position_ids"] = target_label_positions.astype(np.int32, copy=False)
+            sample["target_label_seq_lengths"] = np.array(target_label_tokens.shape[0], dtype=np.int32)
+            sample["target_label_seq_shapes"] = target_label_shape.astype(np.int32, copy=False)
         return sample
 
     def _build_full_sample(
@@ -430,6 +585,21 @@ class PuzzleFullDataset(PuzzleDataset):
             self._build_full_sample(dataset, example_indices, rng)
             for example_indices in sample_example_indices
         ]
+        # min_sample = None
+        # print("len samples ", len(samples))
+        # for sample in samples:
+        #     if min_sample is None:
+        #         min_sample = sample
+        #     else:
+        #         if sample["inputs"].shape[0] < min_sample["inputs"].shape[0]:
+        #             min_sample = sample
+        #             break
+        # print("inputs")
+        # print(min_sample["inputs"])
+        # print("labels")
+        # print(min_sample["labels"])
+        # print("position_ids")
+        # print(min_sample["position_ids"])
 
         batch = {
             "inputs": np.concatenate([sample["inputs"] for sample in samples]).astype(np.int32, copy=False),
@@ -459,6 +629,28 @@ class PuzzleFullDataset(PuzzleDataset):
                 [sample["label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
+        if "target_labels" in samples[0]:
+            batch["target_labels"] = np.concatenate(
+                [sample["target_labels"] for sample in samples]
+            ).astype(np.int32, copy=False)
+            batch["target_position_ids"] = np.concatenate(
+                [sample["target_position_ids"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+            batch["target_label_seq_lengths"] = np.array(
+                [int(sample["target_label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["target_label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["target_label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["target_label_seq_shapes"] = np.stack(
+                [sample["target_label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+
+        if self.config.uses_casual_lm() and self.split != "train":
+            batch = self._strip_casual_eval_targets(batch)
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 
@@ -492,6 +684,28 @@ class PuzzleFullDataset(PuzzleDataset):
                 [sample["label_seq_shapes"] for sample in samples],
                 axis=0,
             ).astype(np.int32, copy=False)
+        if "target_labels" in samples[0]:
+            batch["target_labels"] = np.concatenate(
+                [sample["target_labels"] for sample in samples]
+            ).astype(np.int32, copy=False)
+            batch["target_position_ids"] = np.concatenate(
+                [sample["target_position_ids"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+            batch["target_label_seq_lengths"] = np.array(
+                [int(sample["target_label_seq_lengths"]) for sample in samples],
+                dtype=np.int32,
+            )
+            batch["target_label_seq_offsets"] = np.concatenate(
+                [np.zeros((1,), dtype=np.int32), np.cumsum(batch["target_label_seq_lengths"], dtype=np.int32)]
+            )
+            batch["target_label_seq_shapes"] = np.stack(
+                [sample["target_label_seq_shapes"] for sample in samples],
+                axis=0,
+            ).astype(np.int32, copy=False)
+
+        if self.config.uses_casual_lm() and self.split != "train":
+            batch = self._strip_casual_eval_targets(batch)
 
         return {k: torch.from_numpy(v) for k, v in batch.items()}
 

@@ -7,8 +7,10 @@ import math
 
 try:
     from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+    from flash_attn_interface import flash_attn_with_kvcache
 except ImportError:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_with_kvcache
 
 try:
     from torch.nn.attention.flex_attention import flex_attention
@@ -186,7 +188,10 @@ def apply_rotary_pos_emb_4d(
 def apply_rotary_pos_emb_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     orig_dtype = x.dtype
     x = x.to(cos.dtype)
-    x_embed = (x * cos.unsqueeze(-2)) + (rotate_half(x) * sin.unsqueeze(-2))
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed.to(orig_dtype)
 
 
@@ -203,8 +208,14 @@ def apply_rotary_pos_emb_single_2d(
     half = x.shape[-1] // 2
     x_row, x_col = x[..., :half], x[..., half:]
 
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_row.ndim < x_row.ndim:
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -227,9 +238,17 @@ def apply_rotary_pos_emb_single_3d(
     )
     x_depth, x_row, x_col = torch.split(x, axis_dims, dim=-1)
 
-    x_depth = x_depth * cos_depth.unsqueeze(-2) + rotate_half(x_depth) * sin_depth.unsqueeze(-2)
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_depth.ndim < x_depth.ndim:
+        cos_depth = cos_depth.unsqueeze(-2)
+        sin_depth = sin_depth.unsqueeze(-2)
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_depth = x_depth * cos_depth + rotate_half(x_depth) * sin_depth
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_depth, x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -255,10 +274,20 @@ def apply_rotary_pos_emb_single_4d(
     )
     x_pair, x_io, x_row, x_col = torch.split(x, axis_dims, dim=-1)
 
-    x_pair = x_pair * cos_pair.unsqueeze(-2) + rotate_half(x_pair) * sin_pair.unsqueeze(-2)
-    x_io = x_io * cos_io.unsqueeze(-2) + rotate_half(x_io) * sin_io.unsqueeze(-2)
-    x_row = x_row * cos_row.unsqueeze(-2) + rotate_half(x_row) * sin_row.unsqueeze(-2)
-    x_col = x_col * cos_col.unsqueeze(-2) + rotate_half(x_col) * sin_col.unsqueeze(-2)
+    while cos_pair.ndim < x_pair.ndim:
+        cos_pair = cos_pair.unsqueeze(-2)
+        sin_pair = sin_pair.unsqueeze(-2)
+        cos_io = cos_io.unsqueeze(-2)
+        sin_io = sin_io.unsqueeze(-2)
+        cos_row = cos_row.unsqueeze(-2)
+        sin_row = sin_row.unsqueeze(-2)
+        cos_col = cos_col.unsqueeze(-2)
+        sin_col = sin_col.unsqueeze(-2)
+
+    x_pair = x_pair * cos_pair + rotate_half(x_pair) * sin_pair
+    x_io = x_io * cos_io + rotate_half(x_io) * sin_io
+    x_row = x_row * cos_row + rotate_half(x_row) * sin_row
+    x_col = x_col * cos_col + rotate_half(x_col) * sin_col
     return torch.cat([x_pair, x_io, x_row, x_col], dim=-1).to(orig_dtype)
 
 
@@ -617,6 +646,25 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
+    def project_query_key_value(
+        self,
+        hidden_states: torch.Tensor,
+        cos_sin: Optional[CosSin] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(
+            *hidden_states.shape[:-1],
+            self.num_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
+        )
+        query = qkv[..., :self.num_heads, :]
+        key = qkv[..., self.num_heads: self.num_heads + self.num_key_value_heads, :]
+        value = qkv[..., self.num_heads + self.num_key_value_heads:, :]
+
+        query = apply_rotary_pos_emb_one(query, cos_sin)
+        key = apply_rotary_pos_emb_one(key, cos_sin)
+        return query, key, value
+    
     def _masked_score(self, score: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
         return torch.where(keep, score, torch.full_like(score, float("-inf")))
 
@@ -883,28 +931,12 @@ class Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         window_size=-1,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.attention_type not in {"full", "swa"}:
             raise ValueError(f"Packed variable-length attention does not support attention_type='{self.attention_type}'")
 
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
-        qkv = qkv.view(num_tokens, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-        query = qkv[:, :self.num_heads]
-        key = qkv[:, self.num_heads: self.num_heads + self.num_key_value_heads]
-        value = qkv[:, self.num_heads + self.num_key_value_heads:]
-
-        if cos_sin is not None:
-            if len(cos_sin) == 8:
-                query, key = apply_rotary_pos_emb_4d(query, key, *cos_sin)
-            elif len(cos_sin) == 6:
-                query, key = apply_rotary_pos_emb_3d(query, key, *cos_sin)
-            elif len(cos_sin) == 4:
-                query, key = apply_rotary_pos_emb_2d(query, key, *cos_sin)
-            else:
-                cos, sin = cos_sin
-                query, key = apply_rotary_pos_emb(query, key, cos, sin)
-
+        query, key, value = self.project_query_key_value(hidden_states, cos_sin)
         effective_window_size = self.attention_window_size if window_size == -1 else window_size
         if self.attention_type == "full":
             effective_window_size = -1
@@ -924,7 +956,53 @@ class Attention(nn.Module):
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]
 
-        return self.o_proj(attn_output.reshape(num_tokens, self.output_size))
+        return self.o_proj(attn_output.reshape(num_tokens, self.output_size)), key, value
+
+    def forward_decode(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cache_batch_idx: Optional[torch.Tensor] = None,
+        window_size=-1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        batch_size = hidden_states.shape[0]
+        query, key, value = self.project_query_key_value(hidden_states, cos_sin)
+        if query.ndim == 3:
+            query = query.unsqueeze(1)
+            key = key.unsqueeze(1)
+            value = value.unsqueeze(1)
+        effective_window_size = self.attention_window_size if window_size == -1 else window_size
+        if self.attention_type == "full":
+            effective_window_size = -1
+            
+        try:
+            attn_output = flash_attn_with_kvcache(
+                q=query.contiguous(),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                k=key.contiguous(),
+                v=value.contiguous(),
+                cache_seqlens=cache_seqlens.to(device=key_cache.device, dtype=torch.int32),
+                cache_batch_idx=cache_batch_idx,
+                causal=self.causal,
+                window_size=(effective_window_size, effective_window_size),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "flash_attn_with_kvcache failed with shapes "
+                f"q={tuple(query.shape)}, k={tuple(key.shape)}, v={tuple(value.shape)}, "
+                f"k_cache={tuple(key_cache.shape)}, v_cache={tuple(value_cache.shape)}, "
+                f"cache_seqlens={tuple(cache_seqlens.shape)}"
+            ) from exc
+        if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
+            attn_output = attn_output[0]
+
+        attn_output = self.o_proj(attn_output.reshape(batch_size, 1, self.output_size))
+        return attn_output, key, value
 
     def forward_cross_packed(
         self,
@@ -1036,24 +1114,37 @@ class ConvSwiGLU(nn.Module):
         self.down_proj = CastedLinear(inter, hidden_size, bias=False)
         self.mlp_dropout = nn.Dropout(mlp_dropout)
 
-    def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
+    def forward(self, x: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_ffn = F.silu(gate) * up
-        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
+        x_ffn = F.silu(gate) * up # (B, T, inter)
+        token_len = x_ffn.size(1)
+        cache_len = 0
+        if hidden_state_cache is not None:
+            cache_len = hidden_state_cache.size(1)
+            x_ffn = torch.cat([hidden_state_cache, x_ffn], dim=1) # (B, cache_len + T, inter)
+        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype)) # (B, inter, cache_len + T)
         # x_conv = self.dwattn(cos_sin = None, hidden_states=x_ffn, window_size=self.conv_kernel - 1)
-        x_conv = x_conv[..., :up.size(1)]
+        x_conv = x_conv[..., cache_len:cache_len + token_len] # (B, inter, T)
         x_conv = self.act(x_conv)
-        x_conv = x_conv.transpose(1, 2).contiguous()
-        x_out = self.down_proj(self.mlp_dropout(x_conv))
+        x_conv = x_conv.transpose(1, 2).contiguous() # (B, T, inter)
+        x_out = self.down_proj(self.mlp_dropout(x_conv)) # (B, T, hidden_size)
 
-        return x_out
+        if self.training:
+            return x_out, None
+        
+        next_hidden_state_cache = x_ffn[:, -self.conv_kernel - 1:]
+        return x_out, next_hidden_state_cache
 
-    def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor):
+    def forward_packed(self, x: torch.Tensor, cu_seqlens: torch.Tensor, hidden_state_cache: Optional[torch.Tensor] = None):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_ffn = F.silu(gate) * up
+        x_ffn = F.silu(gate) * up # (total_tokens, inter)
+        gap = self.conv_kernel - 1
+        B = int(cu_seqlens.numel()) - 1
 
-        gap = max(0, self.conv_kernel - 1)
-        if gap > 0 and x_ffn.shape[0] > 0:
+        if hidden_state_cache is not None:
+            expanded = torch.stack([hidden_state_cache, x_ffn, torch.zeros_like(x_ffn)], dim=1).reshape(-1, self.inter) # (3*total_tokens, inter)
+            expanded_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long) * 3 + 1
+        else:
             lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=x_ffn.device, dtype=torch.long)
             seq_ids = torch.repeat_interleave(
                 torch.arange(lengths.shape[0], device=x_ffn.device, dtype=torch.long),
@@ -1064,15 +1155,24 @@ class ConvSwiGLU(nn.Module):
             expanded_len = x_ffn.shape[0] + lengths.shape[0] * gap
             expanded = x_ffn.new_zeros((expanded_len, x_ffn.shape[-1]))
             expanded[expanded_positions] = x_ffn
-        else:
-            expanded_positions = torch.arange(x_ffn.shape[0], device=x_ffn.device, dtype=torch.long)
-            expanded = x_ffn
 
         x_conv = self.dwconv(expanded.unsqueeze(0).transpose(1, 2).to(self.dwconv.weight.dtype))
         x_conv = x_conv[..., :expanded.size(0)]
         x_conv = self.act(x_conv).transpose(1, 2).squeeze(0).contiguous()
         x_conv = x_conv[expanded_positions]
-        return self.down_proj(self.mlp_dropout(x_conv))
+        
+        if x_ffn.shape[0] == cu_seqlens[-1]:  # next token prediction
+            next_cache = x_ffn
+        else:
+            next_cache = x_ffn.new_zeros((B, gap, self.inter))
+            for i in range(B):
+                seq_len = cu_seqlens[i + 1] - cu_seqlens[i]
+                if seq_len >= gap:
+                    next_cache[i] = x_ffn[cu_seqlens[i + 1] - gap: cu_seqlens[i + 1]]
+                else:
+                    next_cache[i, -seq_len:] = x_ffn[cu_seqlens[i]: cu_seqlens[i + 1]]
+        
+        return self.down_proj(self.mlp_dropout(x_conv)), next_cache
 
 
 class FullyLinearGLU(nn.Module):
