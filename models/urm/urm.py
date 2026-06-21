@@ -8,6 +8,7 @@ from pydantic import BaseModel, model_validator
 from models.common import packed_norm_ratio_from_lengths, trunc_normal_init_
 from models.layers import (
     rms_norm,
+    SwiGLU,
     ConvSwiGLU,
     Attention,
     RotaryEmbedding,
@@ -111,6 +112,7 @@ class URMConfig(BaseModel):
     L_layers: int = 0
     hidden_size: int
     expansion: float
+    is_ConvSwiGLU: bool = True
     num_heads: int
     pos_encodings: str
     grid_depth: int = 0  # Grid depth for 3D RoPE (0 = use 2D/1D RoPE)
@@ -220,7 +222,9 @@ class URMBlock(nn.Module):
             prefix_seq_len=prefix_seq_len,
             topk_sparsity=config.topk_sparsity,
         )
-        self.mlp = ConvSwiGLU(
+        self.use_conv_swiglu = config.is_ConvSwiGLU
+        mlp_cls = ConvSwiGLU if self.use_conv_swiglu else SwiGLU
+        self.mlp = mlp_cls(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
             mlp_dropout=config.mlp_dropout,
@@ -265,6 +269,24 @@ class URMBlock(nn.Module):
             cache_chunk_size=max(1, int(cache_chunk_size)),
         )
 
+    def _mlp_forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.use_conv_swiglu:
+            return self.mlp(hidden_states)
+        return self.mlp(hidden_states), None
+
+    def _mlp_forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        hidden_state_cache: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.use_conv_swiglu:
+            return self.mlp.forward_packed(hidden_states, cu_seqlens, hidden_state_cache)
+        return self.mlp(hidden_states), None
+
     def forward(
         self,
         cos_sin: CosSin,
@@ -278,7 +300,7 @@ class URMBlock(nn.Module):
             sequence_lengths=sequence_lengths,
         )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output, _conv_hidden_state = self.mlp(hidden_states)
+        mlp_output, _conv_hidden_state = self._mlp_forward(hidden_states)
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
@@ -314,7 +336,11 @@ class URMBlock(nn.Module):
                 window_size=-1,
             )
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output, conv_hidden_state = self.mlp.forward_packed(hidden_states, cu_seqlens, cache.conv_hidden_state if cache is not None else None)
+        mlp_output, conv_hidden_state = self._mlp_forward_packed(
+            hidden_states,
+            cu_seqlens,
+            cache.conv_hidden_state if cache is not None else None,
+        )
         hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
         
         new_cache = None
@@ -356,7 +382,7 @@ class URMBlock(nn.Module):
             causal=causal,
         )
         query_states = rms_norm(query_states + attn_output, variance_epsilon=self.norm_eps)
-        mlp_output, _conv_hidden_state = self.mlp.forward_packed(query_states, cu_seqlens_q)
+        mlp_output, _conv_hidden_state = self._mlp_forward_packed(query_states, cu_seqlens_q)
         query_states = rms_norm(query_states + mlp_output, variance_epsilon=self.norm_eps)
         return query_states
 
