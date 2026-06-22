@@ -101,10 +101,18 @@ def _normalize_attention_window_sizes(
 ForwardMode = Literal["standard", "answer_only", "prefix_lm", "casual", "causal"]
 
 
+def _configured_puzzle_emb_len(config) -> int:
+    puzzle_emb_len = int(getattr(config, "puzzle_emb_len", 0))
+    if puzzle_emb_len > 0:
+        return puzzle_emb_len
+    return -(config.puzzle_emb_ndim // -config.hidden_size)
+
+
 class URMConfig(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
+    puzzle_emb_len: int = 0
     num_puzzle_identifiers: int
     vocab_size: int
     num_layers: int
@@ -113,6 +121,7 @@ class URMConfig(BaseModel):
     hidden_size: int
     expansion: float
     is_ConvSwiGLU: bool = True
+    loop_type: Literal["urm", "trm", "hrm"] = "urm"
     num_heads: int
     pos_encodings: str
     grid_depth: int = 0  # Grid depth for 3D RoPE (0 = use 2D/1D RoPE)
@@ -138,6 +147,7 @@ class URMConfig(BaseModel):
     input_injection_enabled: bool = True
     noise_size: float = 0.0
     noise_seed: int = 42
+    halt_exploration_prob: float = 0.1
     norm_diff_max: float = 0.2
     norm_diff_min: float = 0.1
     diff_L_loss_enabled: bool = False
@@ -202,7 +212,7 @@ class URMConfig(BaseModel):
 class URMBlock(nn.Module):
     def __init__(self, config: URMConfig, attention_window_size: int) -> None:
         super().__init__()
-        prefix_seq_len = -(config.puzzle_emb_ndim // -config.hidden_size) + config.num_memory_tokens
+        prefix_seq_len = _configured_puzzle_emb_len(config) + config.num_memory_tokens
         attention_type = config.attention_type.lower()
         if attention_type in {"full", "swa"}:
             attention_type = "full" if attention_window_size == -1 else "swa"
@@ -405,8 +415,7 @@ class URM_Inner(nn.Module):
         self.padded_grid_height = self.config.grid_height
         self.padded_grid_width = self.config.grid_width
         self.padded_seq_len = self.config.seq_len
-        self.use_hrm = self.config.H_layers > 0
-        self.L_layers = self.config.L_layers if self.use_hrm and self.config.L_layers > 0 else self.config.num_layers
+        self.L_layers = self.config.L_layers if self.config.L_layers > 0 else self.config.num_layers
             
         config_updates = dict(
             seq_len=self.inner_seq_len,
@@ -429,7 +438,7 @@ class URM_Inner(nn.Module):
         )
         self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
-        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
+        self.puzzle_emb_len = _configured_puzzle_emb_len(self.config)
         self.prefix_seq_len = self.puzzle_emb_len + self.config.num_memory_tokens
 
         if self.config.num_memory_tokens > 0:
@@ -462,8 +471,7 @@ class URM_Inner(nn.Module):
             ]
         )
         
-        if self.use_hrm:
-            self.init_hrm()
+        self.init_hrm()
             
         if self.config.patch_io_enabled:
             self.init_patch_io()
@@ -539,22 +547,34 @@ class URM_Inner(nn.Module):
             )
 
     def init_hrm(self):
-        self.H_layer_attention_window_sizes = []
-        self.H_layers = nn.ModuleList()
-        self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
-                self.inner_config.attention_window_size,
-                self.config.H_layers,
+        if self.config.loop_type == "urm":
+            return
+        
+        if self.config.loop_type == "hrm":
+            self.H_layer_attention_window_sizes = []
+            self.H_layers = nn.ModuleList()
+            self.H_layer_attention_window_sizes = _normalize_attention_window_sizes(
+                    self.inner_config.attention_window_size,
+                    self.config.H_layers,
+                )
+            self.H_layers = nn.ModuleList(
+                [
+                    URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
+                    for layer_idx in range(self.config.H_layers)
+                ]
             )
-        self.H_layers = nn.ModuleList(
-            [
-                URMBlock(self.inner_config, attention_window_size=self.H_layer_attention_window_sizes[layer_idx])
-                for layer_idx in range(self.config.H_layers)
-            ]
-        )
         self.low_init_hidden = nn.Buffer(
             trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
+
+    def _effective_H_layers(self) -> Optional[nn.ModuleList]:
+        if self.config.loop_type == "urm":
+            return None
+        if self.config.loop_type == "hrm":
+            return self.H_layers
+        if self.config.loop_type == "trm":
+             return self.layers
 
     def init_patch_io(self):
         if self.config.grid_height > 0 or self.config.grid_width > 0:
@@ -1027,7 +1047,7 @@ class URM_Inner(nn.Module):
     def empty_carry(self, batch_size: int, seq_len: Optional[int] = None) -> URMCarry:
         carry_seq_len = self.inner_seq_len if seq_len is None else seq_len
         low_hidden = None
-        if self.use_hrm:
+        if self.config.loop_type != "urm":
             low_hidden = torch.empty(
                 batch_size,
                 carry_seq_len + self.prefix_seq_len,
@@ -1051,7 +1071,7 @@ class URM_Inner(nn.Module):
             carry.current_hidden
         )
         new_low_hidden = carry.current_low_hidden
-        if self.use_hrm:
+        if self.config.loop_type != "urm":
             if new_low_hidden is None:
                 raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
             new_low_hidden = torch.where(
@@ -1248,6 +1268,7 @@ class URM_Inner(nn.Module):
                             hidden_states=low_hidden_states,
                             input_embeddings=layer_input,
                             layers=L_layers,
+                            **seq_info,
                         )
                     else:
                         hidden_states, _, _, loop_new_cache = self._run_recurrent_layers(
@@ -1422,8 +1443,9 @@ class URM_Inner(nn.Module):
 
         grad_norms = {}
         layers_per_H_cycle = self.config.L_cycles * len(self.layers)
-        if self.use_hrm:
-            layers_per_H_cycle += len(self.H_layers)
+        effective_H_layers = self._effective_H_layers()
+        if effective_H_layers is not None:
+            layers_per_H_cycle += len(effective_H_layers)
         total_unrolled = self.config.grad_H_cycles * layers_per_H_cycle
 
         def make_grad_hook(idx):
@@ -1501,9 +1523,9 @@ class URM_Inner(nn.Module):
 
         hidden_states, low_hidden_states, diff_L, _unrolled_idx, new_cache = self._loop_layers(
             hidden_states=hidden_states,
-            low_hidden_states=low_hidden_states if self.use_hrm else None,
+            low_hidden_states=low_hidden_states if self.config.loop_type != "urm" else None,
             input_embeddings=input_embeddings,
-            H_layers=self.H_layers if self.use_hrm else None,
+            H_layers=self._effective_H_layers(),
             L_layers=self.layers,
             H_cycles=self.config.H_cycles,
             L_cycles=self.config.L_cycles,
@@ -2064,7 +2086,7 @@ class URM(nn.Module):
         return hidden
 
     def _make_initial_low_hidden(self, batch: Dict[str, torch.Tensor], packed: bool) -> Optional[torch.Tensor]:
-        if not self.inner.use_hrm:
+        if self.config.loop_type == "urm":
             return None
         if packed:
             return self._make_packed_initial_hidden(batch, low=True)
@@ -2107,7 +2129,7 @@ class URM(nn.Module):
             carry.current_hidden,
         )
         new_low_hidden = carry.current_low_hidden
-        if self.inner.use_hrm:
+        if self.config.loop_type != "urm":
             if new_low_hidden is None:
                 raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
             initial_low_hidden = self._make_fixed_initial_hidden(current_data, low=True)
@@ -2206,8 +2228,8 @@ class URM(nn.Module):
                 old_hidden_offsets.append(old_hidden_offsets[-1] + int(length))
 
         hidden_chunks = []
-        low_hidden_chunks = [] if self.inner.use_hrm else None
-        if self.inner.use_hrm and carry.current_low_hidden is None:
+        low_hidden_chunks = [] if self.config.loop_type != "urm" else None
+        if self.config.loop_type != "urm" and carry.current_low_hidden is None:
             raise RuntimeError("HRM mode requires current_low_hidden in the carry.")
         initial_hidden = self._make_packed_initial_hidden(current_data)
         initial_low_hidden = self._make_packed_initial_hidden(current_data, low=True) if low_hidden_chunks is not None else None
@@ -2316,7 +2338,7 @@ class URM(nn.Module):
         return torch.norm(x1 - x2, dim=(1,2)) / (1e-7 + torch.norm(x1 + x2, dim=(1,2)) / 2)
 
     def _inner_cache_loop_count(self) -> int:
-        if self.inner.use_hrm:
+        if self.config.loop_type != "urm":
             return self.config.H_cycles * (self.config.L_cycles + 1)
         return self.config.H_cycles * self.config.L_cycles
 
@@ -2432,7 +2454,7 @@ class URM(nn.Module):
                 halted = halted | (q_halt_logits > 0)
 
                 # Exploration
-                halt_exploration_prob = 0.1
+                halt_exploration_prob = self.config.halt_exploration_prob
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
                 
@@ -2534,7 +2556,7 @@ class URM(nn.Module):
             if self.training and (self.config.loops > 1):
                 halted = halted | (q_halt_logits > 0)
 
-                halt_exploration_prob = 0.1
+                halt_exploration_prob = self.config.halt_exploration_prob
                 min_halt_steps = (torch.rand_like(q_halt_logits) < halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.loops + 1)
                 halted = halted & (new_steps >= min_halt_steps)
 

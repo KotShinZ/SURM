@@ -16,6 +16,7 @@ coda_layers: 0
 hidden_size: 512
 num_heads: 8
 expansion: 4
+is_ConvSwiGLU: true
 
 H_cycles: 4
 L_cycles: 3
@@ -24,6 +25,7 @@ grad_H_cycles: 1
 loop_deltas: [0]
 
 puzzle_emb_ndim: ${.hidden_size}
+puzzle_emb_len: 0
 pos_encodings: rope
 # 4D RoPE: set depth/io/height/width to enable explicit (pair,io,row,col) rotary positions.
 # 3D RoPE: leave io=0 and set depth/height/width for (depth,row,col).
@@ -60,6 +62,7 @@ attention_topk: 0  # Used by topK. Keeps exactly this many tokens per query when
 topk_sparsity: 0.0  # fraction of attention scores to drop (e.g. 0.8 = keep top 20%)
 
 use_act: False
+halt_exploration_prob: 0.1
 norm_diff_max: 0.1
 norm_diff_min: 0.001
 input_embedding_noise_size: 0.0
