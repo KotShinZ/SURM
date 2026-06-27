@@ -509,6 +509,7 @@ class URM_Inner(nn.Module):
         
     def init_rope_nD(self):
         if (self.inner_config.grid_depth > 0 and self.inner_config.grid_io > 0 and self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0):
+            print(f"Using 4D RoPE, grid_depth={self.inner_config.grid_depth}, grid_io={self.inner_config.grid_io}, grid_height={self.inner_config.grid_height}, grid_width={self.inner_config.grid_width}")
             self.rotary_emb = RotaryEmbedding4D(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_depth=self.inner_config.grid_depth,
@@ -523,6 +524,7 @@ class URM_Inner(nn.Module):
             and self.inner_config.grid_height > 0
             and self.inner_config.grid_width > 0
         ):
+            print(f"Using 3D RoPE, grid_depth={self.inner_config.grid_depth}, grid_height={self.inner_config.grid_height}, grid_width={self.inner_config.grid_width}")
             self.rotary_emb = RotaryEmbedding3D(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_depth=self.inner_config.grid_depth,
@@ -532,6 +534,7 @@ class URM_Inner(nn.Module):
                 base=self.inner_config.rope_theta,
             )
         elif self.inner_config.grid_height > 0 and self.inner_config.grid_width > 0:
+            print(f"Using 2D RoPE, grid_height={self.inner_config.grid_height}, grid_width={self.inner_config.grid_width}")
             self.rotary_emb = RotaryEmbedding2D(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 grid_height=self.inner_config.grid_height,
@@ -540,6 +543,7 @@ class URM_Inner(nn.Module):
                 base=self.inner_config.rope_theta,
             )
         else:
+            print(f"Using 1D RoPE, seq_len={self.inner_seq_len}, prefix_seq_len={self.prefix_seq_len}")
             self.rotary_emb = RotaryEmbedding(
                 dim=self.inner_config.hidden_size // self.inner_config.num_heads,
                 max_position_embeddings=self.inner_seq_len + self.prefix_seq_len,
