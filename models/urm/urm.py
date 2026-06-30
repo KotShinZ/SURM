@@ -805,6 +805,8 @@ class URM_Inner(nn.Module):
                 (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding),
                 dim=-2,
             )
+        print(f"puzzle_emb_len: {self.puzzle_emb_len}, embedding.shape: {embedding.shape}, puzzle_embedding.shape: {puzzle_embedding.shape if self.config.puzzle_emb_ndim > 0 else 'N/A'}")
+            
         memory_embedding = self._memory_embeddings(embedding.shape[0], embedding.device)
         if memory_embedding is not None:
             embedding = torch.cat(
@@ -815,6 +817,7 @@ class URM_Inner(nn.Module):
                 ),
                 dim=-2,
             )
+        
         embedding = self.embed_scale * embedding
         embedding = self._apply_label_separate_C_fixed(embedding, batch)
 
@@ -928,7 +931,6 @@ class URM_Inner(nn.Module):
                 layout=embedding.layout,
             )
             embedding = embedding + noise * self.config.input_embedding_noise_size
-
         return embedding, token_indices
 
     def _rotary_cos_sin_packed(self, batch: Dict[str, torch.Tensor], token_indices: torch.Tensor) -> CosSin:

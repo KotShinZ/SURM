@@ -1,5 +1,5 @@
 # Example: WANDB_MODE=offline bash scripts/URM_arcagi1_H100_full.sh
-run_name="URM-arcagi1-full-gen-l4-casual"
+run_name="URM-arcagi1-full-gen-l4-pad"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
@@ -13,7 +13,7 @@ arch.loss.label_mask=0.0 \
 global_batch_size=128 \
 grad_accum_steps=6 \
 epochs=100000 \
-eval_interval=10000 \
+eval_interval=2000 \
 eval_first=False \
 eval_batch_size=64 \
 autoregressive_eval_cache_chunk_size=64 \
@@ -25,7 +25,7 @@ weight_decay=0.1 \
 evaluators="[]" \
 +mask_full_training=True \
 +padding=True \
-full_answer_initial_mode="noised_label" \
+full_answer_initial_mode="black" \
 use_muon=False \
 # --load_checkpoint_file checkpoints/URM-nca2d/step_13020.pt
 # arch.grid_depth=25 arch.grid_height=30 arch.grid_width=30 \
