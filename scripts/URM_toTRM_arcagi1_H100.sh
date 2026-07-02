@@ -1,14 +1,14 @@
-run_name="TRM-arcagi1"
+run_name="TRM-arcagi1-noeval"
 checkpoint_path="checkpoints/${run_name}" 
 mkdir -p $checkpoint_path
 
 torchrun --nproc-per-node 1 pretrain.py \
-data_path=data/arc1concept-aug-1000-pad \
+data_path=data/arc1concept-aug-1000-noeval-pad \
 arch=urm \
 arch.loops=16 \
 arch.H_cycles=3 arch.L_cycles=4 arch.grad_H_cycles=1 \
 arch.num_layers=2 arch.L_layers=2 arch.H_layers=2 \
-arch.puzzle_emb_len=16 arch.is_ConvSwiGLU=False \
+arch.is_ConvSwiGLU=False \
 arch.use_act=True arch.halt_exploration_prob=0.1 \
 arch.norm_diff_max=0.1 arch.norm_diff_min=0.001 \
 global_batch_size=256 \

@@ -20,3 +20,4 @@ data/**
 NCA_datas/nca_dataset_colab_demo/*
 NCA_datas/continuous_nca_dataset_colab_demo/*
 .cache/*
+flash-attention
