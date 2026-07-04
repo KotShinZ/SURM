@@ -23,6 +23,8 @@ weight_decay=0.1 \
 +ema=True \
 evaluators="[]" \
 +arch.loop_type="trm"
+# arch.grid_height=30 arch.grid_width=30 \
+#arch.attention_type="conv" \
 
 # +padding=True \
 # arch.grid_height=30 arch.grid_width=30 \

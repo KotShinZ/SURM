@@ -11,6 +11,7 @@ from models.layers import (
     SwiGLU,
     ConvSwiGLU,
     Attention,
+    DepthwiseConv2DAttention,
     RotaryEmbedding,
     RotaryEmbedding2D,
     RotaryEmbedding3D,
@@ -216,22 +217,32 @@ class URMBlock(nn.Module):
         attention_type = config.attention_type.lower()
         if attention_type in {"full", "swa"}:
             attention_type = "full" if attention_window_size == -1 else "swa"
-        self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=config.forward_mode == "casual",
-            attn_dropout=config.attn_dropout,
-            attention_type=attention_type,
-            attention_window_size=attention_window_size,
-            attention_window_size_2d=config.attention_window_size_2d,
-            attention_topk=config.attention_topk,
-            grid_height=config.grid_height,
-            grid_width=config.grid_width,
-            prefix_seq_len=prefix_seq_len,
-            topk_sparsity=config.topk_sparsity,
-        )
+        if attention_type == "conv":
+            self.self_attn = DepthwiseConv2DAttention(
+                hidden_size=config.hidden_size,
+                grid_height=config.grid_height,
+                grid_width=config.grid_width,
+                prefix_seq_len=prefix_seq_len,
+                attention_window_size_2d=config.attention_window_size_2d,
+                causal=config.forward_mode == "casual",
+            )
+        else:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=config.forward_mode == "casual",
+                attn_dropout=config.attn_dropout,
+                attention_type=attention_type,
+                attention_window_size=attention_window_size,
+                attention_window_size_2d=config.attention_window_size_2d,
+                attention_topk=config.attention_topk,
+                grid_height=config.grid_height,
+                grid_width=config.grid_width,
+                prefix_seq_len=prefix_seq_len,
+                topk_sparsity=config.topk_sparsity,
+            )
         self.use_conv_swiglu = config.is_ConvSwiGLU
         mlp_cls = ConvSwiGLU if self.use_conv_swiglu else SwiGLU
         self.mlp = mlp_cls(
@@ -325,6 +336,9 @@ class URMBlock(nn.Module):
         max_cache_len: Optional[int] = None,
         cache_chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[URMLayerInferenceCache]]:
+        if getattr(self.self_attn, "attention_type", None) == "conv" and (cache is not None or collect_cache):
+            raise ValueError("attention_type='conv' does not support KV-cache collection or cached decode.")
+
         if cache is not None:
             decode_hidden_states = hidden_states.unsqueeze(1) if hidden_states.ndim == 2 else hidden_states
             cache.ensure_capacity(int(decode_hidden_states.shape[1]))

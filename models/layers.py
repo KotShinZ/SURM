@@ -629,6 +629,162 @@ class RotaryEmbedding4D(nn.Module):
             )
         return tuple(with_prefix)
 
+
+class DepthwiseConv2DAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        grid_height: int,
+        grid_width: int,
+        prefix_seq_len: int = 0,
+        attention_window_size_2d: int = 1,
+        causal: bool = False,
+    ) -> None:
+        super().__init__()
+        if grid_height <= 0 or grid_width <= 0:
+            raise ValueError("attention_type='conv' requires grid_height > 0 and grid_width > 0")
+
+        self.hidden_size = hidden_size
+        self.grid_height = grid_height
+        self.grid_width = grid_width
+        self.prefix_seq_len = prefix_seq_len
+        self.grid_area = grid_height * grid_width
+        self.attention_type = "conv"
+        self.causal = causal
+
+        radius = max(0, int(attention_window_size_2d))
+        kernel_size = radius * 2 + 1
+        self.dwconv = nn.Conv2d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            padding=radius,
+            groups=hidden_size,
+            bias=True,
+        )
+
+    def _grid_count(self, seq_len: int) -> int:
+        data_len = seq_len - self.prefix_seq_len
+        if data_len < 0:
+            raise ValueError(
+                f"attention_type='conv' expected at least prefix_seq_len={self.prefix_seq_len} tokens, got {seq_len}"
+            )
+        if data_len % self.grid_area != 0:
+            raise ValueError(
+                "attention_type='conv' expects the non-prefix sequence length to be a multiple of "
+                f"grid_height * grid_width ({self.grid_area}), got {data_len}"
+            )
+        return data_len // self.grid_area
+
+    def _conv_dtype(self, hidden_states: torch.Tensor) -> torch.dtype:
+        if hidden_states.device.type == "cpu" and hidden_states.dtype in {torch.float16, torch.bfloat16}:
+            return torch.float32
+        return hidden_states.dtype
+
+    def forward(
+        self,
+        cos_sin: Optional[CosSin],
+        hidden_states: torch.Tensor,
+        window_size=-1,
+        sequence_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                "attention_type='conv' expects hidden_states with shape "
+                f"(B, T, C), got {tuple(hidden_states.shape)}"
+            )
+
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        if hidden_size != self.hidden_size:
+            raise ValueError(f"attention_type='conv' expected hidden_size={self.hidden_size}, got {hidden_size}")
+
+        grid_count = self._grid_count(seq_len)
+        output = torch.zeros_like(hidden_states)
+        if grid_count == 0:
+            return output
+
+        data_len = grid_count * self.grid_area
+        data_states = hidden_states[:, self.prefix_seq_len : self.prefix_seq_len + data_len]
+        valid_mask = None
+        if sequence_lengths is not None:
+            valid_data_lens = (
+                sequence_lengths.to(device=hidden_states.device, dtype=torch.long) - self.prefix_seq_len
+            ).clamp(min=0, max=data_len)
+            positions = torch.arange(data_len, device=hidden_states.device, dtype=torch.long)
+            valid_mask = positions.unsqueeze(0) < valid_data_lens.unsqueeze(1)
+            data_states = data_states.masked_fill(~valid_mask.unsqueeze(-1), 0)
+
+        grid_states = data_states.view(
+            batch_size,
+            grid_count,
+            self.grid_height,
+            self.grid_width,
+            self.hidden_size,
+        )
+        grid_states = grid_states.permute(0, 1, 4, 2, 3).reshape(
+            batch_size * grid_count,
+            self.hidden_size,
+            self.grid_height,
+            self.grid_width,
+        )
+
+        conv_dtype = self._conv_dtype(hidden_states)
+        bias = self.dwconv.bias.to(conv_dtype) if self.dwconv.bias is not None else None
+        conv_output = F.conv2d(
+            grid_states.to(conv_dtype),
+            self.dwconv.weight.to(conv_dtype),
+            bias=bias,
+            padding=self.dwconv.padding,
+            groups=self.hidden_size,
+        )
+        conv_output = conv_output.reshape(
+            batch_size,
+            grid_count,
+            self.hidden_size,
+            self.grid_height,
+            self.grid_width,
+        )
+        conv_output = conv_output.permute(0, 1, 3, 4, 2).reshape(
+            batch_size,
+            data_len,
+            self.hidden_size,
+        ).to(hidden_states.dtype)
+        if valid_mask is not None:
+            conv_output = conv_output.masked_fill(~valid_mask.unsqueeze(-1), 0)
+
+        output[:, self.prefix_seq_len : self.prefix_seq_len + data_len] = conv_output
+        return output
+
+    def forward_packed(
+        self,
+        cos_sin: Optional[CosSin],
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        window_size=-1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                f"attention_type='conv' packed forward expects hidden_states with shape (N, C), got {tuple(hidden_states.shape)}"
+            )
+
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=hidden_states.device, dtype=torch.long)
+        batch_size = int(lengths.shape[0])
+        padded = hidden_states.new_zeros((batch_size, max_seqlen, hidden_states.shape[-1]))
+        token_mask = torch.arange(max_seqlen, device=hidden_states.device).unsqueeze(0) < lengths.unsqueeze(1)
+        padded[token_mask] = hidden_states
+
+        output = self.forward(cos_sin=None, hidden_states=padded, sequence_lengths=lengths)
+        empty_kv = hidden_states.new_empty((hidden_states.shape[0], 0, 0))
+        return output[token_mask], empty_kv, empty_kv
+
+    def forward_decode(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise ValueError("attention_type='conv' does not support cached decode.")
+
+    def forward_cross_packed(self, *args, **kwargs) -> torch.Tensor:
+        raise ValueError("attention_type='conv' does not support packed cross-attention.")
+
+
 class Attention(nn.Module):
     def __init__(
         self,
