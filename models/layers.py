@@ -1,16 +1,45 @@
-from typing import Callable, Tuple, Optional
+import importlib
+import math
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-import math
 
-try:
-    from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
-    from flash_attn_interface import flash_attn_with_kvcache
-except ImportError:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn import flash_attn_with_kvcache
+
+def _missing_flash_attn_with_kvcache(*args, **kwargs):
+    raise ImportError("flash_attn_with_kvcache is not available in the selected flash-attn backend")
+
+
+def _load_flash_attn_backend():
+    for module_name, backend_name in (
+        ("flash_attn_interface", "flash-attn3"),
+        ("flash_attn", "flash-attn2"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+            func = getattr(module, "flash_attn_func")
+            varlen_func = getattr(module, "flash_attn_varlen_func")
+        except (ImportError, AttributeError, OSError):
+            continue
+
+        kvcache_func = getattr(module, "flash_attn_with_kvcache", None)
+        if kvcache_func is None and module_name == "flash_attn_interface":
+            try:
+                flash_attn2 = importlib.import_module("flash_attn")
+                kvcache_func = getattr(flash_attn2, "flash_attn_with_kvcache", None)
+            except (ImportError, AttributeError, OSError):
+                pass
+        if kvcache_func is None:
+            kvcache_func = _missing_flash_attn_with_kvcache
+
+        print(f"Using {backend_name} ({module_name})")
+        return func, varlen_func, kvcache_func
+
+    raise ImportError("Neither flash-attn3 nor flash-attn2 is available")
+
+
+flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache = _load_flash_attn_backend()
 
 try:
     from torch.nn.attention.flex_attention import flex_attention
@@ -803,7 +832,7 @@ class Attention(nn.Module):
             max_seqlen_k=max_seqlen,
             causal=self.causal,
             window_size=window_size,
-            dropout_p=dropout_p,
+            # dropout_p=dropout_p,
         )
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]
@@ -863,7 +892,7 @@ class Attention(nn.Module):
                     v=value,
                     causal=self.causal,
                     window_size=(-1, -1),
-                    dropout_p=dropout_p,
+                    # dropout_p=dropout_p,
                 )
             else:
                 attn_output = self._flash_attn_varlen_output(
@@ -872,7 +901,7 @@ class Attention(nn.Module):
                     value,
                     sequence_lengths,
                     window_size=(-1, -1),
-                    dropout_p=dropout_p,
+                    # dropout_p=dropout_p,
                 )
         elif self.attention_type == "swa":
             if sequence_lengths is None:
@@ -882,7 +911,7 @@ class Attention(nn.Module):
                     v=value,
                     causal=self.causal,
                     window_size=(effective_window_size, effective_window_size),
-                    dropout_p=dropout_p,
+                    # dropout_p=dropout_p,
                 )
             else:
                 attn_output = self._flash_attn_varlen_output(
@@ -901,7 +930,7 @@ class Attention(nn.Module):
                     v=value,
                     causal=self.causal,
                     window_size=(-1, -1),
-                    dropout_p=dropout_p,
+                    # dropout_p=dropout_p,
                 )
             else:
                 attn_output = self._flex_attention_output(query, key, value, self._lsa_score_mod())
@@ -951,7 +980,7 @@ class Attention(nn.Module):
             max_seqlen_k=max_seqlen,
             causal=self.causal,
             window_size=(effective_window_size, effective_window_size),
-            dropout_p=self.attn_dropout if self.training else 0.0,
+            # dropout_p=self.attn_dropout if self.training else 0.0,
         )
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]
@@ -1057,7 +1086,7 @@ class Attention(nn.Module):
             max_seqlen_k=max_seqlen_k,
             causal=causal,
             window_size=(-1, -1),
-            dropout_p=self.attn_dropout if self.training else 0.0,
+            # dropout_p=self.attn_dropout if self.training else 0.0,
         )
         if isinstance(attn_output, tuple):  # fa2/fa3 compatibility
             attn_output = attn_output[0]

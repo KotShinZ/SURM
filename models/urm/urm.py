@@ -805,7 +805,7 @@ class URM_Inner(nn.Module):
                 (puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding),
                 dim=-2,
             )
-        print(f"puzzle_emb_len: {self.puzzle_emb_len}, embedding.shape: {embedding.shape}, puzzle_embedding.shape: {puzzle_embedding.shape if self.config.puzzle_emb_ndim > 0 else 'N/A'}")
+        # print(f"puzzle_emb_len: {self.puzzle_emb_len}, embedding.shape: {embedding.shape}, puzzle_embedding.shape: {puzzle_embedding.shape if self.config.puzzle_emb_ndim > 0 else 'N/A'}")
             
         memory_embedding = self._memory_embeddings(embedding.shape[0], embedding.device)
         if memory_embedding is not None:
